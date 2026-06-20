@@ -2,7 +2,8 @@ use std::path::PathBuf;
 
 pub mod load;
 
-use wiresurge_core::{RequestSpec, Result, generate_id, json_array, json_object, json_string};
+use tokio_util::sync::CancellationToken;
+use wiresurge_core::{RequestSpec, Result, WireSurgeError, generate_id, serialize_json};
 use wiresurge_http::{HttpResponse, send_http_request};
 use wiresurge_metrics::{ReportSummary, RunnerStats};
 use wiresurge_storage::WorkspaceStore;
@@ -40,53 +41,61 @@ pub struct RunResult {
 }
 
 impl RunResult {
-    pub fn to_json(&self) -> String {
-        json_object(&[
-            ("id", json_string(&self.id)),
-            ("dry_run", self.dry_run.to_string()),
-            ("request", self.request.to_json()),
-            (
-                "response",
-                self.response
-                    .as_ref()
-                    .map(HttpResponse::to_json)
-                    .unwrap_or_else(|| "null".to_string()),
-            ),
-            ("runner", self.runner.to_json()),
-            (
-                "report",
-                self.report
-                    .as_ref()
-                    .map(ReportSummary::to_json)
-                    .unwrap_or_else(|| "null".to_string()),
-            ),
-            (
-                "warnings",
-                json_array(
-                    &self
-                        .warnings
-                        .iter()
-                        .map(|warning| json_string(warning))
-                        .collect::<Vec<_>>(),
-                ),
-            ),
-        ])
+    pub fn to_json(&self) -> Result<String> {
+        let response = self
+            .response
+            .as_ref()
+            .map(HttpResponse::to_json_value)
+            .transpose()?;
+        let report = self
+            .report
+            .as_ref()
+            .map(ReportSummary::to_json_value)
+            .transpose()?;
+        serialize_json(&serde_json::json!({
+            "id": self.id,
+            "dry_run": self.dry_run,
+            "request": self.request.to_json_value()?,
+            "response": response,
+            "runner": self.runner,
+            "report": report,
+            "warnings": self.warnings,
+        }))
     }
 }
 
-pub fn run_stored_request(
+pub async fn run_stored_request(
     store: &WorkspaceStore,
     request_id: &str,
     options: RunOptions,
 ) -> Result<RunResult> {
     let request = store.load_request(request_id)?;
-    run_request(store, request, options)
+    run_request(store, request, options).await
 }
 
-pub fn run_request(
+pub async fn run_stored_request_with_cancellation(
+    store: &WorkspaceStore,
+    request_id: &str,
+    options: RunOptions,
+    cancellation: CancellationToken,
+) -> Result<RunResult> {
+    let request = store.load_request(request_id)?;
+    run_request_with_cancellation(store, request, options, cancellation).await
+}
+
+pub async fn run_request(
     store: &WorkspaceStore,
     request: RequestSpec,
     options: RunOptions,
+) -> Result<RunResult> {
+    run_request_with_cancellation(store, request, options, CancellationToken::new()).await
+}
+
+pub async fn run_request_with_cancellation(
+    store: &WorkspaceStore,
+    request: RequestSpec,
+    options: RunOptions,
+    cancellation: CancellationToken,
 ) -> Result<RunResult> {
     let run_id = generate_id("run", &request.id);
     let active_runner = RunnerStats::local(Some(run_id.clone()), options.parallel);
@@ -106,7 +115,16 @@ pub fn run_request(
         return Ok(result);
     }
 
-    let response = send_http_request(&request)?;
+    let response = tokio::select! {
+        _ = cancellation.cancelled() => {
+            let mut cancelled_runner = active_runner.clone();
+            cancelled_runner.status = "cancelled".to_string();
+            cancelled_runner.active_run_id = None;
+            store.write_runner_snapshot(&cancelled_runner)?;
+            return Err(WireSurgeError::new("run_cancelled", "HTTP run was cancelled"));
+        }
+        result = send_http_request(&request) => result?,
+    };
     let success = response.status_code < 400;
     let runner = active_runner.finish_with_latency(response.duration_ms, success);
     store.write_runner_snapshot(&runner)?;
@@ -128,12 +146,12 @@ pub fn run_request(
             response.duration_ms,
             success,
         );
-        let details = json_object(&[
-            ("run_id", json_string(&run_id)),
-            ("request", request.to_json()),
-            ("response", response.to_json()),
-            ("runner", runner.to_json()),
-        ]);
+        let details = serialize_json(&serde_json::json!({
+            "run_id": run_id,
+            "request": request.to_json_value()?,
+            "response": response.to_json_value()?,
+            "runner": runner,
+        }))?;
         store.write_report(&report_dir, &report, &details)?;
         Some(report)
     } else {

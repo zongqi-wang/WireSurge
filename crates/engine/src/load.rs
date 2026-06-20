@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::time::sleep_until;
 use tokio_util::sync::CancellationToken;
-use wiresurge_core::{Result, WireSurgeError, json_object};
+use wiresurge_core::{Result, WireSurgeError, serialize_json};
 use wiresurge_corpus::{Corpus, SelectMode};
 use wiresurge_dns::transport::do53::{TcpTransport, UdpTransport};
 use wiresurge_dns::transport::{Connection, DnsRequest, Transport, TransportError};
@@ -258,35 +258,25 @@ impl LoadStats {
         }
     }
 
-    pub fn to_json(&self) -> String {
-        let recorder = &self.recorder;
-        let latency = json_object(&[
-            ("min_ms", fmt(recorder.min_ms())),
-            ("mean_ms", fmt(recorder.mean_ms())),
-            ("p50_ms", fmt(recorder.percentile_ms(0.50))),
-            ("p95_ms", fmt(recorder.percentile_ms(0.95))),
-            ("p99_ms", fmt(recorder.percentile_ms(0.99))),
-            ("max_ms", fmt(recorder.max_ms())),
-        ]);
-        json_object(&[
-            ("duration_s", fmt(self.duration_s)),
-            ("sent", recorder.sent.to_string()),
-            ("received", recorder.received.to_string()),
-            ("timeouts", recorder.timeouts.to_string()),
-            ("errors", recorder.errors.to_string()),
-            ("conn_errors", recorder.conn_errors.to_string()),
-            ("truncated", recorder.truncated.to_string()),
-            ("recv_qps", fmt(self.recv_qps())),
-            ("latency_ms", latency),
-            ("cancelled", self.cancelled.to_string()),
-        ])
-    }
-}
-
-fn fmt(value: f64) -> String {
-    if value.is_finite() {
-        format!("{value:.3}")
-    } else {
-        "0.000".to_string()
+    pub fn to_json(&self) -> Result<String> {
+        serialize_json(&serde_json::json!({
+            "duration_s": self.duration_s,
+            "sent": self.recorder.sent,
+            "received": self.recorder.received,
+            "timeouts": self.recorder.timeouts,
+            "errors": self.recorder.errors,
+            "conn_errors": self.recorder.conn_errors,
+            "truncated": self.recorder.truncated,
+            "recv_qps": self.recv_qps(),
+            "latency_ms": {
+                "min_ms": self.recorder.min_ms(),
+                "mean_ms": self.recorder.mean_ms(),
+                "p50_ms": self.recorder.percentile_ms(0.50),
+                "p95_ms": self.recorder.percentile_ms(0.95),
+                "p99_ms": self.recorder.percentile_ms(0.99),
+                "max_ms": self.recorder.max_ms(),
+            },
+            "cancelled": self.cancelled,
+        }))
     }
 }

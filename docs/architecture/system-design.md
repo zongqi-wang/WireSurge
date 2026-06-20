@@ -1,6 +1,6 @@
 # System Design
 
-> **Target architecture.** The current engine is a synchronous single-request orchestrator. This chapter defines the runtime it should evolve toward.
+> **Target architecture.** The current engine is an async single-request orchestrator with Tokio cancellation. This chapter defines the supervised runtime it should evolve toward.
 
 ## Process Model
 

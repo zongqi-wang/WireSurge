@@ -16,7 +16,7 @@ Best-in-class packet rate and arbitrary stack composition pull in different dire
 
 ### Current DNS boundary
 
-NLnet Labs `domain` owns DNS names, record types, message construction/parsing, and EDNS0 encoding. WireSurge owns socket choice, one-owner connection reuse, pacing, cancellation, and run metrics. An EDNS option is represented by a caller-selected `u16` code plus raw bytes; code 65001 remains the CLI default for compatibility, while codes such as 65184 can be selected explicitly.
+`hickory-proto` owns DNS names, record types, complete message construction/parsing, and EDNS0 encoding. WireSurge owns Tokio socket choice, one-owner connection reuse, pacing, deadlines, cancellation, and run metrics. Responses are counted only after their ID, response bit, opcode, and echoed question match the request. An EDNS option is represented by a caller-selected `u16` code plus raw bytes; code 65001 remains the CLI default for compatibility, while codes such as 65184 can be selected explicitly. `hickory-net` is reserved for a reviewed encrypted-DNS phase.
 
 ## Plugin Model
 
@@ -57,7 +57,7 @@ Logging rules:
 - Redaction before display or persistence.
 - Sensitive debug capture only through an explicit warning and local-only storage.
 
-The current runner writes JSON snapshots and optional JSON/HTML reports. DNS metrics use a custom fixed-memory histogram; replacing that implementation is tracked by the dependency policy.
+The current runner writes JSON snapshots and optional JSON/HTML reports. DNS workers record bounded HDR histograms and merge them after the run; samples outside the configured range are reported as overflows.
 
 ## Git and Reports
 

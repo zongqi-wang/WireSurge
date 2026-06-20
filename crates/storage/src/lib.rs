@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use wiresurge_core::{RequestSpec, Result, WireSurgeError, json_array, json_object, json_string};
+use wiresurge_core::{RequestSpec, Result, WireSurgeError, serialize_json};
 use wiresurge_metrics::{ReportSummary, RunnerStats};
 
 #[derive(Debug, Clone)]
@@ -46,19 +46,16 @@ impl WorkspaceStore {
             )
             .with_hint("Run `wiresurge workspace init` first."));
         }
-        Ok(json_object(&[
-            ("root", json_string(&self.root.display().to_string())),
-            (
-                "metadata_dir",
-                json_string(&self.metadata_dir().display().to_string()),
-            ),
-            ("exists", "true".to_string()),
-        ]))
+        serialize_json(&serde_json::json!({
+            "root": self.root.display().to_string(),
+            "metadata_dir": self.metadata_dir().display().to_string(),
+            "exists": true,
+        }))
     }
 
     pub fn create_request(&self, request: &RequestSpec) -> Result<()> {
         self.ensure_workspace()?;
-        fs::write(self.request_path(&request.id), request.to_yaml())?;
+        fs::write(self.request_path(&request.id), request.to_yaml()?)?;
         Ok(())
     }
 
@@ -74,7 +71,7 @@ impl WorkspaceStore {
         }
         let mut updated = request.clone();
         updated.id = id.to_string();
-        fs::write(path, updated.to_yaml())?;
+        fs::write(path, updated.to_yaml()?)?;
         Ok(())
     }
 
@@ -133,7 +130,7 @@ impl WorkspaceStore {
         fs::create_dir_all(self.runners_dir())?;
         fs::write(
             self.runners_dir().join(format!("{}.json", stats.id)),
-            stats.to_json(),
+            stats.to_json()?,
         )?;
         Ok(())
     }
@@ -150,12 +147,12 @@ impl WorkspaceStore {
                     .and_then(|extension| extension.to_str())
                     == Some("json")
                 {
-                    entries.push(fs::read_to_string(entry.path())?);
+                    entries.push(parse_stored_json(&fs::read_to_string(entry.path())?)?);
                 }
             }
         }
-        entries.sort();
-        Ok(json_array(&entries))
+        entries.sort_by_key(serde_json::Value::to_string);
+        serialize_json(&entries)
     }
 
     pub fn write_report(
@@ -166,11 +163,11 @@ impl WorkspaceStore {
     ) -> Result<()> {
         self.ensure_workspace()?;
         fs::create_dir_all(report_dir)?;
-        fs::write(report_dir.join("summary.json"), summary.to_json())?;
+        fs::write(report_dir.join("summary.json"), summary.to_json()?)?;
         fs::write(report_dir.join("details.json"), details_json)?;
         fs::write(
             report_dir.join("index.html"),
-            report_html(summary, details_json),
+            report_html(summary, details_json)?,
         )?;
         fs::create_dir_all(self.reports_dir())?;
         let canonical_dir = report_dir
@@ -178,7 +175,7 @@ impl WorkspaceStore {
             .unwrap_or_else(|_| report_dir.to_path_buf());
         fs::write(
             self.reports_dir().join(format!("{}.json", summary.id)),
-            summary.to_json(),
+            summary.to_json()?,
         )?;
         fs::write(
             self.reports_dir().join(format!("{}.path", summary.id)),
@@ -199,12 +196,12 @@ impl WorkspaceStore {
                     .and_then(|extension| extension.to_str())
                     == Some("json")
                 {
-                    entries.push(fs::read_to_string(entry.path())?);
+                    entries.push(parse_stored_json(&fs::read_to_string(entry.path())?)?);
                 }
             }
         }
-        entries.sort();
-        Ok(json_array(&entries))
+        entries.sort_by_key(serde_json::Value::to_string);
+        serialize_json(&entries)
     }
 
     pub fn load_report_summary(&self, id: &str) -> Result<String> {
@@ -248,8 +245,8 @@ impl WorkspaceStore {
     }
 }
 
-fn report_html(summary: &ReportSummary, details_json: &str) -> String {
-    format!(
+fn report_html(summary: &ReportSummary, details_json: &str) -> Result<String> {
+    Ok(format!(
         r#"<!doctype html>
 <html lang="en">
 <head>
@@ -274,9 +271,19 @@ fn report_html(summary: &ReportSummary, details_json: &str) -> String {
         id = summary.id,
         status = summary.status,
         duration = summary.duration_ms,
-        summary = html_escape(&summary.to_json()),
+        summary = html_escape(&summary.to_json()?),
         details = html_escape(details_json),
-    )
+    ))
+}
+
+fn parse_stored_json(input: &str) -> Result<serde_json::Value> {
+    serde_json::from_str(input).map_err(|error| {
+        WireSurgeError::new("invalid_stored_json", error.to_string()).at(format!(
+            "line {}, column {}",
+            error.line(),
+            error.column()
+        ))
+    })
 }
 
 fn html_escape(input: &str) -> String {
