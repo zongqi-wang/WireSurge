@@ -11,5 +11,6 @@ name = "wiresurge_storage"
 path = "src/lib.rs"
 
 [dependencies]
+serde_json.workspace = true
 wiresurge-core.workspace = true
 wiresurge-metrics.workspace = true

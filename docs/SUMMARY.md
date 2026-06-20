@@ -16,6 +16,7 @@
 
 - [Workflow Model](workflow-model.md)
 - [Dependency Policy](dependency-policy.md)
+  - [ADR 0001: Dependency-Backed Protocol Runtime](adr/0001-dependency-backed-protocol-runtime.md)
 
 # Delivery
 

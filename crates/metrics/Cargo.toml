@@ -12,4 +12,6 @@ path = "src/lib.rs"
 
 [dependencies]
 hdrhistogram.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 wiresurge-core.workspace = true

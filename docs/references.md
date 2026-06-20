@@ -14,9 +14,13 @@ These projects and specifications inform the steering architecture. A reference 
 
 ## Protocols and Dependencies
 
-- [NLnet Labs `domain`](https://github.com/NLnetLabs/domain): selected DNS message, name, record type, and EDNS0 primitives.
+- [Hickory Proto](https://docs.rs/hickory-proto/latest/hickory_proto/): selected DNS message, name, record type, and EDNS0 primitives.
+- [Hickory Net](https://docs.rs/hickory-net/latest/hickory_net/): candidate transport layer for future encrypted DNS stages.
+- [NLnet Labs `domain`](https://github.com/NLnetLabs/domain): reviewed protocol-first alternative.
 - [`clap`](https://docs.rs/clap/latest/clap/): selected command-line parser and help system.
-- [Hickory DNS](https://github.com/hickory-dns/hickory-dns): DNS alternative if a future transport requirement justifies its broader graph.
+- [Serde](https://serde.rs/): selected typed serialization framework.
+- [`yaml_serde`](https://docs.rs/yaml_serde/latest/yaml_serde/): selected maintained YAML adapter.
+- [`hdrhistogram`](https://docs.rs/hdrhistogram/latest/hdrhistogram/): selected bounded latency histogram.
 - [PROXY protocol specification](https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt): connection metadata framing.
 - [RFC 6066](https://datatracker.ietf.org/doc/html/rfc6066): TLS extensions including SNI.
 - [RFC 6891](https://datatracker.ietf.org/doc/html/rfc6891): EDNS0 and the OPT pseudo-RR.
