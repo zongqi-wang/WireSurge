@@ -1,0 +1,22 @@
+[book]
+title = "WireSurge Book"
+authors = ["WireSurge contributors"]
+description = "Architecture, implementation status, policies, and roadmap for WireSurge."
+language = "en"
+src = "docs"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+site-url = "/WireSurge/"
+git-repository-url = "https://github.com/zongqi-wang/WireSurge"
+edit-url-template = "https://github.com/zongqi-wang/WireSurge/edit/main/docs/{path}"
+default-theme = "light"
+preferred-dark-theme = "navy"
+
+[output.html.search]
+enable = true
+limit-results = 30
+use-boolean-and = true
