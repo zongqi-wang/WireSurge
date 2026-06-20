@@ -1,6 +1,8 @@
 # WireSurge Dependency Policy
 
-WireSurge uses established libraries for protocol parsing, cryptography, async I/O, serialization, storage, and other security-sensitive or standards-heavy work. It does not add a library merely to avoid writing a small, well-contained helper.
+WireSurge uses established first-party or third-party libraries for protocol parsing, cryptography, async I/O, signals, serialization, CLI parsing, storage, histograms, and other security-sensitive or standards-heavy work. It does not add a library merely to avoid writing a small, well-contained helper.
+
+A handrolled parser, protocol codec, argument scanner, histogram, or cryptographic implementation is presumed to be replacement work unless an architecture decision record explains why an established library cannot satisfy the requirement. WireSurge-owned code should concentrate on scheduling, pacing, connection lifecycle, cancellation policy, workflow semantics, and metrics semantics.
 
 ## Admission Rules
 
@@ -31,3 +33,20 @@ WireSurge uses `domain = 0.12.1` from NLnet Labs with only the `std` feature. Th
 The `net`, `resolv`, and `unstable-*` features are not enabled. NLnet Labs currently labels its client/server transport work experimental, and those transports would also obscure behavior the load engine needs to control.
 
 `hickory-proto` remains a valid alternative if a future requirement materially benefits from its transport implementation. It is not included now because its protocol-only graph pulls substantially more transitive crates, including IDNA/ICU support. WireSurge must not carry both DNS stacks without a specific interoperability requirement and benchmark.
+
+## CLI Decision
+
+WireSurge uses `clap = 4.6.1` with default features disabled. The selected `std`, `derive`, `help`, `usage`, `error-context`, `color`, `suggestions`, and `wrap_help` features provide a human-first command line with discoverable help and terminal output. The `env` feature is intentionally omitted so flags do not read ambient environment variables implicitly.
+
+`clap` owns argument parsing and validation. WireSurge maps its parse errors into the existing structured error envelope when `--output json` is selected. Domain-specific parsing remains in the owning crate so stable codes such as `invalid_dns_transport` and `invalid_dns_qtype` do not become generic CLI errors.
+
+## Known Replacement Work
+
+The initial scaffold predates the library-first tenet in several areas. Before those areas grow, replace them through reviewed dependency decisions:
+
+- custom JSON/JSONC and YAML parsing in `crates/core`;
+- custom HTTP/1.1 wire construction and response parsing in `crates/http`;
+- direct platform signal bindings and the synchronous transport runtime;
+- custom latency histogram implementation in `crates/dns`.
+
+Each replacement must preserve WireSurge's stable schemas, structured errors, connection ownership, pacing behavior, cancellation semantics, and bounded-memory metrics.

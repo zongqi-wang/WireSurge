@@ -1,8 +1,8 @@
 /target/
+/book/
 /apps/**/node_modules/
 /apps/**/dist/
 /.wiresurge/runners/
 /.wiresurge/secrets/
 /.wiresurge/tmp/
 .DS_Store
-
