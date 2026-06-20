@@ -7,7 +7,7 @@ The repository is an early Rust workspace scaffold. It validates the CLI and sto
 | Area | Current behavior | Important limits |
 |---|---|---|
 | `crates/core` | Request schema, a small JSON/JSONC parser, request YAML serialization, structured errors, ID generation, and basic redaction. | The custom JSON/YAML implementation is replacement work under the library-first tenet. The YAML reader only handles the current flat request format. |
-| `crates/cli` | `clap` derive parsing; human-oriented help, suggestions, and terminal color; `schema`, `workspace`, request CRUD, `run`, `dns`, runner/report reads, structured JSON errors, and a plugin manifest example. | Secrets return `not_implemented`; report export is reserved; there is no internal IPC engine mode. |
+| `crates/cli` | `clap` derive parsing; human-oriented help, suggestions, and terminal color; `schema`, `workspace`, request CRUD, `run`, `dns`, runner/report reads, structured JSON errors, and a plugin manifest example. | Nested `workspace`, `request`, `runner`, and `report` actions are still strings validated by handlers rather than typed Clap subcommands. Secrets and report export are not implemented; there is no IPC engine mode. |
 | `crates/http` | One blocking HTTP/1.1 request to an `http://` target with response status, headers, body, timing, and redaction. | The custom wire parser is replacement work. There is no HTTPS, HTTP/2, redirect following, pooling, chunk decoding, or real parallel execution. Each run sends one request. |
 | `crates/dns` | DNS messages and EDNS0 via NLnet Labs `domain`; UDP/TCP execution with concurrent senders, optional QPS pacing, timeouts, caller-selected EDNS option codes, reusable TCP connections, latency percentiles, and cooperative signal cancellation. | Transport, signal, and histogram code is currently custom and synchronous. There is no DNS-over-TLS, DNS-over-HTTPS, workflow stage integration, or async runtime. |
 | `crates/engine` | Orchestrates one stored or file-based HTTP request, dry runs, runner snapshots, and optional reports. | `--parallel` is accepted but does not send parallel HTTP requests. There is no supervisor, scheduler, ladder, task tree, or connection manager. |
@@ -34,7 +34,7 @@ wiresurge secret set|get|delete
 wiresurge plugin manifest-example
 ```
 
-`clap` rejects unknown flags, missing values, and malformed numeric inputs. Human mode provides discoverable help and suggestions. When `--output json` or `--output=json` is used, parse failures and domain failures use the same structured envelope with `code`, `message`, `path`, `hint`, and `retryable` fields. Non-interactive commands do not prompt.
+`clap` rejects unknown flags, missing values, and malformed numeric inputs. Human mode provides discoverable help and suggestions. When `--output json` or `--output=json` is used, parse failures and domain failures use the same structured envelope with `code`, `message`, `path`, `hint`, and `retryable` fields. Non-interactive commands do not prompt. Invalid nested action names currently reach WireSurge handler validation; converting those actions to Clap subcommands remains planned.
 
 ## Quick Start
 
