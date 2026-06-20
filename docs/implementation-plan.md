@@ -9,7 +9,7 @@ The CLI is human-first. Scripts and coding agents use the explicit `--output jso
 | Phase | Status | Goal | Success criteria |
 |---|---|---|---|
 | 0. Repository foundation | Current | Buildable workspace, consolidated docs, examples, and CI. | Rust checks pass; mdBook builds and publishes to GitHub Pages. |
-| 1. Human-first CLI | Partial | Discoverable terminal interface with stable machine mode. | `clap` owns parsing; nested help, validation, stable JSON errors, schemas, and dry runs work. |
+| 1. Human-first CLI | Partial | Discoverable terminal interface with stable machine mode. | `clap` owns top-level and nested parsing; help, validation, stable JSON errors, schemas, and dry runs work. |
 | 2. HTTP/API MVP | Partial | HTTP/API is first-class. | A reviewed HTTP/TLS stack supports HTTPS, redirects, HTTP/2, bodies, pooling, and timelines. |
 | 3. Metrics/reports/runners | Partial | Local observability before desktop. | Established histograms, live aggregation, atomic reports, and runner snapshots share one model. |
 | 4. Desktop/Runners UI | Planned | First UI surface controls local runners. | Runners view shows health, workers, saturation, throughput, latency, errors, and heartbeat. |
@@ -23,7 +23,7 @@ The CLI is human-first. Scripts and coding agents use the explicit `--output jso
 The current repository implements:
 
 - Rust workspace and CI.
-- Human-first `wiresurge` CLI parsed by `clap`, with help, suggestions, strict flag validation, and JSON machine mode.
+- Human-first `wiresurge` CLI parsed by `clap`, with help, suggestions, strict flag validation, and JSON machine mode; several nested action sets remain string-based.
 - Local `.wiresurge` workspace model.
 - YAML request storage from JSON CLI input.
 - Std-only HTTP runner for `http://` targets.
