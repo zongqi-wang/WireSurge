@@ -36,9 +36,13 @@ The `net`, `resolv`, and `unstable-*` features are not enabled. NLnet Labs curre
 
 ## CLI Decision
 
-WireSurge uses `clap = 4.6.1` with default features disabled. The selected `std`, `derive`, `help`, `usage`, `error-context`, `color`, `suggestions`, and `wrap_help` features provide a human-first command line with discoverable help and terminal output. The `env` feature is intentionally omitted so flags do not read ambient environment variables implicitly.
+WireSurge uses `clap = 4.6.1` with default features disabled and an explicit feature allowlist. In this version, `std`, `color`, `help`, `usage`, `error-context`, and `suggestions` are exactly Clap's default feature set; WireSurge additionally enables `derive` and `wrap_help`. The current declaration therefore does not reduce the dependency graph compared with enabling defaults and adding those two features. Its benefit is review control: a future Clap release cannot add a new default feature to WireSurge without a manifest change and dependency review.
 
-`clap` owns argument parsing and validation. WireSurge maps its parse errors into the existing structured error envelope when `--output json` is selected. Domain-specific parsing remains in the owning crate so stable codes such as `invalid_dns_transport` and `invalid_dns_qtype` do not become generic CLI errors.
+The `env` feature is not part of Clap's defaults and remains intentionally omitted so flags do not read ambient environment variables implicitly. If explicit feature allowlisting stops being a project requirement, the simpler equivalent declaration is to enable Clap defaults and request only `derive` and `wrap_help`.
+
+`clap` owns top-level command parsing, option parsing, typed value conversion, help, and generic argument validation. WireSurge maps its parse errors into the existing structured error envelope when `--output json` is selected. Domain-specific parsing remains in the owning crate so stable codes such as `invalid_dns_transport` and `invalid_dns_qtype` do not become generic CLI errors.
+
+The current CLI still represents `workspace`, `request`, `runner`, and `report` actions as strings and validates them in command handlers. This is transitional implementation debt. Those action sets should become nested Clap `Subcommand` enums so Clap owns their help, allowed values, and required arguments as well.
 
 ## Known Replacement Work
 
@@ -46,6 +50,7 @@ The initial scaffold predates the library-first tenet in several areas. Before t
 
 - custom JSON/JSONC and YAML parsing in `crates/core`;
 - custom HTTP/1.1 wire construction and response parsing in `crates/http`;
+- string-based nested CLI action parsing and validation in `crates/cli`;
 - direct platform signal bindings and the synchronous transport runtime;
 - custom latency histogram implementation in `crates/dns`.
 
