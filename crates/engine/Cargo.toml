@@ -11,7 +11,13 @@ name = "wiresurge_engine"
 path = "src/lib.rs"
 
 [dependencies]
+futures-util.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
 wiresurge-core.workspace = true
+wiresurge-corpus.workspace = true
+wiresurge-dns.workspace = true
 wiresurge-http.workspace = true
 wiresurge-metrics.workspace = true
 wiresurge-storage.workspace = true
+wiresurge-transport.workspace = true
