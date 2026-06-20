@@ -15,6 +15,7 @@ name = "wiresurge"
 path = "src/main.rs"
 
 [dependencies]
+clap = { workspace = true }
 wiresurge-core.workspace = true
 wiresurge-dns.workspace = true
 wiresurge-engine.workspace = true
