@@ -1,0 +1,7 @@
+id: req-local-health
+name: "Local Health"
+method: "GET"
+url: "http://127.0.0.1:8080/health"
+headers:
+  accept: "application/json"
+

@@ -1,0 +1,28 @@
+[workspace]
+members = [
+  "crates/core",
+  "crates/metrics",
+  "crates/storage",
+  "crates/http",
+  "crates/dns",
+  "crates/plugins",
+  "crates/engine",
+  "crates/cli",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zongqi-wang/WireSurge"
+rust-version = "1.94"
+
+[workspace.dependencies]
+domain = { version = "=0.12.1", default-features = false, features = ["std"] }
+wiresurge-core = { path = "crates/core", version = "=0.1.0" }
+wiresurge-dns = { path = "crates/dns", version = "=0.1.0" }
+wiresurge-engine = { path = "crates/engine", version = "=0.1.0" }
+wiresurge-http = { path = "crates/http", version = "=0.1.0" }
+wiresurge-metrics = { path = "crates/metrics", version = "=0.1.0" }
+wiresurge-plugins = { path = "crates/plugins", version = "=0.1.0" }
+wiresurge-storage = { path = "crates/storage", version = "=0.1.0" }

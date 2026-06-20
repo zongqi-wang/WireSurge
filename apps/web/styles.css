@@ -1,0 +1,266 @@
+:root {
+  color-scheme: light dark;
+  --bg: #f5f7fa;
+  --surface: #ffffff;
+  --ink: #17202a;
+  --muted: #687382;
+  --line: #d9e1ea;
+  --accent: #006f7f;
+  --good: #1d7f45;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #101418;
+    --surface: #171d23;
+    --ink: #edf2f7;
+    --muted: #9aa8b5;
+    --line: #2c3742;
+    --accent: #5ecad7;
+    --good: #71d596;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+.app-shell {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  min-height: 100vh;
+}
+
+.sidebar {
+  border-right: 1px solid var(--line);
+  background: var(--surface);
+  padding: 24px 18px;
+}
+
+.brand {
+  font-weight: 800;
+  font-size: 1.2rem;
+  margin-bottom: 22px;
+}
+
+.nav-button {
+  display: block;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+  padding: 10px 12px;
+  border-radius: 6px;
+  margin-bottom: 4px;
+}
+
+.nav-button.active,
+.nav-button:hover {
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.workspace {
+  padding: 28px;
+}
+
+.topbar {
+  display: flex;
+  justify-content: space-between;
+  gap: 24px;
+  align-items: center;
+  margin-bottom: 24px;
+}
+
+.eyebrow {
+  margin: 0 0 4px;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+h1,
+h2 {
+  margin: 0;
+  letter-spacing: 0;
+}
+
+h1 {
+  font-size: 1.8rem;
+}
+
+h2 {
+  font-size: 1.05rem;
+}
+
+.status-pill,
+.metric {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 6px 10px;
+  color: var(--muted);
+  background: var(--surface);
+  white-space: nowrap;
+}
+
+.metric.good {
+  color: var(--good);
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: minmax(320px, 0.9fr) minmax(360px, 1.1fr);
+  gap: 18px;
+  margin-bottom: 18px;
+}
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 18px;
+}
+
+.panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+label {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 14px;
+  color: var(--muted);
+}
+
+input,
+select,
+textarea {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--ink);
+  padding: 9px 10px;
+}
+
+textarea {
+  min-height: 120px;
+}
+
+pre {
+  overflow: auto;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 14px;
+}
+
+.runner-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 14px;
+}
+
+.runner-card {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 14px;
+}
+
+.runner-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  background: var(--good);
+}
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.stats span {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px;
+  color: var(--muted);
+}
+
+.stats b {
+  display: block;
+  color: var(--ink);
+}
+
+.worker-table {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 12px;
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+@media (max-width: 900px) {
+  .app-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    display: flex;
+    gap: 8px;
+    overflow-x: auto;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .brand {
+    margin: 0 12px 0 0;
+  }
+
+  .nav-button {
+    width: auto;
+    white-space: nowrap;
+  }
+
+  .layout {
+    grid-template-columns: 1fr;
+  }
+
+  .topbar {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
+
