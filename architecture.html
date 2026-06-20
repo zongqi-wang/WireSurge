@@ -388,6 +388,17 @@
             <h3>Graceful termination</h3>
             <p>UI cancellation, Ctrl-C, and SIGTERM enter the same shutdown state machine. Abrupt termination remains crash-recoverable.</p>
           </div>
+          <div class="panel">
+            <h3>Established libraries over handrolled code</h3>
+            <p>
+              Standards-heavy and security-sensitive work uses well-established first- or third-party libraries instead of bespoke
+              reimplementations: TLS, HTTP/1.1 and HTTP/2, async runtime and signals, DNS and EDNS0 message encoding, PROXY protocol
+              framing, JSON/YAML serialization, CLI parsing, and latency histograms. WireSurge writes its own code only for what it must
+              own &mdash; scheduling, pacing, connection lifecycle, cancellation, and metrics &mdash; and for small, well-contained helpers.
+              A handrolled parser, protocol codec, or arg scanner is a defect to remove, not a feature. See the
+              <a href="#dependencies">Dependency Policy</a> for the admission rules that enforce this.
+            </p>
+          </div>
         </div>
       </div>
 
@@ -413,8 +424,8 @@
             </tr>
             <tr>
               <td>CLI</td>
-              <td>Run workflows locally, validate configs, automate reports, and serve agentic use cases.</td>
-              <td><code>init</code>, <code>run</code>, <code>ladder</code>, <code>validate</code>, <code>report</code>, <code>secret</code>, <code>plugin</code>.</td>
+              <td>A human-first command-line tool: people run workflows, validate configs, and read load results at the terminal. Rich help, "did you mean" suggestions, and colored output are first-class; scripts and agents are also supported through an opt-in <code>--output json</code> machine mode.</td>
+              <td><code>init</code>, <code>run</code>, <code>ladder</code>, <code>validate</code>, <code>report</code>, <code>secret</code>, <code>plugin</code>; discoverable <code>--help</code> at every level; <code>--output json</code> for automation.</td>
             </tr>
             <tr>
               <td>Engine sidecar</td>

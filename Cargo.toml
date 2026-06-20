@@ -18,6 +18,14 @@ repository = "https://github.com/zongqi-wang/WireSurge"
 rust-version = "1.94"
 
 [workspace.dependencies]
+# default features disabled per docs/dependency-policy.md; enabled features are
+# documented inline. The CLI is human-first: color, suggestions ("did you mean"),
+# and wrap_help give a good terminal experience. clap auto-detects a non-TTY and
+# drops ANSI when output is piped, so the machine-readable --output json path
+# stays clean. std/derive/help/usage/error-context are needed to parse
+# subcommands and map clap errors into WireSurgeError JSON. env is omitted (no
+# flag should read ambient env implicitly).
+clap = { version = "=4.6.1", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "color", "suggestions", "wrap_help"] }
 domain = { version = "=0.12.1", default-features = false, features = ["std"] }
 wiresurge-core = { path = "crates/core", version = "=0.1.0" }
 wiresurge-dns = { path = "crates/dns", version = "=0.1.0" }

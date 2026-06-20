@@ -44,6 +44,15 @@ impl FromStr for DnsTransport {
     }
 }
 
+/// A single EDNS0 OPT option: a caller-supplied option code plus its raw payload
+/// bytes. The code is configurable (not hardcoded) so callers can emit real
+/// options such as the Global Resolver DoT auth token (code 65184 / 0xFEA0).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdnsOption {
+    pub code: u16,
+    pub payload: Vec<u8>,
+}
+
 #[derive(Debug, Clone)]
 pub struct DnsRunConfig {
     pub server: String,
@@ -55,7 +64,7 @@ pub struct DnsRunConfig {
     pub concurrency: usize,
     pub timeout: Duration,
     pub qps: Option<f64>,
-    pub edns_payload: Option<Vec<u8>>,
+    pub edns_option: Option<EdnsOption>,
 }
 
 impl DnsRunConfig {
@@ -95,7 +104,7 @@ impl DnsRunConfig {
             )
             .at("qps"));
         }
-        build_query(0, &self.qname, self.qtype, self.edns_payload.as_deref())?;
+        build_query(0, &self.qname, self.qtype, self.edns_option.as_ref())?;
         Ok(())
     }
 }
@@ -375,7 +384,7 @@ pub fn run_dns(config: DnsRunConfig, cancellation: Arc<AtomicBool>) -> Result<Dn
         0,
         &config.qname,
         config.qtype,
-        config.edns_payload.as_deref(),
+        config.edns_option.as_ref(),
     )?);
     let config = Arc::new(config);
     let next_query = Arc::new(AtomicU64::new(0));
@@ -702,7 +711,7 @@ pub fn build_query(
     transaction_id: u16,
     qname: &str,
     qtype: u16,
-    edns_payload: Option<&[u8]>,
+    edns_option: Option<&EdnsOption>,
 ) -> Result<Vec<u8>> {
     let absolute_name = if qname.ends_with('.') {
         qname.to_string()
@@ -720,11 +729,12 @@ pub fn build_query(
         .push((name, Rtype::from_int(qtype)))
         .map_err(|error| WireSurgeError::new("dns_encode_failed", error.to_string()).at("qname"))?;
 
-    let packet = if let Some(payload) = edns_payload {
-        let option = UnknownOptData::new(OptionCode::from_int(65001), payload).map_err(|_| {
-            WireSurgeError::new("invalid_edns_payload", "EDNS payload exceeds 65535 bytes")
-                .at("edns_payload")
-        })?;
+    let packet = if let Some(edns) = edns_option {
+        let option =
+            UnknownOptData::new(OptionCode::from_int(edns.code), &edns.payload).map_err(|_| {
+                WireSurgeError::new("invalid_edns_payload", "EDNS payload exceeds 65535 bytes")
+                    .at("edns_payload")
+            })?;
         let mut additional = question.additional();
         additional
             .opt(|opt| {
@@ -750,9 +760,9 @@ pub fn build_query(
 pub fn build_query_with_optional_edns0(
     qname: &str,
     qtype: u16,
-    edns_payload: Option<&[u8]>,
+    edns_option: Option<&EdnsOption>,
 ) -> Result<Vec<u8>> {
-    build_query(0x1234, qname, qtype, edns_payload)
+    build_query(0x1234, qname, qtype, edns_option)
 }
 
 pub fn parse_qtype(value: &str) -> Result<u16> {
@@ -827,7 +837,11 @@ mod tests {
 
     #[test]
     fn encodes_transaction_id_and_edns0_option() {
-        let packet = build_query(0xbeef, "example.com", 1, Some(&[0xca, 0xfe])).unwrap();
+        let option = EdnsOption {
+            code: 65001,
+            payload: vec![0xca, 0xfe],
+        };
+        let packet = build_query(0xbeef, "example.com", 1, Some(&option)).unwrap();
         assert_eq!(&packet[0..2], &0xbeef_u16.to_be_bytes());
         assert!(
             packet
@@ -835,6 +849,31 @@ mod tests {
                 .any(|window| window == 65001_u16.to_be_bytes())
         );
         assert!(packet.ends_with(&[0xca, 0xfe]));
+    }
+
+    #[test]
+    fn encodes_configurable_edns0_option_code() {
+        // The Global Resolver DoT auth token rides in EDNS0 option 65184 (0xFEA0);
+        // the option code must be caller-supplied, not hardcoded to 65001.
+        let token = b"a-token-value".to_vec();
+        let option = EdnsOption {
+            code: 65184,
+            payload: token.clone(),
+        };
+        let packet = build_query(0x1234, "example.com", 1, Some(&option)).unwrap();
+        assert!(
+            packet
+                .windows(2)
+                .any(|window| window == 65184_u16.to_be_bytes()),
+            "option code 65184 must appear in the OPT record"
+        );
+        assert!(
+            !packet
+                .windows(2)
+                .any(|window| window == 65001_u16.to_be_bytes()),
+            "the old hardcoded 65001 code must not leak through"
+        );
+        assert!(packet.ends_with(&token));
     }
 
     #[test]
@@ -883,7 +922,7 @@ mod tests {
                 concurrency: 1,
                 timeout: Duration::from_secs(1),
                 qps: None,
-                edns_payload: None,
+                edns_option: None,
             },
             Arc::new(AtomicBool::new(false)),
         )
@@ -925,7 +964,7 @@ mod tests {
                 concurrency: 1,
                 timeout: Duration::from_secs(1),
                 qps: None,
-                edns_payload: None,
+                edns_option: None,
             },
             Arc::new(AtomicBool::new(false)),
         )
