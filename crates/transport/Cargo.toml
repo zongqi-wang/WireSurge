@@ -1,5 +1,5 @@
 [package]
-name = "wiresurge-metrics"
+name = "wiresurge-transport"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -7,9 +7,9 @@ repository.workspace = true
 rust-version.workspace = true
 
 [lib]
-name = "wiresurge_metrics"
+name = "wiresurge_transport"
 path = "src/lib.rs"
 
 [dependencies]
-hdrhistogram.workspace = true
+tokio.workspace = true
 wiresurge-core.workspace = true

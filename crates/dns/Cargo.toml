@@ -12,4 +12,6 @@ path = "src/lib.rs"
 
 [dependencies]
 domain.workspace = true
+tokio.workspace = true
 wiresurge-core.workspace = true
+wiresurge-transport.workspace = true
