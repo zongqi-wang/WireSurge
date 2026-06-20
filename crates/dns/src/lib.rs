@@ -10,8 +10,20 @@ use std::thread;
 use std::time::{Duration, Instant};
 use wiresurge_core::{Result, WireSurgeError, json_object, json_string};
 
+pub mod transport;
+
 const DNS_HEADER_LEN: usize = 12;
 const MAX_DNS_MESSAGE_LEN: usize = u16::MAX as usize;
+
+/// Derive a transaction id from a query index, mixing in a per-run seed so two
+/// concurrent runs against the same target do not share an id stream.
+pub fn derive_txid(query_index: u64, seed: u64) -> u16 {
+    let mut value = query_index ^ seed ^ 0x9e37_79b9_7f4a_7c15;
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value as u16
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DnsTransport {
@@ -372,9 +384,9 @@ fn latency_bucket(micros: u64) -> usize {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ResponseHeader {
-    rcode: u16,
-    truncated: bool,
+pub struct ResponseHeader {
+    pub rcode: u16,
+    pub truncated: bool,
 }
 
 pub fn run_dns(config: DnsRunConfig, cancellation: Arc<AtomicBool>) -> Result<DnsRunStats> {
@@ -682,7 +694,7 @@ fn transaction_id(worker_id: usize, query_index: u64) -> u16 {
     value as u16
 }
 
-fn parse_response_header(response: &[u8], expected_id: u16) -> Result<ResponseHeader> {
+pub fn parse_response_header(response: &[u8], expected_id: u16) -> Result<ResponseHeader> {
     let response = Message::from_octets(response).map_err(|error| {
         WireSurgeError::new("invalid_dns_response", error.to_string()).retryable(false)
     })?;

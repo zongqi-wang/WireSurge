@@ -5,6 +5,8 @@ members = [
   "crates/storage",
   "crates/http",
   "crates/dns",
+  "crates/corpus",
+  "crates/transport",
   "crates/plugins",
   "crates/engine",
   "crates/cli",
@@ -27,8 +29,15 @@ rust-version = "1.94"
 # flag should read ambient env implicitly).
 clap = { version = "=4.6.1", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "color", "suggestions", "wrap_help"] }
 domain = { version = "=0.12.1", default-features = false, features = ["std"] }
+futures-util = { version = "=0.3.31", default-features = false, features = ["std", "async-await"] }
+hdrhistogram = { version = "=7.5.4", default-features = false }
+memmap2 = { version = "=0.9.8" }
+tokio = { version = "=1.52.3", default-features = false, features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal", "io-util"] }
+tokio-util = { version = "=0.7.16", default-features = false, features = ["rt"] }
 wiresurge-core = { path = "crates/core", version = "=0.1.0" }
+wiresurge-corpus = { path = "crates/corpus", version = "=0.1.0" }
 wiresurge-dns = { path = "crates/dns", version = "=0.1.0" }
+wiresurge-transport = { path = "crates/transport", version = "=0.1.0" }
 wiresurge-engine = { path = "crates/engine", version = "=0.1.0" }
 wiresurge-http = { path = "crates/http", version = "=0.1.0" }
 wiresurge-metrics = { path = "crates/metrics", version = "=0.1.0" }

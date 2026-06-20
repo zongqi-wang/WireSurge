@@ -2,6 +2,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use wiresurge_core::{json_array, json_object, json_string};
 
+mod hist;
+pub use hist::LoadRecorder;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkerStats {
     pub id: String,
