@@ -8,7 +8,7 @@ This book is the canonical source for the project's architecture, current implem
 
 The published book is available at:
 
-<https://zongqi-wang.github.io/WireSurge/>
+<https://cedwang.dev/WireSurge/>
 
 The source is ordinary Markdown under `docs/`. To render or serve it locally with mdBook 0.5.3:
 
