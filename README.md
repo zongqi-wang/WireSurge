@@ -2,7 +2,7 @@
 
 WireSurge is a local-first desktop and CLI tool for API exploration, protocol workflows, and high-rate traffic generation.
 
-Read the [WireSurge Book](https://zongqi-wang.github.io/WireSurge/) for the consolidated architecture, current implementation status, policies, and roadmap. The Markdown source lives in [`docs/`](./docs/README.md) and is rendered with [mdBook](https://rust-lang.github.io/mdBook/).
+Read the [WireSurge Book](https://cedwang.dev/WireSurge/) for the consolidated architecture, current implementation status, policies, and roadmap. The Markdown source lives in [`docs/`](./docs/README.md) and is rendered with [mdBook](https://rust-lang.github.io/mdBook/).
 
 ## Current Implementation
 
