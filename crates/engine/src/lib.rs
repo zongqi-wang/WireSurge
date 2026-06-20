@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+pub mod load;
+
 use wiresurge_core::{RequestSpec, Result, generate_id, json_array, json_object, json_string};
 use wiresurge_http::{HttpResponse, send_http_request};
 use wiresurge_metrics::{ReportSummary, RunnerStats};
