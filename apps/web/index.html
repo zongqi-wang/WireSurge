@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WireSurge App Shell</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <div class="sidebar">
+      <div class="brand">WireSurge</div>
+      <button class="nav-button active" type="button">Requests</button>
+      <button class="nav-button" type="button">Runners</button>
+      <button class="nav-button" type="button">Reports</button>
+      <button class="nav-button" type="button">Git</button>
+    </div>
+
+    <div class="workspace">
+      <div class="topbar">
+        <div>
+          <p class="eyebrow">Local workspace</p>
+          <h1>API and Traffic Runs</h1>
+        </div>
+        <div class="status-pill">No cloud dependency</div>
+      </div>
+
+      <div class="layout">
+        <div class="panel request-panel">
+          <div class="panel-header">
+            <h2>Request</h2>
+            <button type="button">Run</button>
+          </div>
+          <label>
+            Method
+            <select>
+              <option>GET</option>
+              <option>POST</option>
+              <option>PUT</option>
+              <option>DELETE</option>
+            </select>
+          </label>
+          <label>
+            URL
+            <input value="http://127.0.0.1:8080/health">
+          </label>
+          <label>
+            Headers
+            <textarea>accept: application/json</textarea>
+          </label>
+        </div>
+
+        <div class="panel response-panel">
+          <div class="panel-header">
+            <h2>Response</h2>
+            <span class="metric good">200 OK</span>
+          </div>
+          <pre>{
+  "status": "ready",
+  "latency_ms": 12.4
+}</pre>
+        </div>
+      </div>
+
+      <div class="panel runners-panel">
+        <div class="panel-header">
+          <div>
+            <p class="eyebrow">Current runners</p>
+            <h2>Runner Stats</h2>
+          </div>
+          <button type="button">Refresh</button>
+        </div>
+
+        <div class="runner-grid">
+          <div class="runner-card">
+            <div class="runner-title">
+              <strong>local-cli</strong>
+              <span class="status-dot"></span>
+            </div>
+            <div class="stats">
+              <span><b>QPS</b> 0</span>
+              <span><b>RPS</b> 0</span>
+              <span><b>p95</b> 0 ms</span>
+              <span><b>Errors</b> 0%</span>
+            </div>
+            <div class="worker-table">
+              <div>worker-0</div>
+              <div>idle</div>
+              <div>0 conn</div>
+            </div>
+            <p class="muted">Last heartbeat: waiting for first CLI run</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

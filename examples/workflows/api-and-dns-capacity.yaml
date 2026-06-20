@@ -1,0 +1,47 @@
+version: 1
+name: api-and-dns-capacity
+
+profiles:
+  local:
+    vars:
+      api_base: "http://127.0.0.1:8080"
+      resolver: "1.1.1.1:853"
+
+flows:
+  fetch-health:
+    kind: http
+    stages:
+      - http:
+          method: GET
+          url: "{{vars.api_base}}/health"
+      - assert:
+          status: 200
+
+  dot-query:
+    kind: dns
+    stages:
+      - tcp_connect:
+          target: "{{vars.resolver}}"
+      - tls:
+          sni: "cloudflare-dns.com"
+          alpn: ["dot"]
+      - dns:
+          qname: "example.com"
+          qtype: A
+          edns0:
+            udp_size: 1232
+            options:
+              - code: 65001
+                payload_hex: "cafe"
+
+experiments:
+  find-maximum-load:
+    type: auto_ladder
+    flows: ["fetch-health", "dot-query"]
+    climb:
+      mode: qps_then_workers
+      qps_start: 100
+      qps_step: 100
+      interval: 30s
+      max_workers: 16
+
