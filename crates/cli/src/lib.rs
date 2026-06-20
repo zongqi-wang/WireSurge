@@ -6,15 +6,115 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread;
 use std::time::Duration;
 
+use clap::error::{ContextKind, ContextValue, ErrorKind};
+use clap::{Args, Parser, Subcommand};
 use wiresurge_core::{
     RequestSpec, Result, WireSurgeError, json_array, json_object, json_string, schema_for,
 };
-use wiresurge_dns::{DnsRunConfig, DnsTransport, decode_hex_payload, parse_qtype, run_dns};
+use wiresurge_dns::{
+    DnsRunConfig, DnsTransport, EdnsOption, decode_hex_payload, parse_qtype, run_dns,
+};
 use wiresurge_engine::{RunOptions, run_request, run_stored_request};
 use wiresurge_plugins::PluginManifestDraft;
 use wiresurge_storage::WorkspaceStore;
 
 static SIGNAL_CODE: AtomicU8 = AtomicU8::new(0);
+
+const DEFAULT_EDNS_CODE: u16 = 65001;
+
+const AFTER_HELP: &str = "Run `wiresurge schema <resource>` to inspect accepted shapes.\n\
+Mutating request commands accept --json and return JSON with stable IDs.\n\
+Pass --output json for machine-readable output and structured errors; non-TTY usage never prompts.";
+
+#[derive(Parser)]
+#[command(
+    name = "wiresurge",
+    about = "WireSurge - local-first programmable traffic workbench",
+    after_help = AFTER_HELP,
+    arg_required_else_help = true,
+    disable_version_flag = true
+)]
+struct Cli {
+    #[arg(long, global = true, value_name = "json")]
+    output: Option<String>,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    Schema {
+        resource: String,
+    },
+    #[command(arg_required_else_help = true)]
+    Dns(DnsArgs),
+    Workspace {
+        action: Option<String>,
+    },
+    Request(RequestArgs),
+    Run(RunArgs),
+    Runner {
+        action: Option<String>,
+    },
+    Report {
+        action: Option<String>,
+        id: Option<String>,
+    },
+    Secret {
+        action: Option<String>,
+    },
+    Plugin {
+        action: Option<String>,
+    },
+}
+
+#[derive(Args)]
+struct DnsArgs {
+    server: String,
+    #[arg(long, value_name = "udp|tcp", default_value = "udp")]
+    protocol: String,
+    #[arg(long, default_value_t = 53)]
+    port: u16,
+    #[arg(long, default_value = "example.com")]
+    name: String,
+    #[arg(long = "type", default_value = "A")]
+    qtype: String,
+    #[arg(long, default_value_t = 1)]
+    count: u64,
+    #[arg(long, default_value_t = 1)]
+    concurrency: usize,
+    #[arg(long)]
+    qps: Option<f64>,
+    #[arg(long = "timeout-ms", default_value_t = 2000)]
+    timeout_ms: u64,
+    #[arg(long = "edns-payload-hex")]
+    edns_payload_hex: Option<String>,
+    #[arg(long = "edns-code", value_name = "CODE")]
+    edns_code: Option<u16>,
+}
+
+#[derive(Args)]
+struct RequestArgs {
+    action: String,
+    id: Option<String>,
+    #[arg(long)]
+    json: Option<String>,
+}
+
+#[derive(Args)]
+struct RunArgs {
+    target: String,
+    #[arg(long, default_value_t = 1)]
+    parallel: usize,
+    #[arg(long = "fail-fast")]
+    fail_fast: bool,
+    #[arg(long = "dry-run")]
+    dry_run: bool,
+    #[arg(long)]
+    verbose: bool,
+    #[arg(long)]
+    report: Option<PathBuf>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliOutcome {
@@ -50,74 +150,95 @@ impl CliOutcome {
 }
 
 pub fn dispatch(args: &[String], cwd: PathBuf) -> CliOutcome {
-    let output_json = wants_json_output(args);
-    match run(args, cwd, output_json) {
-        Ok((stdout, code)) => CliOutcome::ok_with_code(stdout, code),
-        Err(error) => CliOutcome::err(error, output_json),
+    let argv = std::iter::once("wiresurge".to_string()).chain(args.iter().cloned());
+    match Cli::try_parse_from(argv) {
+        Ok(cli) => {
+            let output_json = cli.output.as_deref() == Some("json");
+            match run(cli, cwd) {
+                Ok((stdout, code)) => CliOutcome::ok_with_code(stdout, code),
+                Err(error) => CliOutcome::err(error, output_json),
+            }
+        }
+        Err(error) => clap_error_to_outcome(error, raw_wants_json(args)),
     }
 }
 
-fn run(args: &[String], cwd: PathBuf, output_json: bool) -> Result<(String, i32)> {
-    if args.is_empty() || args[0] == "--help" || args[0] == "-h" || args[0] == "help" {
-        return Ok((help_text(), 0));
-    }
+fn run(cli: Cli, cwd: PathBuf) -> Result<(String, i32)> {
+    let output_json = cli.output.as_deref() == Some("json");
     let store = WorkspaceStore::new(cwd);
-    let output = match args[0].as_str() {
-        "schema" => {
-            let resource = args.get(1).ok_or_else(|| {
-                WireSurgeError::new("missing_argument", "schema requires a resource name")
-            })?;
-            schema_for(resource)
-        }
-        "dns" => return dns_command(&args[1..], output_json),
-        "workspace" => workspace_command(&store, &args[1..], output_json),
-        "request" => request_command(&store, &args[1..], output_json),
-        "run" => run_command(&store, &args[1..]),
-        "runner" => runner_command(&store, &args[1..]),
-        "report" => report_command(&store, &args[1..]),
-        "secret" => secret_command(&args[1..]),
-        "plugin" => plugin_command(&args[1..]),
-        other => Err(
-            WireSurgeError::new("unknown_command", format!("unknown command '{other}'"))
-                .with_hint("Run `wiresurge --help`."),
-        ),
-    }?;
+    let output = match cli.command {
+        Command::Schema { resource } => schema_for(&resource)?,
+        Command::Dns(args) => return dns_command(args, output_json),
+        Command::Workspace { action } => workspace_command(&store, action.as_deref(), output_json)?,
+        Command::Request(args) => request_command(&store, args)?,
+        Command::Run(args) => run_command(&store, args)?,
+        Command::Runner { action } => runner_command(&store, action.as_deref())?,
+        Command::Report { action, id } => report_command(&store, action.as_deref(), id.as_deref())?,
+        Command::Secret { .. } => secret_command()?,
+        Command::Plugin { action } => plugin_command(action.as_deref())?,
+    };
     Ok((output, 0))
 }
 
-fn dns_command(args: &[String], output_json: bool) -> Result<(String, i32)> {
-    if args.is_empty() || args[0] == "--help" || args[0] == "-h" {
-        return Ok((dns_help_text(), 0));
+fn raw_wants_json(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "--output=json")
+        || args
+            .windows(2)
+            .any(|window| window[0] == "--output" && window[1] == "json")
+}
+
+fn clap_error_to_outcome(error: clap::Error, output_json: bool) -> CliOutcome {
+    match error.kind() {
+        ErrorKind::DisplayHelp
+        | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        | ErrorKind::DisplayVersion => CliOutcome::ok_with_code(error.render().to_string(), 0),
+        _ => CliOutcome::err(clap_error_to_wiresurge(&error), output_json),
     }
-    let server = args[0].clone();
-    let transport = DnsTransport::from_str(option_value(args, "--protocol").unwrap_or("udp"))?;
-    let port = parse_number_option(args, "--port", 53_u16)?;
-    let count = parse_number_option(args, "--count", 1_u64)?;
-    let concurrency = parse_number_option(args, "--concurrency", 1_usize)?;
-    let timeout_ms = parse_number_option(args, "--timeout-ms", 2000_u64)?;
-    let qps = option_value(args, "--qps")
-        .map(|value| {
-            value.parse::<f64>().map_err(|_| {
-                WireSurgeError::new("invalid_argument", "--qps must be a number").at("qps")
-            })
-        })
-        .transpose()?;
-    let edns_payload = option_value(args, "--edns-payload-hex")
-        .map(decode_hex_payload)
-        .transpose()?;
+}
+
+fn clap_error_to_wiresurge(error: &clap::Error) -> WireSurgeError {
+    let code = match error.kind() {
+        ErrorKind::UnknownArgument => "unknown_argument",
+        ErrorKind::MissingRequiredArgument | ErrorKind::MissingSubcommand => "missing_argument",
+        ErrorKind::ArgumentConflict => "conflicting_arguments",
+        ErrorKind::InvalidSubcommand => "unknown_command",
+        _ => "invalid_argument",
+    };
+    let rendered = error.render().to_string();
+    let message = rendered
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("invalid arguments")
+        .trim_start_matches("error: ")
+        .to_string();
+    let mut wiresurge_error =
+        WireSurgeError::new(code, message).with_hint("Run `wiresurge --help`.");
+    if let Some(ContextValue::String(arg)) = error.get(ContextKind::InvalidArg) {
+        wiresurge_error = wiresurge_error.at(arg.trim_start_matches('-').to_string());
+    }
+    wiresurge_error
+}
+
+fn dns_command(args: DnsArgs, output_json: bool) -> Result<(String, i32)> {
+    let transport = DnsTransport::from_str(&args.protocol)?;
+    let edns_option = match &args.edns_payload_hex {
+        Some(hex) => Some(EdnsOption {
+            code: args.edns_code.unwrap_or(DEFAULT_EDNS_CODE),
+            payload: decode_hex_payload(hex)?,
+        }),
+        None => None,
+    };
     let config = DnsRunConfig {
-        server,
-        port,
+        server: args.server,
+        port: args.port,
         transport,
-        qname: option_value(args, "--name")
-            .unwrap_or("example.com")
-            .to_string(),
-        qtype: parse_qtype(option_value(args, "--type").unwrap_or("A"))?,
-        count,
-        concurrency,
-        timeout: Duration::from_millis(timeout_ms),
-        qps,
-        edns_payload,
+        qname: args.name,
+        qtype: parse_qtype(&args.qtype)?,
+        count: args.count,
+        concurrency: args.concurrency,
+        timeout: Duration::from_millis(args.timeout_ms),
+        qps: args.qps,
+        edns_option,
     };
 
     SIGNAL_CODE.store(0, Ordering::Release);
@@ -239,22 +360,12 @@ impl Drop for SignalGuard {
     fn drop(&mut self) {}
 }
 
-fn parse_number_option<T>(args: &[String], flag: &str, default: T) -> Result<T>
-where
-    T: FromStr,
-{
-    match option_value(args, flag) {
-        Some(value) => value.parse::<T>().map_err(|_| {
-            WireSurgeError::new("invalid_argument", format!("{flag} has an invalid value"))
-                .at(flag.trim_start_matches('-'))
-        }),
-        None => Ok(default),
-    }
-}
-
-fn workspace_command(store: &WorkspaceStore, args: &[String], output_json: bool) -> Result<String> {
-    let action = args.first().map(String::as_str).unwrap_or("show");
-    match action {
+fn workspace_command(
+    store: &WorkspaceStore,
+    action: Option<&str>,
+    output_json: bool,
+) -> Result<String> {
+    match action.unwrap_or("show") {
         "init" => {
             store.init()?;
             let workspace = store.workspace_json()?;
@@ -282,17 +393,14 @@ fn workspace_command(store: &WorkspaceStore, args: &[String], output_json: bool)
     }
 }
 
-fn request_command(store: &WorkspaceStore, args: &[String], _output_json: bool) -> Result<String> {
-    let action = args
-        .first()
-        .ok_or_else(|| WireSurgeError::new("missing_argument", "request requires an action"))?;
-    match action.as_str() {
+fn request_command(store: &WorkspaceStore, args: RequestArgs) -> Result<String> {
+    match args.action.as_str() {
         "create" => {
-            let input = option_value(args, "--json").ok_or_else(|| {
+            let input = args.json.ok_or_else(|| {
                 WireSurgeError::new("missing_json", "request create requires --json '{...}'")
                     .with_hint("Run `wiresurge schema request` to inspect the accepted shape.")
             })?;
-            let request = RequestSpec::from_json(input)?;
+            let request = RequestSpec::from_json(&input)?;
             store.create_request(&request)?;
             Ok(json_object(&[("request", request.to_json())]))
         }
@@ -305,32 +413,32 @@ fn request_command(store: &WorkspaceStore, args: &[String], _output_json: bool) 
             Ok(json_array(&requests))
         }
         "show" => {
-            let id = args.get(1).ok_or_else(|| {
+            let id = args.id.ok_or_else(|| {
                 WireSurgeError::new("missing_argument", "request show requires an id")
             })?;
-            Ok(store.load_request(id)?.to_json())
+            Ok(store.load_request(&id)?.to_json())
         }
         "update" => {
-            let id = args.get(1).ok_or_else(|| {
+            let id = args.id.ok_or_else(|| {
                 WireSurgeError::new("missing_argument", "request update requires an id")
             })?;
-            let input = option_value(args, "--json").ok_or_else(|| {
+            let input = args.json.ok_or_else(|| {
                 WireSurgeError::new("missing_json", "request update requires --json '{...}'")
                     .with_hint("Run `wiresurge schema request` to inspect the accepted shape.")
             })?;
-            let request = RequestSpec::from_json(input)?;
-            store.update_request(id, &request)?;
+            let request = RequestSpec::from_json(&input)?;
+            store.update_request(&id, &request)?;
             Ok(json_object(&[(
                 "request",
-                store.load_request(id)?.to_json(),
+                store.load_request(&id)?.to_json(),
             )]))
         }
         "delete" => {
-            let id = args.get(1).ok_or_else(|| {
+            let id = args.id.ok_or_else(|| {
                 WireSurgeError::new("missing_argument", "request delete requires an id")
             })?;
-            store.delete_request(id)?;
-            Ok(json_object(&[("deleted", json_string(id))]))
+            store.delete_request(&id)?;
+            Ok(json_object(&[("deleted", json_string(&id))]))
         }
         _ => Err(WireSurgeError::new(
             "unknown_request_action",
@@ -339,34 +447,25 @@ fn request_command(store: &WorkspaceStore, args: &[String], _output_json: bool) 
     }
 }
 
-fn run_command(store: &WorkspaceStore, args: &[String]) -> Result<String> {
-    let target = args.first().ok_or_else(|| {
-        WireSurgeError::new(
-            "missing_argument",
-            "run requires a request id or request YAML file",
-        )
-    })?;
+fn run_command(store: &WorkspaceStore, args: RunArgs) -> Result<String> {
     let options = RunOptions {
-        parallel: option_value(args, "--parallel")
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(1),
-        fail_fast: has_flag(args, "--fail-fast"),
-        dry_run: has_flag(args, "--dry-run"),
-        verbose: has_flag(args, "--verbose"),
-        report_dir: option_value(args, "--report").map(PathBuf::from),
+        parallel: args.parallel,
+        fail_fast: args.fail_fast,
+        dry_run: args.dry_run,
+        verbose: args.verbose,
+        report_dir: args.report,
     };
-    if PathBuf::from(target).exists() {
-        let input = fs::read_to_string(target)?;
+    if PathBuf::from(&args.target).exists() {
+        let input = fs::read_to_string(&args.target)?;
         let request = RequestSpec::from_yaml(&input)?;
         Ok(run_request(store, request, options)?.to_json())
     } else {
-        Ok(run_stored_request(store, target, options)?.to_json())
+        Ok(run_stored_request(store, &args.target, options)?.to_json())
     }
 }
 
-fn runner_command(store: &WorkspaceStore, args: &[String]) -> Result<String> {
-    let action = args.first().map(String::as_str).unwrap_or("list");
-    match action {
+fn runner_command(store: &WorkspaceStore, action: Option<&str>) -> Result<String> {
+    match action.unwrap_or("list") {
         "list" | "stats" => store.runner_entries_json(),
         _ => Err(WireSurgeError::new(
             "unknown_runner_action",
@@ -375,103 +474,50 @@ fn runner_command(store: &WorkspaceStore, args: &[String]) -> Result<String> {
     }
 }
 
-fn report_command(store: &WorkspaceStore, args: &[String]) -> Result<String> {
-    let action = args.first().map(String::as_str).unwrap_or("list");
-    match action {
+fn report_command(
+    store: &WorkspaceStore,
+    action: Option<&str>,
+    id: Option<&str>,
+) -> Result<String> {
+    match action.unwrap_or("list") {
         "list" => store.report_entries_json(),
         "show" => {
-            let id = args
-                .get(1)
-                .ok_or_else(|| WireSurgeError::new("missing_argument", "report show requires an id"))?;
+            let id = id.ok_or_else(|| {
+                WireSurgeError::new("missing_argument", "report show requires an id")
+            })?;
             store.load_report_summary(id)
         }
-        "export" => Err(WireSurgeError::new("not_implemented", "report export is reserved for the report phase")
-            .with_hint("Current runs already write summary.json, details.json, and index.html when --report is used.")),
-        _ => Err(WireSurgeError::new("unknown_report_action", "report action must be list, show, or export")),
+        "export" => Err(WireSurgeError::new(
+            "not_implemented",
+            "report export is reserved for the report phase",
+        )
+        .with_hint(
+            "Current runs already write summary.json, details.json, and index.html when --report is used.",
+        )),
+        _ => Err(WireSurgeError::new(
+            "unknown_report_action",
+            "report action must be list, show, or export",
+        )),
     }
 }
 
-fn secret_command(_args: &[String]) -> Result<String> {
-    Err(WireSurgeError::new("not_implemented", "keychain-backed secrets are planned for phase 7")
-        .with_hint("Do not store real secrets in request files; use placeholder values until the keychain adapter lands."))
+fn secret_command() -> Result<String> {
+    Err(
+        WireSurgeError::new("not_implemented", "keychain-backed secrets are planned for phase 7")
+            .with_hint(
+                "Do not store real secrets in request files; use placeholder values until the keychain adapter lands.",
+            ),
+    )
 }
 
-fn plugin_command(args: &[String]) -> Result<String> {
-    let action = args
-        .first()
-        .map(String::as_str)
-        .unwrap_or("manifest-example");
-    match action {
+fn plugin_command(action: Option<&str>) -> Result<String> {
+    match action.unwrap_or("manifest-example") {
         "manifest-example" => Ok(PluginManifestDraft::example().to_json()),
         _ => Err(WireSurgeError::new(
             "unknown_plugin_action",
             "plugin action must be manifest-example",
         )),
     }
-}
-
-fn option_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
-    args.windows(2)
-        .find(|window| window[0] == flag)
-        .map(|window| window[1].as_str())
-}
-
-fn has_flag(args: &[String], flag: &str) -> bool {
-    args.iter().any(|arg| arg == flag)
-}
-
-fn wants_json_output(args: &[String]) -> bool {
-    option_value(args, "--output") == Some("json")
-}
-
-fn help_text() -> String {
-    r#"WireSurge - local-first programmable traffic workbench
-
-Usage:
-  wiresurge schema <workspace|request|environment|workflow|run|report|runner>
-  wiresurge dns <server> [--protocol udp|tcp] [--name <domain>] [--type <qtype>] [--count <n>] [--concurrency <n>] [--qps <n>]
-  wiresurge workspace init|list|show [--output json]
-  wiresurge request create --json '{...}'
-  wiresurge request list|show|update|delete
-  wiresurge run <request-id|request.yaml> [--output json] [--report <dir>] [--parallel <n>] [--dry-run] [--fail-fast] [--verbose]
-  wiresurge runner list|stats [--output json]
-  wiresurge report list|show|export
-  wiresurge secret set|get|delete
-  wiresurge plugin manifest-example
-
-Agent rules:
-  - Mutating request commands accept --json and return JSON with stable IDs.
-  - Errors are structured with code, message, path, hint, and retryable fields when --output json is set.
-  - Non-TTY usage never prompts; use --dry-run and --output json for planning.
-"#
-    .trim()
-    .to_string()
-}
-
-fn dns_help_text() -> String {
-    r#"WireSurge DNS over UDP/TCP
-
-Usage:
-  wiresurge dns <server> [options]
-
-Options:
-  --protocol <udp|tcp>       Transport protocol (default: udp)
-  --port <port>              Target port (default: 53)
-  --name <domain>            Query name (default: example.com)
-  --type <qtype>             A, AAAA, NS, CNAME, SOA, PTR, MX, TXT, SRV, ANY, or numeric (default: A)
-  --count <n>                Total queries (default: 1)
-  --concurrency <n>          Concurrent senders; each owns a UDP socket or TCP connection (default: 1)
-  --qps <n>                  Optional global queries-per-second limit
-  --timeout-ms <ms>          Per-query timeout (default: 2000)
-  --edns-payload-hex <hex>   Add EDNS0 option 65001 with custom bytes
-  --output json              Emit machine-readable metrics
-
-Examples:
-  wiresurge dns 127.0.0.1 --name example.com
-  wiresurge dns 127.0.0.1 --protocol tcp --count 1000 --concurrency 8 --output json
-"#
-    .trim()
-    .to_string()
 }
 
 #[cfg(test)]
@@ -520,6 +566,37 @@ mod tests {
         );
         assert_eq!(outcome.code, 1);
         assert!(outcome.stdout.contains("invalid_dns_transport"));
+    }
+
+    #[test]
+    fn dns_accepts_equals_form_for_output_flag() {
+        let outcome = dispatch(
+            &[
+                "dns".to_string(),
+                "127.0.0.1".to_string(),
+                "--protocol=invalid".to_string(),
+                "--output=json".to_string(),
+            ],
+            temp_dir(),
+        );
+        assert_eq!(outcome.code, 1);
+        assert!(outcome.stdout.contains("invalid_dns_transport"));
+    }
+
+    #[test]
+    fn unknown_flag_is_rejected_not_ignored() {
+        let outcome = dispatch(
+            &[
+                "dns".to_string(),
+                "127.0.0.1".to_string(),
+                "--nope".to_string(),
+                "--output".to_string(),
+                "json".to_string(),
+            ],
+            temp_dir(),
+        );
+        assert_eq!(outcome.code, 1);
+        assert!(outcome.stdout.contains("unknown_argument"));
     }
 
     #[test]
