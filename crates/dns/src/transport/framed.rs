@@ -123,7 +123,9 @@ impl Correlator {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let woke = tokio::time::timeout(remaining, notify.notified()).await.is_ok();
+            let woke = tokio::time::timeout(remaining, notify.notified())
+                .await
+                .is_ok();
             let mut st = self.state.lock().unwrap();
             let slot = st
                 .pending
@@ -153,7 +155,8 @@ impl Correlator {
     pub fn close(&self) {
         let mut st = self.state.lock().unwrap();
         st.closed = true;
-        let waiters: Vec<Arc<Notify>> = st.pending.values().map(|s| Arc::clone(&s.notify)).collect();
+        let waiters: Vec<Arc<Notify>> =
+            st.pending.values().map(|s| Arc::clone(&s.notify)).collect();
         drop(st);
         for notify in waiters {
             notify.notify_one();
