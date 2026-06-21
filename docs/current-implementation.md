@@ -1,17 +1,19 @@
 # Current Implementation
 
-The repository is an early Rust workspace scaffold. It validates the CLI and storage shape, implements a plain HTTP runner and a more capable DNS runner, and establishes report and runner data models. It does **not** yet implement the supervised async engine described in the architecture chapters.
+The repository is an early Rust workspace scaffold. It validates the CLI and storage shape, implements async HTTP and DNS runners, and establishes report and runner data models. It does **not** yet implement the full supervised engine described in the architecture chapters.
 
 ## Workspace Status
 
 | Area | Current behavior | Important limits |
 |---|---|---|
-| `crates/core` | Request schema, a small JSON/JSONC parser, request YAML serialization, structured errors, ID generation, and basic redaction. | The custom JSON/YAML implementation is replacement work under the library-first tenet. The YAML reader only handles the current flat request format. |
-| `crates/cli` | `clap` derive parsing; human-oriented help, suggestions, and terminal color; `schema`, `workspace`, request CRUD, `run`, `dns`, runner/report reads, structured JSON errors, and a plugin manifest example. | Nested `workspace`, `request`, `runner`, and `report` actions are still strings validated by handlers rather than typed Clap subcommands. Secrets and report export are not implemented; there is no IPC engine mode. |
-| `crates/http` | One blocking HTTP/1.1 request to an `http://` target with response status, headers, body, timing, and redaction. | The custom wire parser is replacement work. There is no HTTPS, HTTP/2, redirect following, pooling, chunk decoding, or real parallel execution. Each run sends one request. |
-| `crates/dns` | DNS messages and EDNS0 via NLnet Labs `domain`; UDP/TCP execution with concurrent senders, optional QPS pacing, timeouts, caller-selected EDNS option codes, reusable TCP connections, latency percentiles, and cooperative signal cancellation. | Transport, signal, and histogram code is currently custom and synchronous. There is no DNS-over-TLS, DNS-over-HTTPS, workflow stage integration, or async runtime. |
-| `crates/engine` | Orchestrates one stored or file-based HTTP request, dry runs, runner snapshots, and optional reports. | `--parallel` is accepted but does not send parallel HTTP requests. There is no supervisor, scheduler, ladder, task tree, or connection manager. |
-| `crates/metrics` | Runner, worker, and single-request report summary models. | Metrics are snapshots rather than a live aggregation pipeline. |
+| `crates/core` | Serde-backed JSON/YAML request parsing, structured errors with field paths, ID generation, and output redaction. | The typed model still covers only the current flat request format, not the target workflow schema. JSONC comments are not accepted. |
+| `crates/cli` | `clap` derive parsing; human-oriented help, suggestions, and terminal color; `schema`, `workspace`, request CRUD, `run`, `dns`, runner/report reads, structured JSON errors, and a plugin manifest example. | Secrets return `not_implemented`; report export is reserved; there is no internal IPC engine mode. |
+| `crates/corpus` | Memory-mapped request file library for the async load engine. | No directory watching, incremental loading, or streaming support. |
+| `crates/http` | Async pooled Hyper client for HTTP/1.1, HTTP/2, HTTP and rustls HTTPS; decoded bodies, response limits, timing, redirects-as-results, and redaction. | Redirect following remains intentionally disabled. Each current engine run sends one request, so the pool becomes useful when multi-request execution lands. |
+| `crates/dns` | DNS/EDNS0 via `hickory-proto`; Tokio UDP/TCP workers, QPS pacing, deadlines, late-datagram filtering, reusable TCP connections, HDR percentiles, and cancellation tokens. | There is no DNS-over-TLS, DNS-over-HTTPS, DNS-over-QUIC, or workflow stage integration. `hickory-net` is reserved for that transport phase. |
+| `crates/engine` | Async orchestration for one stored or file-based HTTP request, dry runs, runner snapshots, and optional reports. `load` module drives many-in-flight requests via the async load engine. | `--parallel` is accepted but does not send parallel HTTP requests. There is no supervisor, ladder, task tree, or durable connection manager. |
+| `crates/metrics` | Runner, worker, and report models plus bounded `hdrhistogram` latency aggregation and `LoadRecorder` for async load metrics. | Metrics are post-run snapshots rather than a live aggregation pipeline. |
+| `crates/transport` | `ConnectTarget`, `connect_tcp`, and `connect_udp` helpers used by DNS and engine transport layers. | No connection reuse tracking beyond the DNS crate's own TCP pool. |
 | `crates/storage` | Local `.wiresurge` directories, YAML request files, runner JSON snapshots, and JSON/HTML report files. | No SQLite, keychain, crash-recovery journal, or content-addressed report assets. |
 | `crates/plugins` | Draft manifest and capability types. | No plugin loader, WASM host, sandbox, registry, or ABI. |
 | `apps/web` | Static UI shell, including the proposed Runners view. | It is not wired to an engine. |
@@ -34,7 +36,7 @@ wiresurge secret set|get|delete
 wiresurge plugin manifest-example
 ```
 
-`clap` rejects unknown flags, missing values, and malformed numeric inputs. Human mode provides discoverable help and suggestions. When `--output json` or `--output=json` is used, parse failures and domain failures use the same structured envelope with `code`, `message`, `path`, `hint`, and `retryable` fields. Non-interactive commands do not prompt. Invalid nested action names currently reach WireSurge handler validation; converting those actions to Clap subcommands remains planned.
+`clap` rejects unknown flags, missing values, and malformed numeric inputs. Human mode provides discoverable help and suggestions. When `--output json` or `--output=json` is used, parse failures and command failures use the same structured envelope with `code`, `message`, `path`, `hint`, and `retryable` fields. Non-interactive commands do not prompt.
 
 ## Quick Start
 

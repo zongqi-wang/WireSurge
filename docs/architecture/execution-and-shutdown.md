@@ -1,6 +1,6 @@
 # Execution and Shutdown
 
-> **Target architecture.** The current HTTP engine is blocking and single-request. The current DNS runner uses OS threads and cooperative atomic cancellation. This chapter defines the shared async runtime design.
+> **Mixed status.** HTTP and DNS now run on Tokio, use cancellation tokens, and share async signal handling. The HTTP engine remains single-request, and the supervisor, bounded queues, drain deadlines, and hierarchical task ownership below are target architecture.
 
 ## Tasks, Threads, and Ownership
 

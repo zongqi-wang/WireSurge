@@ -11,10 +11,10 @@ This repository now contains the first Rust workspace scaffold:
 - `crates/core`: schemas, request model, redaction, structured errors.
 - `crates/cli`: the human-first `wiresurge` CLI, parsed by `clap`, with JSON machine mode.
 - `crates/engine`: request execution orchestration, runner heartbeat, reports.
-- `crates/http`: std-only HTTP/1.1 runner for local HTTP targets.
+- `crates/http`: pooled Hyper HTTP/1.1 and HTTP/2 client with rustls HTTPS.
 - `crates/metrics`: runner, worker, and report summary models.
 - `crates/storage`: local `.wiresurge` workspace storage.
-- `crates/dns`: DNS/EDNS0 messages via NLnet Labs `domain`, configurable EDNS option codes, and WireSurge-owned UDP/TCP execution.
+- `crates/dns`: DNS/EDNS0 messages via `hickory-proto` and Tokio UDP/TCP execution.
 - `crates/plugins`: plugin manifest draft types.
 
 ## Quick Start
@@ -34,7 +34,7 @@ cargo run -p wiresurge-cli -- dns 127.0.0.1 --protocol tcp --count 1000 --concur
 cargo run -p wiresurge-cli -- dns 127.0.0.1 --edns-code 65184 --edns-payload-hex cafe --output json
 ```
 
-Each DNS sender owns one connected UDP socket or one reusable TCP connection. Runs report send/receive counts, timeouts, errors, response codes, truncation, throughput, and fixed-memory latency percentiles. Ctrl-C and SIGTERM request cooperative shutdown.
+Each DNS sender owns one connected UDP socket or one reusable TCP connection. Runs report send/receive counts, timeouts, errors, response codes, truncation, throughput, and HDR latency percentiles. Ctrl-C and SIGTERM request cooperative Tokio cancellation.
 
 External dependencies follow [the dependency policy](./docs/dependency-policy.md): narrow established libraries, minimal features, exact direct pins, a committed lockfile, and automated advisory/license/source checks.
 

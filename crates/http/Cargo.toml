@@ -11,4 +11,12 @@ name = "wiresurge_http"
 path = "src/lib.rs"
 
 [dependencies]
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-rustls.workspace = true
+hyper-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+url.workspace = true
 wiresurge-core.workspace = true
