@@ -20,6 +20,11 @@ multiple-versions = "deny"
 wildcards = "deny"
 allow-wildcard-paths = true
 highlight = "simplest-path"
+skip = [
+  # ring (rustls crypto) uses getrandom 0.2, hickory-proto depends on
+  # rand 0.10 which uses getrandom 0.4 — both are required transitive deps.
+  { name = "getrandom" },
+]
 
 [bans.workspace-dependencies]
 duplicates = "deny"
@@ -31,6 +36,7 @@ confidence-threshold = 0.93
 allow = [
   "Apache-2.0",
   "BSD-3-Clause",
+  "ISC",
   "MIT",
   "Unicode-3.0",
 ]

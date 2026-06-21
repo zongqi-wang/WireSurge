@@ -1,11 +1,106 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use wiresurge_core::{json_array, json_object, json_string};
+use hdrhistogram::Histogram;
+use serde::Serialize;
+use wiresurge_core::{Result, WireSurgeError, serialize_json};
 
 mod hist;
 pub use hist::LoadRecorder;
 
-#[derive(Debug, Clone, PartialEq)]
+const LATENCY_MIN_MICROS: u64 = 1;
+const LATENCY_MAX_MICROS: u64 = 60 * 60 * 1_000_000;
+const LATENCY_SIGNIFICANT_DIGITS: u8 = 3;
+
+#[derive(Debug, Clone)]
+pub struct LatencyHistogram {
+    histogram: Histogram<u64>,
+    total_micros: u128,
+    overflows: u64,
+}
+
+impl Default for LatencyHistogram {
+    fn default() -> Self {
+        Self {
+            histogram: Histogram::new_with_bounds(
+                LATENCY_MIN_MICROS,
+                LATENCY_MAX_MICROS,
+                LATENCY_SIGNIFICANT_DIGITS,
+            )
+            .expect("static latency histogram bounds are valid"),
+            total_micros: 0,
+            overflows: 0,
+        }
+    }
+}
+
+impl LatencyHistogram {
+    pub fn record(&mut self, duration: Duration) {
+        let micros = duration
+            .as_micros()
+            .max(LATENCY_MIN_MICROS as u128)
+            .min(u64::MAX as u128) as u64;
+        if self.histogram.record(micros).is_ok() {
+            self.total_micros += micros as u128;
+        } else {
+            self.overflows += 1;
+        }
+    }
+
+    pub fn merge(&mut self, other: &Self) -> Result<()> {
+        self.histogram.add(&other.histogram).map_err(|error| {
+            WireSurgeError::new("latency_histogram_merge_failed", error.to_string())
+        })?;
+        self.total_micros += other.total_micros;
+        self.overflows += other.overflows;
+        Ok(())
+    }
+
+    pub fn len(&self) -> u64 {
+        self.histogram.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.histogram.is_empty()
+    }
+
+    pub fn overflows(&self) -> u64 {
+        self.overflows
+    }
+
+    pub fn min_ms(&self) -> f64 {
+        if self.is_empty() {
+            0.0
+        } else {
+            self.histogram.min() as f64 / 1000.0
+        }
+    }
+
+    pub fn max_ms(&self) -> f64 {
+        if self.is_empty() {
+            0.0
+        } else {
+            self.histogram.max() as f64 / 1000.0
+        }
+    }
+
+    pub fn average_ms(&self) -> f64 {
+        if self.is_empty() {
+            0.0
+        } else {
+            self.total_micros as f64 / self.len() as f64 / 1000.0
+        }
+    }
+
+    pub fn percentile_ms(&self, quantile: f64) -> f64 {
+        if self.is_empty() {
+            0.0
+        } else {
+            self.histogram.value_at_quantile(quantile) as f64 / 1000.0
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WorkerStats {
     pub id: String,
     pub status: String,
@@ -35,23 +130,12 @@ impl WorkerStats {
         }
     }
 
-    pub fn to_json(&self) -> String {
-        json_object(&[
-            ("id", json_string(&self.id)),
-            ("status", json_string(&self.status)),
-            ("qps", format_float(self.qps)),
-            ("rps", format_float(self.rps)),
-            ("p50_ms", format_float(self.p50_ms)),
-            ("p95_ms", format_float(self.p95_ms)),
-            ("p99_ms", format_float(self.p99_ms)),
-            ("error_rate", format_float(self.error_rate)),
-            ("timeout_rate", format_float(self.timeout_rate)),
-            ("open_connections", self.open_connections.to_string()),
-        ])
+    pub fn to_json(&self) -> Result<String> {
+        serialize_json(self)
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RunnerStats {
     pub id: String,
     pub name: String,
@@ -130,40 +214,8 @@ impl RunnerStats {
         self
     }
 
-    pub fn to_json(&self) -> String {
-        let workers = self
-            .workers
-            .iter()
-            .map(WorkerStats::to_json)
-            .collect::<Vec<_>>();
-        json_object(&[
-            ("id", json_string(&self.id)),
-            ("name", json_string(&self.name)),
-            ("source", json_string(&self.source)),
-            ("status", json_string(&self.status)),
-            ("pid", self.pid.to_string()),
-            ("version", json_string(&self.version)),
-            ("started_at", self.started_at.to_string()),
-            ("last_heartbeat", self.last_heartbeat.to_string()),
-            (
-                "active_run_id",
-                self.active_run_id
-                    .as_ref()
-                    .map(|id| json_string(id))
-                    .unwrap_or_else(|| "null".to_string()),
-            ),
-            ("workers", json_array(&workers)),
-            ("qps", format_float(self.qps)),
-            ("rps", format_float(self.rps)),
-            ("p50_ms", format_float(self.p50_ms)),
-            ("p95_ms", format_float(self.p95_ms)),
-            ("p99_ms", format_float(self.p99_ms)),
-            ("error_rate", format_float(self.error_rate)),
-            ("timeout_rate", format_float(self.timeout_rate)),
-            ("open_connections", self.open_connections.to_string()),
-            ("cpu_pct", format_float(self.cpu_pct)),
-            ("memory_bytes", self.memory_bytes.to_string()),
-        ])
+    pub fn to_json(&self) -> Result<String> {
+        serialize_json(self)
     }
 }
 
@@ -203,34 +255,70 @@ impl ReportSummary {
         }
     }
 
-    pub fn to_json(&self) -> String {
-        json_object(&[
-            ("id", json_string(&self.id)),
-            ("started_at", self.started_at.to_string()),
-            ("duration_ms", format_float(self.duration_ms)),
-            ("workflow_hash", json_string(&self.workflow_hash)),
-            (
-                "git_commit",
-                self.git_commit
-                    .as_ref()
-                    .map(|commit| json_string(commit))
-                    .unwrap_or_else(|| "null".to_string()),
-            ),
-            ("status", json_string(&self.status)),
-            ("total_requests", self.total_requests.to_string()),
-            ("total_errors", self.total_errors.to_string()),
-            (
-                "latency_percentiles",
-                json_object(&[
-                    ("p50_ms", format_float(self.p50_ms)),
-                    ("p95_ms", format_float(self.p95_ms)),
-                    ("p99_ms", format_float(self.p99_ms)),
-                ]),
-            ),
-            ("error_summary", json_string(&self.error_summary)),
-            ("redaction_status", json_string(&self.redaction_status)),
-        ])
+    pub fn to_json(&self) -> Result<String> {
+        serialize_json(&ReportSummaryOutput {
+            id: &self.id,
+            started_at: self.started_at,
+            duration_ms: self.duration_ms,
+            workflow_hash: &self.workflow_hash,
+            git_commit: self.git_commit.as_deref(),
+            status: &self.status,
+            total_requests: self.total_requests,
+            total_errors: self.total_errors,
+            latency_percentiles: LatencyPercentiles {
+                p50_ms: self.p50_ms,
+                p95_ms: self.p95_ms,
+                p99_ms: self.p99_ms,
+            },
+            error_summary: &self.error_summary,
+            redaction_status: &self.redaction_status,
+        })
     }
+
+    pub fn to_json_value(&self) -> Result<serde_json::Value> {
+        serde_json::to_value(ReportSummaryOutput {
+            id: &self.id,
+            started_at: self.started_at,
+            duration_ms: self.duration_ms,
+            workflow_hash: &self.workflow_hash,
+            git_commit: self.git_commit.as_deref(),
+            status: &self.status,
+            total_requests: self.total_requests,
+            total_errors: self.total_errors,
+            latency_percentiles: LatencyPercentiles {
+                p50_ms: self.p50_ms,
+                p95_ms: self.p95_ms,
+                p99_ms: self.p99_ms,
+            },
+            error_summary: &self.error_summary,
+            redaction_status: &self.redaction_status,
+        })
+        .map_err(|error| {
+            wiresurge_core::WireSurgeError::new("json_encode_failed", error.to_string())
+        })
+    }
+}
+
+#[derive(Serialize)]
+struct ReportSummaryOutput<'a> {
+    id: &'a str,
+    started_at: u64,
+    duration_ms: f64,
+    workflow_hash: &'a str,
+    git_commit: Option<&'a str>,
+    status: &'a str,
+    total_requests: u64,
+    total_errors: u64,
+    latency_percentiles: LatencyPercentiles,
+    error_summary: &'a str,
+    redaction_status: &'a str,
+}
+
+#[derive(Serialize)]
+struct LatencyPercentiles {
+    p50_ms: f64,
+    p95_ms: f64,
+    p99_ms: f64,
 }
 
 pub fn unix_timestamp() -> u64 {
@@ -240,14 +328,6 @@ pub fn unix_timestamp() -> u64 {
         .unwrap_or_default()
 }
 
-fn format_float(value: f64) -> String {
-    if value.is_finite() {
-        format!("{value:.3}")
-    } else {
-        "0.000".to_string()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,8 +335,31 @@ mod tests {
     #[test]
     fn runner_stats_include_workers() {
         let stats = RunnerStats::local(Some("run-1".to_string()), 2);
-        let json = stats.to_json();
+        let json = stats.to_json().unwrap();
         assert!(json.contains("\"active_run_id\":\"run-1\""));
         assert!(json.contains("worker-1"));
+    }
+
+    #[test]
+    fn latency_histograms_merge_with_bounded_precision() {
+        let mut left = LatencyHistogram::default();
+        left.record(Duration::from_micros(100));
+        left.record(Duration::from_micros(200));
+        let mut right = LatencyHistogram::default();
+        right.record(Duration::from_micros(300));
+        left.merge(&right).unwrap();
+
+        assert_eq!(left.len(), 3);
+        assert_eq!(left.average_ms(), 0.2);
+        assert!((0.299..=0.301).contains(&left.percentile_ms(0.99)));
+        assert_eq!(left.overflows(), 0);
+    }
+
+    #[test]
+    fn latency_histogram_counts_out_of_range_samples() {
+        let mut histogram = LatencyHistogram::default();
+        histogram.record(Duration::from_secs(2 * 60 * 60));
+        assert!(histogram.is_empty());
+        assert_eq!(histogram.overflows(), 1);
     }
 }

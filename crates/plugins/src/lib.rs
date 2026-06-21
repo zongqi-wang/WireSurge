@@ -1,12 +1,13 @@
-use wiresurge_core::{json_array, json_object, json_string};
+use serde::Serialize;
+use wiresurge_core::{Result, serialize_json};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PluginCapability {
     pub name: String,
     pub granted_by_default: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PluginManifestDraft {
     pub id: String,
     pub name: String,
@@ -41,25 +42,7 @@ impl PluginManifestDraft {
         }
     }
 
-    pub fn to_json(&self) -> String {
-        let capabilities = self
-            .capabilities
-            .iter()
-            .map(|capability| {
-                json_object(&[
-                    ("name", json_string(&capability.name)),
-                    (
-                        "granted_by_default",
-                        capability.granted_by_default.to_string(),
-                    ),
-                ])
-            })
-            .collect::<Vec<_>>();
-        json_object(&[
-            ("id", json_string(&self.id)),
-            ("name", json_string(&self.name)),
-            ("version", json_string(&self.version)),
-            ("capabilities", json_array(&capabilities)),
-        ])
+    pub fn to_json(&self) -> Result<String> {
+        serialize_json(self)
     }
 }
