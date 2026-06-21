@@ -11,15 +11,18 @@ name = "wiresurge_dns"
 path = "src/lib.rs"
 
 [dependencies]
+data-encoding.workspace = true
 hickory-proto.workspace = true
-serde.workspace = true
+hyper.workspace = true
 tokio.workspace = true
-tokio-util.workspace = true
 wiresurge-core.workspace = true
-wiresurge-metrics.workspace = true
+wiresurge-http.workspace = true
 wiresurge-transport.workspace = true
 
 [dev-dependencies]
 futures-util.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["server"] }
+hyper-util.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true

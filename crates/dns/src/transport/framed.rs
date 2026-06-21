@@ -41,7 +41,7 @@ pub fn complete(pending: &Pending, buf: &[u8]) {
     let id = u16::from_be_bytes([buf[0], buf[1]]);
     let sender = pending.lock().unwrap().remove(&id);
     if let Some(sender) = sender
-        && let Ok(header) = parse_response_header(buf, id)
+        && let Ok(header) = parse_response_header(buf, Some(id))
     {
         let _ = sender.send(DnsResponse {
             correlation: id,
@@ -65,6 +65,18 @@ pub async fn await_response(
             pending.lock().unwrap().remove(&id);
             Err(TransportError::Timeout)
         }
+    }
+}
+
+/// Wait for all outstanding queries to drain, bounded by `grace`. Shared by
+/// every `Connection::drain` impl (UDP and the framed TCP/DoT path).
+pub async fn drain_pending(pending: &Pending, grace: Duration) {
+    let deadline = tokio::time::Instant::now() + grace;
+    while !pending.lock().unwrap().is_empty() {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
     }
 }
 
@@ -169,12 +181,6 @@ impl Connection for FramedConn {
     }
 
     async fn drain(&self, grace: Duration) {
-        let deadline = tokio::time::Instant::now() + grace;
-        while !self.pending.lock().unwrap().is_empty() {
-            if tokio::time::Instant::now() >= deadline {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
+        drain_pending(&self.pending, grace).await;
     }
 }

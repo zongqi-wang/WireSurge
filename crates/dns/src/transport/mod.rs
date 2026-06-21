@@ -4,6 +4,7 @@ use std::time::Duration;
 use wiresurge_transport::ConnectTarget;
 
 pub mod do53;
+pub mod doh;
 pub mod dot;
 pub mod framed;
 
@@ -49,6 +50,16 @@ pub trait Connection: Send + Sync + 'static {
         request: DnsRequest,
         timeout: Duration,
     ) -> impl Future<Output = Result<DnsResponse, TransportError>> + Send;
+
+    /// True once the connection is permanently unusable (peer GOAWAY, driver
+    /// gone, socket closed). The load engine consults this to stop feeding a
+    /// dead connection instead of hot-spinning on synchronous send failures —
+    /// it matters most for DoH, whose `exchange` returns `ConnectionClosed`
+    /// instantly once the HTTP/2 driver exits. Transports that block on a
+    /// socket per query (Do53/DoT) cannot hot-spin and keep the default.
+    fn is_closed(&self) -> bool {
+        false
+    }
 
     /// Stop accepting new work and let in-flight queries finish within `grace`.
     fn drain(&self, grace: Duration) -> impl Future<Output = ()> + Send;

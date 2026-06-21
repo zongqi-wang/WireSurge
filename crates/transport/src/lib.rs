@@ -26,6 +26,39 @@ impl AppProto {
     }
 }
 
+/// HTTP method for a request-carrying connection (DoH uses GET or POST per
+/// RFC 8484). Kept as a small protocol-agnostic enum so the transport layer
+/// stays free of hyper types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpMethod {
+    Get,
+    Post,
+}
+
+impl HttpMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HttpMethod::Get => "GET",
+            HttpMethod::Post => "POST",
+        }
+    }
+}
+
+/// Everything a request-carrying transport needs to address an HTTP endpoint,
+/// independent of the payload. The adapter (e.g. DoH) fills in scheme, authority
+/// (`https://abc.example/dns-query`), method, and an optional static query
+/// string (the auth token rides here). Generic by design so the same HTTP/2
+/// transport can drive a non-DNS API load test.
+#[derive(Clone)]
+pub struct HttpTemplate {
+    pub method: HttpMethod,
+    /// Absolute origin form: `https://authority/path` (no query).
+    pub base_uri: String,
+    /// Pre-encoded query string appended to every request (without a leading
+    /// `?`), e.g. `token=...`; empty when unused.
+    pub query: String,
+}
+
 /// Where a connection is established and how it is framed before the carried
 /// protocol begins. The `tcp_addr` is always the real socket peer (e.g. the
 /// pod), independent of any PROXY-protocol source/destination addresses added
@@ -38,6 +71,9 @@ pub struct ConnectTarget {
     pub proto: Option<AppProto>,
     pub tls: Option<Arc<rustls::ClientConfig>>,
     pub alpn_relaxed: bool,
+    /// HTTP request template for request-carrying transports (DoH). `None` for
+    /// Do53/DoT.
+    pub http: Option<HttpTemplate>,
 }
 
 impl ConnectTarget {
@@ -48,6 +84,7 @@ impl ConnectTarget {
             proto: None,
             tls: None,
             alpn_relaxed: false,
+            http: None,
         }
     }
 
@@ -62,6 +99,11 @@ impl ConnectTarget {
         self.proto = Some(proto);
         self.sni = sni;
         self.alpn_relaxed = alpn_relaxed;
+        self
+    }
+
+    pub fn with_http(mut self, template: HttpTemplate) -> Self {
+        self.http = Some(template);
         self
     }
 }

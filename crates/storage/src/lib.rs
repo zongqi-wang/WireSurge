@@ -163,11 +163,12 @@ impl WorkspaceStore {
     ) -> Result<()> {
         self.ensure_workspace()?;
         fs::create_dir_all(report_dir)?;
-        fs::write(report_dir.join("summary.json"), summary.to_json()?)?;
+        let summary_json = summary.to_json()?;
+        fs::write(report_dir.join("summary.json"), &summary_json)?;
         fs::write(report_dir.join("details.json"), details_json)?;
         fs::write(
             report_dir.join("index.html"),
-            report_html(summary, details_json)?,
+            report_html(summary, &summary_json, details_json),
         )?;
         fs::create_dir_all(self.reports_dir())?;
         let canonical_dir = report_dir
@@ -175,7 +176,7 @@ impl WorkspaceStore {
             .unwrap_or_else(|_| report_dir.to_path_buf());
         fs::write(
             self.reports_dir().join(format!("{}.json", summary.id)),
-            summary.to_json()?,
+            &summary_json,
         )?;
         fs::write(
             self.reports_dir().join(format!("{}.path", summary.id)),
@@ -245,8 +246,8 @@ impl WorkspaceStore {
     }
 }
 
-fn report_html(summary: &ReportSummary, details_json: &str) -> Result<String> {
-    Ok(format!(
+fn report_html(summary: &ReportSummary, summary_json: &str, details_json: &str) -> String {
+    format!(
         r#"<!doctype html>
 <html lang="en">
 <head>
@@ -271,9 +272,9 @@ fn report_html(summary: &ReportSummary, details_json: &str) -> Result<String> {
         id = summary.id,
         status = summary.status,
         duration = summary.duration_ms,
-        summary = html_escape(&summary.to_json()?),
+        summary = html_escape(summary_json),
         details = html_escape(details_json),
-    ))
+    )
 }
 
 fn parse_stored_json(input: &str) -> Result<serde_json::Value> {

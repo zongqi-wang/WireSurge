@@ -1,6 +1,5 @@
 use std::fs;
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::time::Duration;
 
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -8,20 +7,19 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{Args, Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
+use url::{Position, Url};
 use wiresurge_core::{RequestSpec, Result, WireSurgeError, schema_for, serialize_json};
 use wiresurge_corpus::Corpus;
-use wiresurge_dns::{
-    DnsRunConfig, DnsTransport, EdnsOption, decode_hex_payload, parse_qtype, run_dns,
-};
+use wiresurge_dns::parse_qtype;
 use wiresurge_engine::load::{LoadConfig, LoadProto, LoadStats, run_load};
 use wiresurge_engine::{
     RunOptions, run_request_with_cancellation, run_stored_request_with_cancellation,
 };
 use wiresurge_plugins::PluginManifestDraft;
 use wiresurge_storage::WorkspaceStore;
-use wiresurge_transport::{AppProto, ConnectTarget, TlsParams, build_client_config};
-
-const DEFAULT_EDNS_CODE: u16 = 65001;
+use wiresurge_transport::{
+    AppProto, ConnectTarget, HttpMethod, HttpTemplate, TlsParams, build_client_config,
+};
 
 const AFTER_HELP: &str = "Run `wiresurge schema <resource>` to inspect accepted shapes.\n\
 Mutating request commands accept --json and return JSON with stable IDs.\n\
@@ -43,12 +41,14 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+// The Load variant carries many flags and dwarfs the others, but a clap
+// Subcommand field must impl Args, which Box<LoadArgs> does not — and the enum
+// is parsed once at startup, so the size gap is irrelevant.
+#[allow(clippy::large_enum_variant)]
 enum Command {
     Schema {
         resource: String,
     },
-    #[command(arg_required_else_help = true)]
-    Dns(DnsArgs),
     #[command(arg_required_else_help = true)]
     Load(LoadArgs),
     Workspace {
@@ -72,38 +72,21 @@ enum Command {
 }
 
 #[derive(Args)]
-struct DnsArgs {
-    server: String,
-    #[arg(long, value_name = "udp|tcp", default_value = "udp")]
-    protocol: String,
-    #[arg(long, default_value_t = 53)]
-    port: u16,
-    #[arg(long, default_value = "example.com")]
-    name: String,
-    #[arg(long = "type", default_value = "A")]
-    qtype: String,
-    #[arg(long, default_value_t = 1)]
-    count: u64,
-    #[arg(long, default_value_t = 1)]
-    concurrency: usize,
-    #[arg(long)]
-    qps: Option<f64>,
-    #[arg(long = "timeout-ms", default_value_t = 2000)]
-    timeout_ms: u64,
-    #[arg(long = "edns-payload-hex")]
-    edns_payload_hex: Option<String>,
-    #[arg(long = "edns-code", value_name = "CODE")]
-    edns_code: Option<u16>,
-}
-
-#[derive(Args)]
 struct LoadArgs {
     /// Server address; pod IP:port the socket actually opens.
     server: String,
-    #[arg(long, value_name = "udp|tcp|dot", default_value = "udp")]
+    #[arg(long, value_name = "udp|tcp|dot|doh", default_value = "udp")]
     protocol: String,
     #[arg(long, default_value_t = 53)]
     port: u16,
+    /// DoH endpoint URL (required for --protocol doh), e.g.
+    /// https://resolver.example/dns-query. The socket still opens to <server>;
+    /// the URL host becomes the default SNI and the HTTP :authority.
+    #[arg(long)]
+    url: Option<String>,
+    /// DoH HTTP method: post (raw wire body, default) or get (base64url ?dns=).
+    #[arg(long = "doh-method", value_name = "get|post")]
+    doh_method: Option<String>,
     /// Path to a newline-delimited query-name corpus; falls back to --name.
     #[arg(long)]
     corpus: Option<PathBuf>,
@@ -131,10 +114,10 @@ struct LoadArgs {
     randomize: bool,
     #[arg(long, default_value_t = 0)]
     seed: u64,
-    /// Auth token: EDNS 65184 on Do53/DoT (URL query on DoH, later).
+    /// Auth token: EDNS 65184 on DoT, `?token=` URL query on DoH.
     #[arg(long)]
     token: Option<String>,
-    /// TLS SNI for DoT; defaults to the server IP when unset.
+    /// TLS SNI for DoT/DoH; defaults to the DoH URL host, else the server IP.
     #[arg(long)]
     sni: Option<String>,
     /// Proceed when the TLS peer negotiates no ALPN (assume the protocol).
@@ -233,7 +216,6 @@ async fn run(cli: Cli, cwd: PathBuf) -> Result<(String, i32)> {
     let store = WorkspaceStore::new(cwd);
     let output = match cli.command {
         Command::Schema { resource } => schema_for(&resource)?,
-        Command::Dns(args) => return dns_command(args, output_json).await,
         Command::Load(args) => return load_command(args, output_json).await,
         Command::Workspace { action } => workspace_command(&store, action.as_deref(), output_json)?,
         Command::Request(args) => request_command(&store, args)?,
@@ -285,49 +267,6 @@ fn clap_error_to_wiresurge(error: &clap::Error) -> WireSurgeError {
     wiresurge_error
 }
 
-async fn dns_command(args: DnsArgs, output_json: bool) -> Result<(String, i32)> {
-    let transport = DnsTransport::from_str(&args.protocol)?;
-    let edns_option = match &args.edns_payload_hex {
-        Some(hex) => Some(EdnsOption {
-            code: args.edns_code.unwrap_or(DEFAULT_EDNS_CODE),
-            payload: decode_hex_payload(hex)?,
-        }),
-        None => None,
-    };
-    let config = DnsRunConfig {
-        server: args.server,
-        port: args.port,
-        transport,
-        qname: args.name,
-        qtype: parse_qtype(&args.qtype)?,
-        count: args.count,
-        concurrency: args.concurrency,
-        timeout: Duration::from_millis(args.timeout_ms),
-        qps: args.qps,
-        edns_option,
-    };
-
-    let cancellation = CancellationToken::new();
-    let execution = run_dns(config, cancellation.clone());
-    tokio::pin!(execution);
-    let signal = shutdown_signal();
-    tokio::pin!(signal);
-    let (stats, exit_code) = tokio::select! {
-        result = &mut execution => (result?, 0),
-        signal_code = &mut signal => {
-            let signal_code = signal_code?;
-            cancellation.cancel();
-            (execution.await?, signal_code)
-        }
-    };
-    let output = if output_json {
-        stats.to_json()?
-    } else {
-        stats.to_text()
-    };
-    Ok((output, exit_code))
-}
-
 fn resolve_addr(server: &str, port: u16) -> Result<SocketAddr> {
     if let Ok(addr) = server.parse::<SocketAddr>() {
         return Ok(addr);
@@ -351,21 +290,38 @@ fn build_load_config(args: &LoadArgs) -> Result<LoadConfig> {
         "udp" => LoadProto::Do53Udp,
         "tcp" => LoadProto::Do53Tcp,
         "dot" => LoadProto::Dot,
+        "doh" => LoadProto::Doh,
         other => {
             return Err(WireSurgeError::new(
                 "invalid_dns_transport",
-                format!("protocol must be udp, tcp, or dot, got {other}"),
+                format!("protocol must be udp, tcp, dot, or doh, got {other}"),
             )
             .at("protocol"));
         }
     };
     let is_dot = proto == LoadProto::Dot;
-    if !is_dot && (args.insecure || args.sni.is_some() || args.alpn_relaxed) {
+    let is_doh = proto == LoadProto::Doh;
+    let is_tls = is_dot || is_doh;
+    if !is_tls && (args.insecure || args.sni.is_some() || args.alpn_relaxed) {
         return Err(WireSurgeError::new(
             "tls_flag_without_tls",
-            "--sni, --alpn-relaxed, and --insecure apply only to --protocol dot",
+            "--sni, --alpn-relaxed, and --insecure apply only to --protocol dot or doh",
         )
         .at("protocol"));
+    }
+    if args.url.is_some() && !is_doh {
+        return Err(WireSurgeError::new(
+            "url_requires_doh",
+            "--url is only used by --protocol doh",
+        )
+        .at("url"));
+    }
+    if args.doh_method.is_some() && !is_doh {
+        return Err(WireSurgeError::new(
+            "doh_method_requires_doh",
+            "--doh-method is only used by --protocol doh",
+        )
+        .at("doh-method"));
     }
     if args.duration_s.is_some() && args.count.is_some() {
         return Err(WireSurgeError::new(
@@ -374,10 +330,20 @@ fn build_load_config(args: &LoadArgs) -> Result<LoadConfig> {
         )
         .at("duration-s"));
     }
-    if args.token.is_some() && !is_dot {
+    if args.token.is_some() && !is_tls {
         return Err(WireSurgeError::new(
             "token_requires_encrypted_transport",
-            "--token rides in EDNS 65184 and is only sent over the encrypted dot transport; plain udp/tcp would expose the credential in cleartext",
+            "--token is a credential and is only sent over the encrypted dot or doh transports; plain udp/tcp would expose it in cleartext",
+        )
+        .at("token"));
+    }
+    if args.token.is_some() && args.insecure {
+        // --insecure installs a no-op certificate verifier, so the peer identity
+        // is unauthenticated; sending the credential then exposes it to any MITM
+        // that can terminate the TLS handshake. Refuse the combination.
+        return Err(WireSurgeError::new(
+            "token_requires_verified_peer",
+            "--token must not be combined with --insecure: an unverified peer could capture the credential; drop --insecure or omit the token",
         )
         .at("token"));
     }
@@ -392,6 +358,8 @@ fn build_load_config(args: &LoadArgs) -> Result<LoadConfig> {
             args.sni.clone(),
             args.alpn_relaxed,
         )
+    } else if is_doh {
+        build_doh_target(args, addr)?
     } else {
         ConnectTarget::new(addr)
     };
@@ -416,6 +384,86 @@ fn build_load_config(args: &LoadArgs) -> Result<LoadConfig> {
     };
     config.validate()?;
     Ok(config)
+}
+
+/// Build a DoH connect target from the load args. The socket opens to `addr`
+/// (the pod), while the `--url` host supplies the TLS SNI and the HTTP
+/// `:authority`; the auth token is folded into the request query so it rides
+/// the URL rather than an EDNS option.
+fn build_doh_target(args: &LoadArgs, addr: SocketAddr) -> Result<ConnectTarget> {
+    let raw = args.url.as_deref().ok_or_else(|| {
+        WireSurgeError::new(
+            "doh_url_required",
+            "--protocol doh requires --url, e.g. https://resolver.example/dns-query",
+        )
+        .at("url")
+    })?;
+    let url = Url::parse(raw)
+        .map_err(|error| WireSurgeError::new("invalid_url", error.to_string()).at("url"))?;
+    if url.scheme() != "https" {
+        return Err(WireSurgeError::new("invalid_url", "DoH URL must use https").at("url"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        // Userinfo would ride into the HTTP/2 :authority pseudo-header, which
+        // RFC 9113 §8.3.1 forbids; a conformant peer rejects the request and the
+        // embedded credential leaks. Reject up front rather than fail every query.
+        return Err(WireSurgeError::new(
+            "invalid_url",
+            "DoH URL must not embed userinfo (user:pass@); pass credentials via --token",
+        )
+        .at("url"));
+    }
+    let host = url.host().ok_or_else(|| {
+        WireSurgeError::new("invalid_url", "DoH URL must include a host").at("url")
+    })?;
+    // SNI must be the bare host: rustls rejects an IPv6 literal in its bracketed
+    // URL form (`[::1]`), so use the unbracketed address for that case.
+    let sni_host = match host {
+        url::Host::Ipv6(addr) => addr.to_string(),
+        other => other.to_string(),
+    };
+
+    let method = match args
+        .doh_method
+        .as_deref()
+        .unwrap_or("post")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "post" => HttpMethod::Post,
+        "get" => HttpMethod::Get,
+        other => {
+            return Err(WireSurgeError::new(
+                "invalid_doh_method",
+                format!("--doh-method must be get or post, got {other}"),
+            )
+            .at("doh-method"));
+        }
+    };
+
+    // Scheme + authority + path, no query/fragment: the per-query suffix
+    // (?dns=, ?token=) is appended by the adapter from `query` below.
+    let base_uri = url[..Position::AfterPath].to_string();
+    // Preserve any query already on the URL, then fold the token in with proper
+    // percent-encoding via the url crate rather than hand-splicing.
+    let mut query_url = url.clone();
+    if let Some(token) = &args.token {
+        query_url.query_pairs_mut().append_pair("token", token);
+    }
+    let query = query_url.query().unwrap_or("").to_string();
+
+    let sni = args.sni.clone().or(Some(sni_host));
+    let config = build_client_config(&TlsParams {
+        proto: AppProto::Doh,
+        insecure: args.insecure,
+    })?;
+    Ok(ConnectTarget::new(addr)
+        .with_tls(config, AppProto::Doh, sni, args.alpn_relaxed)
+        .with_http(HttpTemplate {
+            method,
+            base_uri,
+            query,
+        }))
 }
 
 async fn load_command(args: LoadArgs, output_json: bool) -> Result<(String, i32)> {
@@ -720,18 +768,18 @@ mod tests {
     }
 
     #[test]
-    fn dns_help_lists_udp_and_tcp() {
-        let outcome = dispatch(&["dns".to_string(), "--help".to_string()], temp_dir());
+    fn load_help_lists_protocols() {
+        let outcome = dispatch(&["load".to_string(), "--help".to_string()], temp_dir());
         assert_eq!(outcome.code, 0);
-        assert!(outcome.stdout.contains("--protocol <udp|tcp>"));
+        assert!(outcome.stdout.contains("--protocol <udp|tcp|dot|doh>"));
         assert!(outcome.stdout.contains("--concurrency"));
     }
 
     #[test]
-    fn dns_rejects_invalid_protocol_with_structured_error() {
+    fn load_rejects_invalid_protocol_with_structured_error() {
         let outcome = dispatch(
             &[
-                "dns".to_string(),
+                "load".to_string(),
                 "127.0.0.1".to_string(),
                 "--protocol".to_string(),
                 "invalid".to_string(),
@@ -745,10 +793,10 @@ mod tests {
     }
 
     #[test]
-    fn dns_accepts_equals_form_for_output_flag() {
+    fn load_accepts_equals_form_for_output_flag() {
         let outcome = dispatch(
             &[
-                "dns".to_string(),
+                "load".to_string(),
                 "127.0.0.1".to_string(),
                 "--protocol=invalid".to_string(),
                 "--output=json".to_string(),
@@ -763,7 +811,7 @@ mod tests {
     fn unknown_flag_is_rejected_not_ignored() {
         let outcome = dispatch(
             &[
-                "dns".to_string(),
+                "load".to_string(),
                 "127.0.0.1".to_string(),
                 "--nope".to_string(),
                 "--output".to_string(),
@@ -818,6 +866,72 @@ mod tests {
         );
         assert_eq!(outcome.code, 1);
         assert!(outcome.stdout.contains("tls_flag_without_tls"));
+    }
+
+    #[test]
+    fn load_rejects_token_with_insecure() {
+        let outcome = dispatch(
+            &[
+                "load".into(),
+                "127.0.0.1".into(),
+                "--protocol".into(),
+                "doh".into(),
+                "--url".into(),
+                "https://r.example/dns-query".into(),
+                "--token".into(),
+                "secret".into(),
+                "--insecure".into(),
+                "--count".into(),
+                "1".into(),
+                "--output".into(),
+                "json".into(),
+            ],
+            temp_dir(),
+        );
+        assert_eq!(outcome.code, 1);
+        assert!(outcome.stdout.contains("token_requires_verified_peer"));
+    }
+
+    #[test]
+    fn load_rejects_doh_method_on_non_doh() {
+        let outcome = dispatch(
+            &[
+                "load".into(),
+                "127.0.0.1".into(),
+                "--protocol".into(),
+                "udp".into(),
+                "--doh-method".into(),
+                "get".into(),
+                "--count".into(),
+                "1".into(),
+                "--output".into(),
+                "json".into(),
+            ],
+            temp_dir(),
+        );
+        assert_eq!(outcome.code, 1);
+        assert!(outcome.stdout.contains("doh_method_requires_doh"));
+    }
+
+    #[test]
+    fn load_rejects_doh_url_with_userinfo() {
+        let outcome = dispatch(
+            &[
+                "load".into(),
+                "127.0.0.1".into(),
+                "--protocol".into(),
+                "doh".into(),
+                "--url".into(),
+                "https://user:pass@r.example/dns-query".into(),
+                "--count".into(),
+                "1".into(),
+                "--output".into(),
+                "json".into(),
+            ],
+            temp_dir(),
+        );
+        assert_eq!(outcome.code, 1);
+        assert!(outcome.stdout.contains("invalid_url"));
     }
 
     #[test]
