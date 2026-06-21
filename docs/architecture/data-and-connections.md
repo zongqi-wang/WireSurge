@@ -1,6 +1,6 @@
 # Data and Connections
 
-> **Target architecture.** The current scaffold has no corpus service or HTTP connection pool. Its DNS runner already gives each sender its own connected UDP socket or reusable TCP connection, which is consistent with the ownership model below.
+> **Target architecture.** The current scaffold has a memory-mapped query-name corpus but no HTTP connection pool yet. Its DNS load engine already gives each connection actor its own socket — one connected UDP socket, or one TCP/TLS stream multiplexing many in-flight queries — which is consistent with the ownership model below.
 
 ## Corpus Memory and Randomization
 

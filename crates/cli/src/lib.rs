@@ -18,7 +18,7 @@ use wiresurge_engine::{
 use wiresurge_plugins::PluginManifestDraft;
 use wiresurge_storage::WorkspaceStore;
 use wiresurge_transport::{
-    AppProto, ConnectTarget, HttpMethod, HttpTemplate, TlsParams, build_client_config,
+    AppProto, ConnectTarget, HttpMethod, HttpTemplate, ProxyHeader, TlsParams, build_client_config,
 };
 
 const AFTER_HELP: &str = "Run `wiresurge schema <resource>` to inspect accepted shapes.\n\
@@ -117,6 +117,13 @@ struct LoadArgs {
     /// Auth token: EDNS 65184 on DoT, `?token=` URL query on DoH.
     #[arg(long)]
     token: Option<String>,
+    /// PROXY protocol v2 source (mocked customer) as IP:PORT, e.g.
+    /// 192.0.2.10:50000. Requires --proxy-dst; TCP-based transports only.
+    #[arg(long = "proxy-src", value_name = "IP:PORT")]
+    proxy_src: Option<String>,
+    /// PROXY protocol v2 destination (NLB VIP) as IP:PORT. Requires --proxy-src.
+    #[arg(long = "proxy-dst", value_name = "IP:PORT")]
+    proxy_dst: Option<String>,
     /// TLS SNI for DoT/DoH; defaults to the DoH URL host, else the server IP.
     #[arg(long)]
     sni: Option<String>,
@@ -347,7 +354,10 @@ fn build_load_config(args: &LoadArgs) -> Result<LoadConfig> {
         )
         .at("token"));
     }
-    let target = if is_dot {
+    // PROXY v2 rides on TCP-based transports only (it is the first TCP payload);
+    // a UDP socket has nowhere to put it.
+    let proxy = build_proxy_header(args, proto == LoadProto::Do53Udp)?;
+    let mut target = if is_dot {
         let config = build_client_config(&TlsParams {
             proto: AppProto::Dot,
             insecure: args.insecure,
@@ -363,6 +373,9 @@ fn build_load_config(args: &LoadArgs) -> Result<LoadConfig> {
     } else {
         ConnectTarget::new(addr)
     };
+    if let Some(proxy) = proxy {
+        target = target.with_proxy(proxy);
+    }
     let corpus = match &args.corpus {
         Some(path) => Corpus::load(path)?,
         None => Corpus::single(&args.name),
@@ -464,6 +477,61 @@ fn build_doh_target(args: &LoadArgs, addr: SocketAddr) -> Result<ConnectTarget> 
             base_uri,
             query,
         }))
+}
+
+/// Parse the optional PROXY v2 source/destination pair. Both endpoints are
+/// required together; on a UDP transport the header has nowhere to go and is
+/// rejected. The header carries a mocked customer source and the resolver's NLB
+/// VIP destination, independent of the socket peer the run actually opens to.
+fn build_proxy_header(args: &LoadArgs, is_udp: bool) -> Result<Option<ProxyHeader>> {
+    // UDP is the disqualifier whether one or both endpoints are set, so check it
+    // first — otherwise `--protocol udp --proxy-src X` would misleadingly demand
+    // --proxy-dst before revealing that UDP cannot carry the header at all.
+    if is_udp && (args.proxy_src.is_some() || args.proxy_dst.is_some()) {
+        return Err(WireSurgeError::new(
+            "proxy_requires_tcp",
+            "--proxy-src/--proxy-dst ride on a TCP connection; use --protocol tcp, dot, or doh",
+        )
+        .at("proxy"));
+    }
+    let (src, dst) = match (&args.proxy_src, &args.proxy_dst) {
+        (None, None) => return Ok(None),
+        (Some(src), Some(dst)) => (src, dst),
+        _ => {
+            return Err(WireSurgeError::new(
+                "proxy_requires_both_endpoints",
+                "--proxy-src and --proxy-dst must be set together",
+            )
+            .at("proxy"));
+        }
+    };
+    let src = parse_proxy_addr(src, "proxy-src")?;
+    let dst = parse_proxy_addr(dst, "proxy-dst")?;
+    // The wire format carries one family byte for the pair, so a v4/v6 mix can
+    // never be encoded. Reject it here — alongside the other proxy gates — rather
+    // than letting it surface as an opaque per-connection error mid-run.
+    if src.is_ipv4() != dst.is_ipv4() {
+        return Err(WireSurgeError::new(
+            "proxy_family_mismatch",
+            "--proxy-src and --proxy-dst must be the same IP family (both IPv4 or both IPv6)",
+        )
+        .at("proxy"));
+    }
+    Ok(Some(ProxyHeader::new(src, dst)))
+}
+
+/// Parse a PROXY endpoint and canonicalize an IPv4-mapped IPv6 literal
+/// (`[::ffff:a.b.c.d]`) back to its IPv4 form, so the operator gets the TCPv4
+/// header they meant rather than a surprising 36-byte TCPv6 one.
+fn parse_proxy_addr(value: &str, field: &str) -> Result<SocketAddr> {
+    let addr = value.parse::<SocketAddr>().map_err(|error| {
+        WireSurgeError::new(
+            format!("invalid_{}", field.replace('-', "_")),
+            error.to_string(),
+        )
+        .at(field)
+    })?;
+    Ok(SocketAddr::new(addr.ip().to_canonical(), addr.port()))
 }
 
 async fn load_command(args: LoadArgs, output_json: bool) -> Result<(String, i32)> {
@@ -932,6 +1000,129 @@ mod tests {
         );
         assert_eq!(outcome.code, 1);
         assert!(outcome.stdout.contains("invalid_url"));
+    }
+
+    #[test]
+    fn load_rejects_proxy_with_only_one_endpoint() {
+        let outcome = dispatch(
+            &[
+                "load".into(),
+                "127.0.0.1".into(),
+                "--protocol".into(),
+                "tcp".into(),
+                "--proxy-src".into(),
+                "192.0.2.1:50000".into(),
+                "--count".into(),
+                "1".into(),
+                "--output".into(),
+                "json".into(),
+            ],
+            temp_dir(),
+        );
+        assert_eq!(outcome.code, 1);
+        assert!(outcome.stdout.contains("proxy_requires_both_endpoints"));
+    }
+
+    #[test]
+    fn load_rejects_proxy_on_udp() {
+        let outcome = dispatch(
+            &[
+                "load".into(),
+                "127.0.0.1".into(),
+                "--protocol".into(),
+                "udp".into(),
+                "--proxy-src".into(),
+                "192.0.2.1:50000".into(),
+                "--proxy-dst".into(),
+                "203.0.113.5:443".into(),
+                "--count".into(),
+                "1".into(),
+                "--output".into(),
+                "json".into(),
+            ],
+            temp_dir(),
+        );
+        assert_eq!(outcome.code, 1);
+        assert!(outcome.stdout.contains("proxy_requires_tcp"));
+    }
+
+    #[test]
+    fn load_rejects_proxy_family_mismatch() {
+        let outcome = dispatch(
+            &[
+                "load".into(),
+                "127.0.0.1".into(),
+                "--protocol".into(),
+                "tcp".into(),
+                "--proxy-src".into(),
+                "192.0.2.1:50000".into(),
+                "--proxy-dst".into(),
+                "[2001:db8::2]:443".into(),
+                "--count".into(),
+                "1".into(),
+                "--output".into(),
+                "json".into(),
+            ],
+            temp_dir(),
+        );
+        assert_eq!(outcome.code, 1);
+        assert!(outcome.stdout.contains("proxy_family_mismatch"));
+    }
+
+    #[test]
+    fn load_reports_tcp_first_for_udp_with_single_proxy_endpoint() {
+        // UDP is the disqualifier; a single endpoint on udp must report
+        // proxy_requires_tcp, not demand the missing endpoint first.
+        let outcome = dispatch(
+            &[
+                "load".into(),
+                "127.0.0.1".into(),
+                "--protocol".into(),
+                "udp".into(),
+                "--proxy-src".into(),
+                "192.0.2.1:50000".into(),
+                "--count".into(),
+                "1".into(),
+                "--output".into(),
+                "json".into(),
+            ],
+            temp_dir(),
+        );
+        assert_eq!(outcome.code, 1);
+        assert!(outcome.stdout.contains("proxy_requires_tcp"));
+    }
+
+    #[test]
+    fn proxy_addr_canonicalizes_ipv4_mapped_v6() {
+        // An IPv4-mapped IPv6 literal must collapse to its IPv4 form so the
+        // emitted PROXY header is TCPv4 (family 0x11), not a surprising TCPv6.
+        let addr = parse_proxy_addr("[::ffff:192.0.2.1]:443", "proxy-src").unwrap();
+        assert!(addr.is_ipv4(), "::ffff: literal must canonicalize to IPv4");
+        assert_eq!(addr.to_string(), "192.0.2.1:443");
+    }
+
+    #[test]
+    fn load_accepts_proxy_on_tcp() {
+        // count 0 = no work, completes immediately; the point is that valid
+        // --proxy-src/--proxy-dst on a TCP transport parse and build without error.
+        let outcome = dispatch(
+            &[
+                "load".into(),
+                "127.0.0.1".into(),
+                "--protocol".into(),
+                "tcp".into(),
+                "--proxy-src".into(),
+                "192.0.2.1:50000".into(),
+                "--proxy-dst".into(),
+                "203.0.113.5:443".into(),
+                "--count".into(),
+                "0".into(),
+                "--output".into(),
+                "json".into(),
+            ],
+            temp_dir(),
+        );
+        assert_eq!(outcome.code, 0, "{}", outcome.stdout);
     }
 
     #[test]
