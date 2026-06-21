@@ -60,7 +60,7 @@ The same state machine and event model must serve direct CLI calls and IPC calls
 
 ## Workspace Evolution
 
-The repository currently contains `core`, `engine`, `http`, `dns`, `metrics`, `storage`, `plugins`, and `cli` crates. The target boundaries add dedicated control, corpus, and transport crates when their behavior becomes substantial enough to justify the split.
+The repository currently contains `core`, `engine`, `http`, `dns`, `corpus`, `transport`, `metrics`, `storage`, `plugins`, and `cli` crates. The target boundaries add a dedicated control crate when its behavior becomes substantial enough to justify the split.
 
 ```text
 project-root/
@@ -68,10 +68,10 @@ project-root/
     core/              domain model, workflow schema, validation, redaction
     control/           supervisor, IPC, cancellation, lifecycle       (target)
     engine/            scheduler, work queues, rate control, run state
-    corpus/            mapped datasets and deterministic selection     (target)
+    corpus/            mapped datasets and deterministic selection
     http/              HTTP execution, pooling, redirects, assertions
     dns/               DNS messages, transports, and query generation
-    transport/         TCP, TLS, UDP, PROXY protocol, connection actors (target)
+    transport/         TCP, TLS, UDP, PROXY protocol, connection actors
     metrics/           histograms, counters, exporters, report model
     plugins/           WASM host, capabilities, and plugin ABI
     storage/           workspace data, atomic reports, crash recovery

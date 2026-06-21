@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+pub mod h2;
+
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Bytes;
 use hyper::header::{HeaderName, HeaderValue, USER_AGENT};
@@ -26,12 +28,6 @@ pub struct HttpClient {
 }
 
 impl HttpClient {
-    pub fn new() -> Result<Self> {
-        Ok(Self {
-            client: build_hyper_client()?,
-        })
-    }
-
     pub fn shared() -> Result<Self> {
         match SHARED_HTTP_CLIENT.get_or_init(|| build_hyper_client().map_err(|error| error.message))
         {
