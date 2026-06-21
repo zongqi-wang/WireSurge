@@ -49,16 +49,12 @@ impl ProxyHeader {
                 out.extend_from_slice(&12u16.to_be_bytes());
                 out.extend_from_slice(&src.ip().octets());
                 out.extend_from_slice(&dst.ip().octets());
-                out.extend_from_slice(&src.port().to_be_bytes());
-                out.extend_from_slice(&dst.port().to_be_bytes());
             }
             (SocketAddr::V6(src), SocketAddr::V6(dst)) => {
                 out.push(FAM_TCP6);
                 out.extend_from_slice(&36u16.to_be_bytes());
                 out.extend_from_slice(&src.ip().octets());
                 out.extend_from_slice(&dst.ip().octets());
-                out.extend_from_slice(&src.port().to_be_bytes());
-                out.extend_from_slice(&dst.port().to_be_bytes());
             }
             _ => {
                 return Err(WireSurgeError::new(
@@ -68,6 +64,8 @@ impl ProxyHeader {
                 .at("proxy"));
             }
         }
+        out.extend_from_slice(&self.src.port().to_be_bytes());
+        out.extend_from_slice(&self.dst.port().to_be_bytes());
         Ok(out)
     }
 }

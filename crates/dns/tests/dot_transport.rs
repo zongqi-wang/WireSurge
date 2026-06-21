@@ -22,8 +22,8 @@ const KEY_DER: &[u8] = include_bytes!("fixtures/key.der");
 enum ServerMode {
     /// Echo every query back with the response bit set.
     Echo,
-    /// Echo, but silently swallow one out of every `1/drop_ratio` queries so the
-    /// client must reap the slot on timeout.
+    /// Echo, but silently swallow every other query so the client must reap the
+    /// slot on timeout.
     DropEveryOther,
     /// Negotiate no ALPN at all (exercises the relaxed-ALPN client path).
     EchoNoAlpn,
