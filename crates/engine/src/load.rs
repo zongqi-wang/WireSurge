@@ -110,7 +110,7 @@ struct WorkSource {
     deadline: Option<Instant>,
     gate: Option<RateGate>,
     corpus: Arc<Corpus>,
-    wires: Vec<Vec<u8>>,
+    wires: Vec<Arc<[u8]>>,
     seed: u64,
     mode: SelectMode,
 }
@@ -132,7 +132,7 @@ impl WorkSource {
         }
         let row = self.corpus.select_index(index, self.seed, self.mode);
         Some(DnsRequest {
-            wire: self.wires[row].clone(),
+            wire: Arc::clone(&self.wires[row]),
         })
     }
 
@@ -255,7 +255,10 @@ pub async fn run_load(config: LoadConfig, cancel: CancellationToken) -> Result<L
     let wires = config
         .corpus
         .iter_rows()
-        .map(|name| wiresurge_dns::build_query(0, name, config.qtype, edns_option.as_ref()))
+        .map(|name| {
+            wiresurge_dns::build_query(0, name, config.qtype, edns_option.as_ref())
+                .map(Arc::<[u8]>::from)
+        })
         .collect::<Result<Vec<_>>>()?;
 
     let start = Instant::now();
@@ -327,6 +330,18 @@ impl LoadStats {
         }
     }
 
+    /// Rate of NOERROR (rcode 0) responses. A response with any other rcode
+    /// (REFUSED, SERVFAIL, ...) still counts toward `recv_qps`, so a server that
+    /// cheaply rejects load reports a high `recv_qps` but a low `noerror_qps`;
+    /// the latter is the only honest measure of resolved traffic.
+    pub fn noerror_qps(&self) -> f64 {
+        if self.duration_s > 0.0 {
+            self.recorder.rcodes[0] as f64 / self.duration_s
+        } else {
+            0.0
+        }
+    }
+
     pub fn to_json(&self) -> Result<String> {
         serialize_json(&serde_json::json!({
             "duration_s": self.duration_s,
@@ -337,6 +352,8 @@ impl LoadStats {
             "conn_errors": self.recorder.conn_errors,
             "truncated": self.recorder.truncated,
             "recv_qps": self.recv_qps(),
+            "noerror_qps": self.noerror_qps(),
+            "rcodes": self.recorder.rcode_breakdown(),
             "latency_ms": {
                 "min_ms": self.recorder.min_ms(),
                 "mean_ms": self.recorder.mean_ms(),
