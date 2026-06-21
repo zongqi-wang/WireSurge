@@ -15,7 +15,7 @@ These projects and specifications inform the steering architecture. A reference 
 ## Protocols and Dependencies
 
 - [Hickory Proto](https://docs.rs/hickory-proto/latest/hickory_proto/): selected DNS message, name, record type, and EDNS0 primitives.
-- [Hickory Net](https://docs.rs/hickory-net/latest/hickory_net/): candidate transport layer for future encrypted DNS stages.
+- [Hickory Net](https://docs.rs/hickory-net/latest/hickory_net/): candidate transport layer for a future DNS-over-QUIC stage (DoT and DoH ship on `rustls`/`ring`).
 - [NLnet Labs `domain`](https://github.com/NLnetLabs/domain): reviewed protocol-first alternative.
 - [`clap`](https://docs.rs/clap/latest/clap/): selected command-line parser and help system.
 - [Serde](https://serde.rs/): selected typed serialization framework.

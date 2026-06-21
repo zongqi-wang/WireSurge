@@ -5,10 +5,10 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use wiresurge_transport::{ConnectTarget, connect_tcp, connect_udp};
 
-use super::framed::{FramedConn, Pending, await_response, complete, register};
+use super::framed::{FramedConn, Pending, await_response, complete, drain_pending, register};
 use super::{Connection, DnsRequest, DnsResponse, Transport, TransportCaps, TransportError};
+use crate::MAX_DNS_MESSAGE_LEN;
 
-const MAX_DNS_MESSAGE_LEN: usize = u16::MAX as usize;
 const UDP_IN_FLIGHT: usize = 1024;
 const TCP_IN_FLIGHT: usize = 256;
 
@@ -70,13 +70,7 @@ impl Connection for UdpConn {
     }
 
     async fn drain(&self, grace: Duration) {
-        let deadline = tokio::time::Instant::now() + grace;
-        while !self.pending.lock().unwrap().is_empty() {
-            if tokio::time::Instant::now() >= deadline {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
+        drain_pending(&self.pending, grace).await;
     }
 }
 

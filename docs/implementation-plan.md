@@ -31,8 +31,8 @@ The current repository implements:
 - JSON/HTML reports from `--report`.
 - Static UI shell with a Runners section.
 - DNS/EDNS0 with caller-selected option codes and a plugin manifest foundation.
-- DNS over Tokio UDP and TCP with concurrent tasks, reusable TCP connections, QPS pacing, JSON metrics, and cooperative cancellation.
-- DNS message encoding, decoding, names, record types, and EDNS options use `hickory-proto`; future encrypted transports will evaluate `hickory-net`.
+- A many-in-flight DNS load engine over Do53 UDP/TCP, DoT, and DoH, with a shared lock-free work source, process-wide QPS pacing, count/duration budgets, JSON metrics, and cooperative cancellation.
+- DNS message encoding, decoding, names, record types, and EDNS options use `hickory-proto`; encrypted transports (DoT/DoH) use `rustls` with the `ring` provider over the shared `transport` seam.
 - Dependency admission rules and `cargo-deny` CI for reviewed sources, licenses, advisories, exact direct pins, and minimal features.
 - Consolidated mdBook source and GitHub Pages automation.
 

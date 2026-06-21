@@ -18,19 +18,19 @@ The structural backbone is a protocol-agnostic `Transport` trait + a per-connect
 
 ## Crate / module layout
 
-Existing crates and their public APIs stay intact. The synchronous `run_dns` path stays untouched and green; the async engine is additive behind a Cargo feature and a new `wiresurge load` subcommand, then becomes the default high-rate path at cutover.
+The async engine landed as the `wiresurge load` subcommand and is now the only DNS load path: at cutover the earlier synchronous `run_dns` worker-per-connection engine and its `dns` subcommand were deleted, since `load` covers Do53 UDP/TCP plus DoT and DoH with many in flight. The shared parse helpers (`build_query`, `parse_response_header`, `parse_qtype`, `decode_hex_payload`, `EdnsOption`) stay public in `dns`.
 
 - **`transport`** (new) — shared connection seam: `ConnectTarget`/`BoxedStream`, rustls `ClientConfig` builders (ring provider, ALPN, SNI, resumption, relaxed-ALPN), hand-rolled PROXY-protocol-v2 encoder, and `connect_with_ppv2` (TCP dial → PPv2 → optional TLS).
 - **`corpus`** (new) — mmap newline file + offset table + selection (`-R`); seeded permutation for visit-each-once.
-- **`dns`** (grow) — keep the existing sync path and parse helpers public; add a `Transport` trait + request/response/error/caps types and per-protocol implementations: UDP and TCP (Do53), DoT, DoH.
+- **`dns`** (grow) — keep the message-codec and parse helpers public; add a `Transport` trait + request/response/error/caps types and per-protocol implementations: UDP and TCP (Do53), DoT, DoH.
 - **`engine`** (grow) — `LoadConfig`/`run_load`, the `WorkSource` scheduler (rate credits, depth, duration, count, randomize), the per-connection actor, and the connection pool.
-- **`metrics`** (grow) — keep existing JSON shapes; add an hdrhistogram-backed per-actor recorder merged off the hot path, and an NDJSON emitter.
-- **`cli`** (grow) — new `load` subcommand + explicit tokio runtime builder.
+- **`metrics`** (grow) — an hdrhistogram-backed per-actor recorder (`LoadRecorder`) merged off the hot path, plus an NDJSON emitter.
+- **`cli`** (grow) — the `load` subcommand + explicit tokio runtime builder.
 - **`http`, `core`, `plugins`, `storage`** — unchanged.
 
 ## The async in-flight pipeline
 
-The current sync path serializes each query (send-then-recv), so max QPS = `workers / RTT`. The new pipeline keeps `-q` requests outstanding **per connection**, multiplied across `-c` connections.
+The retired sync path serialized each query (send-then-recv), capping max QPS at `workers / RTT`. This pipeline keeps `-q` requests outstanding **per connection**, multiplied across `-c` connections.
 
 - **Do53-UDP** — one connected `UdpSocket`. A dedicated reader task dispatches each datagram by txid into a slab of `oneshot` senders. `exchange()` allocates a txid, sends, and awaits its receiver under a timeout; on timeout the slab entry is reaped so the actor slot reopens. Many `exchange` futures coexist.
 - **Do53-TCP & DoT** — channel-split actor over `tokio::io::split`. A writer task drains an mpsc, allocates a per-connection txid from a slab (unique within the outstanding window), and writes `[u16 len][msg]` without ever awaiting a read. A reader task parses each framed message's txid and rcode/tc and completes the matching `oneshot`. DoT negotiates ALPN `dot`.
@@ -83,7 +83,7 @@ The corpus is mmap'd and indexed by a one-time newline scan (memchr) on a blocki
 
 ## NDJSON metrics
 
-A per-actor hdrhistogram recorder (microseconds, 3 significant figures) is merged into an aggregate via mpsc roughly every 250ms by one aggregator task — no shared hot lock at 20k+/s. This replaces the coarse power-of-two latency histogram, giving true p50/p95/p99/p999.
+A per-actor hdrhistogram recorder (`LoadRecorder`, microseconds, 3 significant figures) lives in each connection actor and is merged into an aggregate off the hot path — no shared hot lock at 20k+/s — giving true p50/p95/p99/p999. (A streaming NDJSON emitter merged via mpsc on a fixed interval remains planned; the current path merges once at run end.)
 
 NDJSON is built with the existing `wiresurge_core` json helpers (no `serde_json`):
 
@@ -94,7 +94,7 @@ NDJSON is built with the existing `wiresurge_core` json helpers (no `serde_json`
 // final: {"summary":true, "duration_s":..., full percentiles, "goaway_count":..., "reconnects":..., "cancelled":...}
 ```
 
-The final summary keeps the existing `DnsRunStats` field names plus `conns/streams/in_flight_peak/goaway_count/reconnects`, so downstream tooling and `wiresurge report` keep working.
+The final summary is the `LoadStats` shape — `duration_s`, `sent`, `received`, `timeouts`, `errors`, `conn_errors`, `truncated`, `recv_qps`, and a `latency_ms` percentile block — to be extended with `conns/streams/in_flight_peak/goaway_count/reconnects` so downstream tooling and `wiresurge report` keep working.
 
 ## Dependencies
 

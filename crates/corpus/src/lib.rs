@@ -80,14 +80,27 @@ impl Corpus {
         std::str::from_utf8(&self.backing.bytes()[start as usize..end as usize]).unwrap_or("")
     }
 
-    pub fn select(&self, idx: u64, seed: u64, mode: SelectMode) -> &str {
+    /// Iterate over every row name in order. Used to encode the corpus once
+    /// before a run starts.
+    pub fn iter_rows(&self) -> impl Iterator<Item = &str> {
+        (0..self.rows.len()).map(|index| self.row(index))
+    }
+
+    /// Map a query index to the corpus row it selects under `mode`, without
+    /// dereferencing to the name. Callers that hold a precomputed per-row table
+    /// (e.g. prebuilt wire messages) index into it with this instead of `select`.
+    pub fn select_index(&self, idx: u64, seed: u64, mode: SelectMode) -> usize {
         let n = self.rows.len() as u64;
         let row = match mode {
             SelectMode::Sequential => idx % n,
             SelectMode::RandomReplace => splitmix64(idx ^ seed) % n,
             SelectMode::RandomPermute => permute_index(idx, n, seed),
         };
-        self.row(row as usize)
+        row as usize
+    }
+
+    pub fn select(&self, idx: u64, seed: u64, mode: SelectMode) -> &str {
+        self.row(self.select_index(idx, seed, mode))
     }
 }
 

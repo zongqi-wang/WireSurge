@@ -22,3 +22,11 @@ wiresurge-http.workspace = true
 wiresurge-metrics.workspace = true
 wiresurge-storage.workspace = true
 wiresurge-transport.workspace = true
+
+[dev-dependencies]
+data-encoding.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["server"] }
+hyper-util.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true

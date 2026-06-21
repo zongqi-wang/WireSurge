@@ -9,6 +9,7 @@ use wiresurge_core::{Result, WireSurgeError, serialize_json};
 use wiresurge_corpus::{Corpus, SelectMode};
 use wiresurge_dns::EdnsOption;
 use wiresurge_dns::transport::do53::{TcpTransport, UdpTransport};
+use wiresurge_dns::transport::doh::DohTransport;
 use wiresurge_dns::transport::dot::DotTransport;
 use wiresurge_dns::transport::{Connection, DnsRequest, Transport, TransportError};
 use wiresurge_metrics::LoadRecorder;
@@ -28,6 +29,15 @@ pub enum LoadProto {
     Do53Udp,
     Do53Tcp,
     Dot,
+    Doh,
+}
+
+impl LoadProto {
+    /// DoH carries the auth token in the URL query, not in an EDNS option, so
+    /// the work source must not append the token OPT for this protocol.
+    fn token_rides_in_edns(self) -> bool {
+        !matches!(self, LoadProto::Doh)
+    }
 }
 
 #[derive(Clone)]
@@ -90,17 +100,19 @@ impl RateGate {
 
 /// Shared, lock-free source of work. Every actor pulls query indexes from one
 /// atomic counter, so a process-wide QPS cap and total count apply across all
-/// connections without a hot lock.
+/// connections without a hot lock. Each corpus row's full wire message is
+/// encoded once before the run clock starts (`wires`); `next` only clones the
+/// matching prebuilt buffer (the transport patches in the transaction id at send
+/// time), so the hot path never re-runs the DNS encoder per query.
 struct WorkSource {
     seq: AtomicU64,
     count: Option<u64>,
     deadline: Option<Instant>,
     gate: Option<RateGate>,
     corpus: Arc<Corpus>,
-    qtype: u16,
+    wires: Vec<Vec<u8>>,
     seed: u64,
     mode: SelectMode,
-    edns_option: Option<EdnsOption>,
 }
 
 impl WorkSource {
@@ -118,10 +130,10 @@ impl WorkSource {
                 return None;
             }
         }
-        let name = self.corpus.select(index, self.seed, self.mode);
-        let wire =
-            wiresurge_dns::build_query(0, name, self.qtype, self.edns_option.as_ref()).ok()?;
-        Some(DnsRequest { wire })
+        let row = self.corpus.select_index(index, self.seed, self.mode);
+        Some(DnsRequest {
+            wire: self.wires[row].clone(),
+        })
     }
 
     fn exhausted(&self) -> bool {
@@ -150,7 +162,13 @@ async fn run_actor<T: Transport>(
     let mut inflight = FuturesUnordered::new();
 
     loop {
-        while inflight.len() < cap && !cancel.is_cancelled() {
+        // Stop feeding a dead connection. A closed transport (peer GOAWAY,
+        // driver gone) makes exchange() fail synchronously; without this guard a
+        // DoH actor would hot-spin, draining the shared WorkSource at CPU speed,
+        // burning a core, and starving the healthy connections of the run's
+        // count/QPS budget. There is no reconnect, so once closed this actor is
+        // done after its in-flight queries settle.
+        while inflight.len() < cap && !cancel.is_cancelled() && !conn_ref.is_closed() {
             match work.next(&cancel).await {
                 Some(request) => {
                     recorder.on_sent();
@@ -165,7 +183,7 @@ async fn run_actor<T: Transport>(
         }
 
         if inflight.is_empty() {
-            if cancel.is_cancelled() || work.exhausted() {
+            if cancel.is_cancelled() || work.exhausted() || conn_ref.is_closed() {
                 break;
             }
             continue;
@@ -220,6 +238,26 @@ fn record(
 
 pub async fn run_load(config: LoadConfig, cancel: CancellationToken) -> Result<LoadStats> {
     config.validate()?;
+
+    let edns_option = config
+        .token
+        .as_ref()
+        .filter(|_| config.proto.token_rides_in_edns())
+        .map(|token| EdnsOption {
+            code: TOKEN_EDNS_CODE,
+            payload: token.as_bytes().to_vec(),
+        });
+
+    // Encode every corpus row's wire message once, before the run clock starts,
+    // so the hot path only clones a prebuilt buffer and a large corpus cannot
+    // delay the first send. A malformed name therefore surfaces here rather than
+    // on first send.
+    let wires = config
+        .corpus
+        .iter_rows()
+        .map(|name| wiresurge_dns::build_query(0, name, config.qtype, edns_option.as_ref()))
+        .collect::<Result<Vec<_>>>()?;
+
     let start = Instant::now();
     let work = Arc::new(WorkSource {
         seq: AtomicU64::new(0),
@@ -227,17 +265,13 @@ pub async fn run_load(config: LoadConfig, cancel: CancellationToken) -> Result<L
         deadline: config.duration.map(|d| start + d),
         gate: config.qps_cap.map(|qps| RateGate { start, qps }),
         corpus: Arc::clone(&config.corpus),
-        qtype: config.qtype,
+        wires,
         seed: config.seed,
         mode: if config.randomize {
             SelectMode::RandomReplace
         } else {
             SelectMode::Sequential
         },
-        edns_option: config.token.as_ref().map(|token| EdnsOption {
-            code: TOKEN_EDNS_CODE,
-            payload: token.as_bytes().to_vec(),
-        }),
     });
 
     let mut actors = Vec::with_capacity(config.concurrency);
@@ -255,6 +289,9 @@ pub async fn run_load(config: LoadConfig, cancel: CancellationToken) -> Result<L
                 target, work, in_flight, timeout, cancel,
             )),
             LoadProto::Dot => tokio::spawn(run_actor::<DotTransport>(
+                target, work, in_flight, timeout, cancel,
+            )),
+            LoadProto::Doh => tokio::spawn(run_actor::<DohTransport>(
                 target, work, in_flight, timeout, cancel,
             )),
         };

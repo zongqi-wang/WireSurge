@@ -22,8 +22,8 @@ const KEY_DER: &[u8] = include_bytes!("fixtures/key.der");
 enum ServerMode {
     /// Echo every query back with the response bit set.
     Echo,
-    /// Echo, but silently swallow one out of every `1/drop_ratio` queries so the
-    /// client must reap the slot on timeout.
+    /// Echo, but silently swallow every other query so the client must reap the
+    /// slot on timeout.
     DropEveryOther,
     /// Negotiate no ALPN at all (exercises the relaxed-ALPN client path).
     EchoNoAlpn,
@@ -191,4 +191,67 @@ async fn dot_strict_alpn_rejects_peer_without_alpn() {
         result.is_err(),
         "strict ALPN must reject a peer that offers none"
     );
+}
+
+/// PROXY v2 header precedes the TLS ClientHello on the DoT path. The server reads
+/// the 28-byte v4 PROXY header off the raw TCP stream BEFORE handing it to the
+/// TLS acceptor; if the header were written after (or interleaved with) the
+/// ClientHello, the signature read would consume handshake bytes and the TLS
+/// accept would fail. This is the high-risk ordering path that the plain-TCP
+/// proxy test cannot exercise.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dot_proxy_header_precedes_client_hello() {
+    use wiresurge_transport::ProxyHeader;
+
+    const SIGNATURE: [u8; 12] = [
+        0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
+    ];
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let acceptor = TlsAcceptor::from(server_config(ServerMode::Echo));
+    tokio::spawn(async move {
+        let (mut tcp, _) = listener.accept().await.unwrap();
+        // Read the PROXY preamble in the clear, before any TLS bytes.
+        let mut fixed = [0u8; 16];
+        tcp.read_exact(&mut fixed).await.unwrap();
+        assert_eq!(
+            &fixed[..12],
+            &SIGNATURE,
+            "PROXY signature before ClientHello"
+        );
+        assert_eq!(fixed[13], 0x11, "TCPv4 family");
+        let block_len = u16::from_be_bytes([fixed[14], fixed[15]]) as usize;
+        let mut block = vec![0u8; block_len];
+        tcp.read_exact(&mut block).await.unwrap();
+        // Now the remaining stream is the TLS handshake + DoT frames.
+        let mut tls = acceptor.accept(tcp).await.unwrap();
+        let mut len_buf = [0u8; 2];
+        if tls.read_exact(&mut len_buf).await.is_ok() {
+            let len = u16::from_be_bytes(len_buf) as usize;
+            let mut msg = vec![0u8; len];
+            if tls.read_exact(&mut msg).await.is_ok() {
+                msg[2] = 0x81;
+                msg[3] = 0x80;
+                let mut frame = Vec::with_capacity(msg.len() + 2);
+                frame.extend_from_slice(&(msg.len() as u16).to_be_bytes());
+                frame.extend_from_slice(&msg);
+                let _ = tls.write_all(&frame).await;
+                let _ = tls.flush().await;
+            }
+        }
+    });
+
+    let proxy = ProxyHeader::new(
+        "192.0.2.10:50000".parse().unwrap(),
+        "203.0.113.5:443".parse().unwrap(),
+    );
+    let conn = DotTransport::connect(target(addr, false).with_proxy(proxy))
+        .await
+        .expect("DoT connect with a PROXY preamble must succeed");
+    let response = conn
+        .exchange(request(), Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(response.rcode, 0);
 }
