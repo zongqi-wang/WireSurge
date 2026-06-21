@@ -1,6 +1,6 @@
 # References
 
-These projects and specifications inform the steering architecture. A reference is not automatically a selected dependency; selections are recorded in the [Dependency Policy](dependency-policy.md) or an architecture decision record.
+These projects and specifications inform the steering architecture. A reference is not automatically a selected dependency.
 
 ## Product and Runtime
 
@@ -10,7 +10,7 @@ These projects and specifications inform the steering architecture. A reference 
 - [Tokio runtime builder](https://docs.rs/tokio/latest/tokio/runtime/struct.Builder.html): bounded worker-thread configuration.
 - [Tokio signals](https://docs.rs/tokio/latest/tokio/signal/): asynchronous platform signal integration.
 - [Tokio `CancellationToken`](https://docs.rs/tokio-util/latest/tokio_util/sync/struct.CancellationToken.html): hierarchical cooperative cancellation.
-- [Hyper client](https://docs.rs/hyper-util/latest/hyper_util/client/legacy/struct.Client.html): reusable connection pools.
+- [Hyper HTTP/2 client connection](https://docs.rs/hyper/latest/hyper/client/conn/http2/index.html): low-level connection driver used for DoH.
 
 ## Protocols and Dependencies
 

@@ -12,13 +12,15 @@
 - [Protocols, Plugins, and Observability](architecture/protocols-plugins-observability.md)
 - [Desktop and Distribution](architecture/desktop-and-distribution.md)
 
-# Specifications and Policy
+# Specifications
 
 - [Workflow Model](workflow-model.md)
-- [Dependency Policy](dependency-policy.md)
-  - [ADR 0001: Dependency-Backed Protocol Runtime](adr/0001-dependency-backed-protocol-runtime.md)
 
 # Delivery
 
 - [Implementation Plan](implementation-plan.md)
+- [Load Engine Plan](load-engine-plan.md)
+
+# Reference
+
 - [References](references.md)

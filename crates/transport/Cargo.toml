@@ -11,5 +11,8 @@ name = "wiresurge_transport"
 path = "src/lib.rs"
 
 [dependencies]
+rustls.workspace = true
+rustls-native-certs.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
 wiresurge-core.workspace = true
