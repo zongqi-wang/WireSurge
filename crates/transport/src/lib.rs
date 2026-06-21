@@ -1,11 +1,14 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio_rustls::client::TlsStream;
 use wiresurge_core::{Result, WireSurgeError};
 
+mod ppv2;
 mod tls;
+pub use ppv2::ProxyHeader;
 pub use tls::{TlsParams, build_client_config};
 
 /// Application protocol carried over a connection, used to negotiate ALPN and to
@@ -74,6 +77,9 @@ pub struct ConnectTarget {
     /// HTTP request template for request-carrying transports (DoH). `None` for
     /// Do53/DoT.
     pub http: Option<HttpTemplate>,
+    /// PROXY protocol v2 header to prepend to a TCP connection (before TLS/DNS).
+    /// `None` disables it; only valid on TCP-based transports.
+    pub proxy: Option<ProxyHeader>,
 }
 
 impl ConnectTarget {
@@ -85,6 +91,7 @@ impl ConnectTarget {
             tls: None,
             alpn_relaxed: false,
             http: None,
+            proxy: None,
         }
     }
 
@@ -106,10 +113,15 @@ impl ConnectTarget {
         self.http = Some(template);
         self
     }
+
+    pub fn with_proxy(mut self, proxy: ProxyHeader) -> Self {
+        self.proxy = Some(proxy);
+        self
+    }
 }
 
 pub async fn connect_tcp(target: &ConnectTarget) -> Result<TcpStream> {
-    let stream = TcpStream::connect(target.tcp_addr).await.map_err(|error| {
+    let mut stream = TcpStream::connect(target.tcp_addr).await.map_err(|error| {
         WireSurgeError::new("connect_failed", error.to_string())
             .at("server")
             .retryable(true)
@@ -117,6 +129,24 @@ pub async fn connect_tcp(target: &ConnectTarget) -> Result<TcpStream> {
     stream.set_nodelay(true).map_err(|error| {
         WireSurgeError::new("set_nodelay_failed", error.to_string()).retryable(true)
     })?;
+    // The PROXY v2 header is the very first thing on the wire, ahead of the TLS
+    // ClientHello or the DNS length-prefixed frame, so a downstream listener
+    // reads it before the carried protocol begins. Flush it before handing the
+    // stream to the TLS connector, which would otherwise interleave its own
+    // first write.
+    if let Some(proxy) = &target.proxy {
+        let header = proxy.encode()?;
+        stream.write_all(&header).await.map_err(|error| {
+            WireSurgeError::new("proxy_write_failed", error.to_string())
+                .at("proxy")
+                .retryable(true)
+        })?;
+        stream.flush().await.map_err(|error| {
+            WireSurgeError::new("proxy_write_failed", error.to_string())
+                .at("proxy")
+                .retryable(true)
+        })?;
+    }
     Ok(stream)
 }
 
@@ -135,9 +165,8 @@ pub async fn connect_udp(target: &ConnectTarget) -> Result<UdpSocket> {
     Ok(socket)
 }
 
-/// Establish a TCP connection and wrap it in TLS. The PROXY-protocol preamble
-/// (Stage 5) belongs between the TCP connect and the TLS handshake; it has not
-/// landed yet, so this is the seam where it will go.
+/// Establish a TCP connection (writing the PROXY v2 preamble first if the target
+/// carries one) and wrap it in TLS.
 pub async fn connect_tls(target: &ConnectTarget) -> Result<TlsStream<TcpStream>> {
     let config = target.tls.clone().ok_or_else(|| {
         WireSurgeError::new(

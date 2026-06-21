@@ -1,6 +1,6 @@
 # Protocols, Plugins, and Observability
 
-> **Mixed status.** DNS UDP/TCP, configurable EDNS0 options, filesystem reports, basic redaction, and runner snapshots exist. The composable stage engine, broader protocol set, sandboxed plugins, and live observability pipeline are target features.
+> **Mixed status.** A many-in-flight DNS load engine over Do53 UDP/TCP, DoT, and DoH, configurable EDNS0 options, filesystem reports, basic redaction, and runner snapshots exist. The composable stage engine, broader protocol set, sandboxed plugins, and live observability pipeline are target features.
 
 ## Protocol Stages
 
@@ -16,7 +16,7 @@ Best-in-class packet rate and arbitrary stack composition pull in different dire
 
 ### Current DNS boundary
 
-`hickory-proto` owns DNS names, record types, complete message construction/parsing, and EDNS0 encoding. WireSurge owns Tokio socket choice, one-owner connection reuse, pacing, deadlines, cancellation, and run metrics. Responses are counted only after their ID, response bit, opcode, and echoed question match the request. An EDNS option is represented by a caller-selected `u16` code plus raw bytes; code 65001 remains the CLI default for compatibility, while codes such as 65184 can be selected explicitly. `hickory-net` is reserved for a reviewed encrypted-DNS phase.
+`hickory-proto` owns DNS names, record types, complete message construction/parsing, and EDNS0 encoding. WireSurge owns Tokio socket choice, the per-connection actor and its many-in-flight multiplexer, pacing, deadlines, cancellation, and run metrics. The `load` engine runs over a protocol-agnostic `Transport`/`Connection` seam with Do53 UDP/TCP, DoT, and DoH implementations; replies are correlated by transaction id on Do53/DoT and by HTTP/2 stream on DoH, and a response is counted once its header validates (rcode, response bit, opcode). An EDNS option is a caller-selected `u16` code plus raw bytes; the `--token` auth credential rides EDNS option 65184 on DoT and the `?token=` URL query on DoH. DNS-over-QUIC is reserved for a later transport phase.
 
 ## Plugin Model
 
