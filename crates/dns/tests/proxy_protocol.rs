@@ -45,7 +45,6 @@ async fn spawn_proxy_checked_echo(report: tokio::sync::oneshot::Sender<Vec<u8>>)
         full.extend_from_slice(&block);
         let _ = report.send(full);
 
-        // Now serve length-prefixed DNS: echo each query with the response bit.
         loop {
             let mut len_buf = [0u8; 2];
             if tcp.read_exact(&mut len_buf).await.is_err() {

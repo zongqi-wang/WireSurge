@@ -239,8 +239,6 @@ fn record(
 pub async fn run_load(config: LoadConfig, cancel: CancellationToken) -> Result<LoadStats> {
     config.validate()?;
 
-    // DoH carries the auth token in the URL query, not in an EDNS option, so the
-    // token OPT is appended for every protocol except DoH.
     let edns_option = config
         .token
         .as_ref()
