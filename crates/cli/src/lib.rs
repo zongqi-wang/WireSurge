@@ -354,9 +354,7 @@ fn build_load_config(args: &LoadArgs) -> Result<LoadConfig> {
         )
         .at("token"));
     }
-    // PROXY v2 rides on TCP-based transports only (it is the first TCP payload);
-    // a UDP socket has nowhere to put it.
-    let proxy = build_proxy_header(args, proto == LoadProto::Do53Udp)?;
+    let proxy = build_proxy_header(args)?;
     let mut target = if is_dot {
         let config = build_client_config(&TlsParams {
             proto: AppProto::Dot,
@@ -480,20 +478,12 @@ fn build_doh_target(args: &LoadArgs, addr: SocketAddr) -> Result<ConnectTarget> 
 }
 
 /// Parse the optional PROXY v2 source/destination pair. Both endpoints are
-/// required together; on a UDP transport the header has nowhere to go and is
-/// rejected. The header carries a mocked customer source and the resolver's NLB
-/// VIP destination, independent of the socket peer the run actually opens to.
-fn build_proxy_header(args: &LoadArgs, is_udp: bool) -> Result<Option<ProxyHeader>> {
-    // UDP is the disqualifier whether one or both endpoints are set, so check it
-    // first — otherwise `--protocol udp --proxy-src X` would misleadingly demand
-    // --proxy-dst before revealing that UDP cannot carry the header at all.
-    if is_udp && (args.proxy_src.is_some() || args.proxy_dst.is_some()) {
-        return Err(WireSurgeError::new(
-            "proxy_requires_tcp",
-            "--proxy-src/--proxy-dst ride on a TCP connection; use --protocol tcp, dot, or doh",
-        )
-        .at("proxy"));
-    }
+/// required together. The header carries a mocked customer source and the
+/// resolver's NLB VIP destination, independent of the socket peer the run
+/// actually opens to. It rides every protocol: a stream connection
+/// (TCP/DoT/DoH) writes it as the connection preamble, a UDP transport prepends
+/// it to each datagram.
+fn build_proxy_header(args: &LoadArgs) -> Result<Option<ProxyHeader>> {
     let (src, dst) = match (&args.proxy_src, &args.proxy_dst) {
         (None, None) => return Ok(None),
         (Some(src), Some(dst)) => (src, dst),
@@ -560,18 +550,27 @@ async fn load_command(args: LoadArgs, output_json: bool) -> Result<(String, i32)
 
 fn format_load_text(stats: &LoadStats) -> String {
     let recorder = &stats.recorder;
+    let rcodes = recorder
+        .rcode_breakdown()
+        .into_iter()
+        .map(|(name, count)| format!("{name} {count}"))
+        .collect::<Vec<_>>()
+        .join("  ");
     format!(
-        "duration {:.2}s  sent {}  received {}  recv_qps {:.0}\n\
+        "duration {:.2}s  sent {}  received {}  recv_qps {:.0}  noerror_qps {:.0}\n\
          timeouts {}  errors {}  conn_errors {}  truncated {}\n\
+         rcodes  {}\n\
          latency_ms  p50 {:.2}  p95 {:.2}  p99 {:.2}  max {:.2}{}",
         stats.duration_s,
         recorder.sent,
         recorder.received,
         stats.recv_qps(),
+        stats.noerror_qps(),
         recorder.timeouts,
         recorder.errors,
         recorder.conn_errors,
         recorder.truncated,
+        if rcodes.is_empty() { "none" } else { &rcodes },
         recorder.percentile_ms(0.50),
         recorder.percentile_ms(0.95),
         recorder.percentile_ms(0.99),
@@ -1024,7 +1023,7 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_proxy_on_udp() {
+    fn load_accepts_proxy_on_udp() {
         let outcome = dispatch(
             &[
                 "load".into(),
@@ -1034,16 +1033,15 @@ mod tests {
                 "--proxy-src".into(),
                 "192.0.2.1:50000".into(),
                 "--proxy-dst".into(),
-                "203.0.113.5:443".into(),
+                "203.0.113.5:53".into(),
                 "--count".into(),
-                "1".into(),
+                "0".into(),
                 "--output".into(),
                 "json".into(),
             ],
             temp_dir(),
         );
-        assert_eq!(outcome.code, 1);
-        assert!(outcome.stdout.contains("proxy_requires_tcp"));
+        assert_eq!(outcome.code, 0, "{}", outcome.stdout);
     }
 
     #[test]
@@ -1070,9 +1068,7 @@ mod tests {
     }
 
     #[test]
-    fn load_reports_tcp_first_for_udp_with_single_proxy_endpoint() {
-        // UDP is the disqualifier; a single endpoint on udp must report
-        // proxy_requires_tcp, not demand the missing endpoint first.
+    fn load_rejects_udp_proxy_with_single_endpoint() {
         let outcome = dispatch(
             &[
                 "load".into(),
@@ -1089,7 +1085,7 @@ mod tests {
             temp_dir(),
         );
         assert_eq!(outcome.code, 1);
-        assert!(outcome.stdout.contains("proxy_requires_tcp"));
+        assert!(outcome.stdout.contains("proxy_requires_both_endpoints"));
     }
 
     #[test]
