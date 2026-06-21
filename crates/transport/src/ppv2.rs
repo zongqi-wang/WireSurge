@@ -1,12 +1,12 @@
 //! PROXY protocol v2 header encoding.
 //!
-//! The header is written as the very first bytes on a TCP connection, before any
-//! TLS ClientHello or DNS frame, so a downstream listener (NLB / Global
-//! Resolver) attributes the connection to the carried `src`/`dst` rather than to
-//! the real socket peer. WireSurge uses it to present a mocked customer source
-//! and the resolver's NLB VIP destination while the socket itself opens to the
-//! pod under test. Only the v2 binary PROXY command for TCP is emitted (the only
-//! shape the load path needs); LOCAL, UDP, and UNIX address families are not.
+//! The header attributes a connection or datagram to a carried `src`/`dst`
+//! rather than the real socket peer, so the Global Resolver applies its customer
+//! ACL to the carried source; an unspoofed query is REFUSED. A stream transport
+//! (TCP/DoT/DoH) writes it as the connection preamble; a datagram transport
+//! (Do53-UDP) prefixes every datagram. The carried transport selects byte-14's
+//! low nibble (STREAM vs DGRAM); only the v2 PROXY command over
+//! AF_INET/AF_INET6 is emitted.
 
 use std::net::SocketAddr;
 
@@ -18,10 +18,24 @@ const SIGNATURE: [u8; 12] = [
 ];
 /// Byte 13: version 2 (upper nibble) + PROXY command (lower nibble).
 const VER_CMD: u8 = 0x21;
-/// Byte 14: AF_INET + STREAM.
-const FAM_TCP4: u8 = 0x11;
-/// Byte 14: AF_INET6 + STREAM.
-const FAM_TCP6: u8 = 0x21;
+const AF_INET: u8 = 0x10;
+const AF_INET6: u8 = 0x20;
+
+/// Transport carried under the PROXY header, selecting byte-14's low nibble.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyTransport {
+    Stream,
+    Dgram,
+}
+
+impl ProxyTransport {
+    fn proto_nibble(self) -> u8 {
+        match self {
+            ProxyTransport::Stream => 0x01,
+            ProxyTransport::Dgram => 0x02,
+        }
+    }
+}
 
 /// A source/destination address pair to advertise via PROXY protocol v2. Both
 /// endpoints must be the same IP family; mixing v4 and v6 is rejected because
@@ -37,21 +51,23 @@ impl ProxyHeader {
         Self { src, dst }
     }
 
-    /// Serialize the full v2 header (16-byte fixed prefix + address block).
-    pub fn encode(&self) -> Result<Vec<u8>> {
+    /// Serialize the full v2 header (16-byte fixed prefix + address block) for
+    /// the given carried transport.
+    pub fn encode(&self, transport: ProxyTransport) -> Result<Vec<u8>> {
+        let proto = transport.proto_nibble();
         let mut out = Vec::with_capacity(52);
         out.extend_from_slice(&SIGNATURE);
         out.push(VER_CMD);
 
         match (self.src, self.dst) {
             (SocketAddr::V4(src), SocketAddr::V4(dst)) => {
-                out.push(FAM_TCP4);
+                out.push(AF_INET | proto);
                 out.extend_from_slice(&12u16.to_be_bytes());
                 out.extend_from_slice(&src.ip().octets());
                 out.extend_from_slice(&dst.ip().octets());
             }
             (SocketAddr::V6(src), SocketAddr::V6(dst)) => {
-                out.push(FAM_TCP6);
+                out.push(AF_INET6 | proto);
                 out.extend_from_slice(&36u16.to_be_bytes());
                 out.extend_from_slice(&src.ip().octets());
                 out.extend_from_slice(&dst.ip().octets());
@@ -80,16 +96,34 @@ mod tests {
             "192.0.2.1:50000".parse().unwrap(),
             "203.0.113.7:443".parse().unwrap(),
         );
-        let bytes = header.encode().unwrap();
+        let bytes = header.encode(ProxyTransport::Stream).unwrap();
         assert_eq!(bytes.len(), 28);
         assert_eq!(&bytes[..12], &SIGNATURE);
         assert_eq!(bytes[12], 0x21);
         assert_eq!(bytes[13], 0x11);
         assert_eq!(&bytes[14..16], &12u16.to_be_bytes());
-        assert_eq!(&bytes[16..20], &[192, 0, 2, 1]); // src addr
-        assert_eq!(&bytes[20..24], &[203, 0, 113, 7]); // dst addr
-        assert_eq!(&bytes[24..26], &50000u16.to_be_bytes()); // src port
-        assert_eq!(&bytes[26..28], &443u16.to_be_bytes()); // dst port
+        assert_eq!(&bytes[16..20], &[192, 0, 2, 1]);
+        assert_eq!(&bytes[20..24], &[203, 0, 113, 7]);
+        assert_eq!(&bytes[24..26], &50000u16.to_be_bytes());
+        assert_eq!(&bytes[26..28], &443u16.to_be_bytes());
+    }
+
+    #[test]
+    fn encodes_udp4_golden_bytes() {
+        let header = ProxyHeader::new(
+            "52.5.87.206:40000".parse().unwrap(),
+            "10.216.17.23:5353".parse().unwrap(),
+        );
+        let bytes = header.encode(ProxyTransport::Dgram).unwrap();
+        assert_eq!(bytes.len(), 28);
+        assert_eq!(&bytes[..12], &SIGNATURE);
+        assert_eq!(bytes[12], 0x21);
+        assert_eq!(bytes[13], 0x12);
+        assert_eq!(&bytes[14..16], &12u16.to_be_bytes());
+        assert_eq!(&bytes[16..20], &[52, 5, 87, 206]);
+        assert_eq!(&bytes[20..24], &[10, 216, 17, 23]);
+        assert_eq!(&bytes[24..26], &40000u16.to_be_bytes());
+        assert_eq!(&bytes[26..28], &5353u16.to_be_bytes());
     }
 
     #[test]
@@ -98,7 +132,7 @@ mod tests {
             "[2001:db8::1]:50000".parse().unwrap(),
             "[2001:db8::2]:443".parse().unwrap(),
         );
-        let bytes = header.encode().unwrap();
+        let bytes = header.encode(ProxyTransport::Stream).unwrap();
         assert_eq!(bytes.len(), 52);
         assert_eq!(&bytes[..12], &SIGNATURE);
         assert_eq!(bytes[12], 0x21);
@@ -118,6 +152,9 @@ mod tests {
             "192.0.2.1:1".parse().unwrap(),
             "[2001:db8::2]:443".parse().unwrap(),
         );
-        assert_eq!(header.encode().unwrap_err().code, "proxy_family_mismatch");
+        assert_eq!(
+            header.encode(ProxyTransport::Stream).unwrap_err().code,
+            "proxy_family_mismatch"
+        );
     }
 }

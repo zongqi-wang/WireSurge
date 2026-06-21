@@ -89,4 +89,24 @@ impl LoadRecorder {
     pub fn percentile_ms(&self, quantile: f64) -> f64 {
         self.hist.value_at_quantile(quantile) as f64 / 1000.0
     }
+
+    /// Non-zero rcode counts keyed by name (unknown rcodes as `rcodeN`).
+    pub fn rcode_breakdown(&self) -> std::collections::BTreeMap<String, u64> {
+        const NAMES: [&str; 11] = [
+            "NOERROR", "FORMERR", "SERVFAIL", "NXDOMAIN", "NOTIMP", "REFUSED", "YXDOMAIN",
+            "YXRRSET", "NXRRSET", "NOTAUTH", "NOTZONE",
+        ];
+        self.rcodes
+            .iter()
+            .enumerate()
+            .filter(|&(_, &count)| count > 0)
+            .map(|(code, &count)| {
+                let name = NAMES
+                    .get(code)
+                    .map(|name| name.to_string())
+                    .unwrap_or_else(|| format!("rcode{code}"));
+                (name, count)
+            })
+            .collect()
+    }
 }
