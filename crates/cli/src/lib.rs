@@ -1,9 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::thread;
 use std::time::Duration;
 
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -11,20 +8,18 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{Args, Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
-use wiresurge_core::{
-    RequestSpec, Result, WireSurgeError, json_array, json_object, json_string, schema_for,
-};
+use wiresurge_core::{RequestSpec, Result, WireSurgeError, schema_for, serialize_json};
 use wiresurge_corpus::Corpus;
 use wiresurge_dns::{
     DnsRunConfig, DnsTransport, EdnsOption, decode_hex_payload, parse_qtype, run_dns,
 };
 use wiresurge_engine::load::{LoadConfig, LoadProto, LoadStats, run_load};
-use wiresurge_engine::{RunOptions, run_request, run_stored_request};
+use wiresurge_engine::{
+    RunOptions, run_request_with_cancellation, run_stored_request_with_cancellation,
+};
 use wiresurge_plugins::PluginManifestDraft;
 use wiresurge_storage::WorkspaceStore;
 use wiresurge_transport::{AppProto, ConnectTarget, TlsParams, build_client_config};
-
-static SIGNAL_CODE: AtomicU8 = AtomicU8::new(0);
 
 const DEFAULT_EDNS_CODE: u16 = 65001;
 
@@ -193,7 +188,8 @@ impl CliOutcome {
         if output_json {
             Self {
                 code: 1,
-                stdout: json_object(&[("error", error.to_json())]),
+                stdout: serde_json::to_string(&serde_json::json!({ "error": error }))
+                    .unwrap_or_else(|_| error.to_json()),
                 stderr: String::new(),
             }
         } else {
@@ -211,7 +207,19 @@ pub fn dispatch(args: &[String], cwd: PathBuf) -> CliOutcome {
     match Cli::try_parse_from(argv) {
         Ok(cli) => {
             let output_json = cli.output.as_deref() == Some("json");
-            match run(cli, cwd) {
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    return CliOutcome::err(
+                        WireSurgeError::new("runtime_initialization_failed", error.to_string()),
+                        output_json,
+                    );
+                }
+            };
+            match runtime.block_on(run(cli, cwd)) {
                 Ok((stdout, code)) => CliOutcome::ok_with_code(stdout, code),
                 Err(error) => CliOutcome::err(error, output_json),
             }
@@ -220,16 +228,16 @@ pub fn dispatch(args: &[String], cwd: PathBuf) -> CliOutcome {
     }
 }
 
-fn run(cli: Cli, cwd: PathBuf) -> Result<(String, i32)> {
+async fn run(cli: Cli, cwd: PathBuf) -> Result<(String, i32)> {
     let output_json = cli.output.as_deref() == Some("json");
     let store = WorkspaceStore::new(cwd);
     let output = match cli.command {
         Command::Schema { resource } => schema_for(&resource)?,
-        Command::Dns(args) => return dns_command(args, output_json),
-        Command::Load(args) => return load_command(args, output_json),
+        Command::Dns(args) => return dns_command(args, output_json).await,
+        Command::Load(args) => return load_command(args, output_json).await,
         Command::Workspace { action } => workspace_command(&store, action.as_deref(), output_json)?,
         Command::Request(args) => request_command(&store, args)?,
-        Command::Run(args) => run_command(&store, args)?,
+        Command::Run(args) => return run_command(&store, args, output_json).await,
         Command::Runner { action } => runner_command(&store, action.as_deref())?,
         Command::Report { action, id } => report_command(&store, action.as_deref(), id.as_deref())?,
         Command::Secret { .. } => secret_command()?,
@@ -277,7 +285,7 @@ fn clap_error_to_wiresurge(error: &clap::Error) -> WireSurgeError {
     wiresurge_error
 }
 
-fn dns_command(args: DnsArgs, output_json: bool) -> Result<(String, i32)> {
+async fn dns_command(args: DnsArgs, output_json: bool) -> Result<(String, i32)> {
     let transport = DnsTransport::from_str(&args.protocol)?;
     let edns_option = match &args.edns_payload_hex {
         Some(hex) => Some(EdnsOption {
@@ -299,33 +307,21 @@ fn dns_command(args: DnsArgs, output_json: bool) -> Result<(String, i32)> {
         edns_option,
     };
 
-    SIGNAL_CODE.store(0, Ordering::Release);
-    let _signal_guard = install_signal_handlers()?;
-    let cancellation = Arc::new(AtomicBool::new(false));
-    let watcher_cancellation = Arc::clone(&cancellation);
-    let watcher_done = Arc::new(AtomicBool::new(false));
-    let watcher_done_thread = Arc::clone(&watcher_done);
-    let signal_watcher = thread::spawn(move || {
-        while !watcher_done_thread.load(Ordering::Acquire) {
-            if SIGNAL_CODE.load(Ordering::Acquire) != 0 {
-                watcher_cancellation.store(true, Ordering::Release);
-                break;
-            }
-            thread::sleep(Duration::from_millis(5));
+    let cancellation = CancellationToken::new();
+    let execution = run_dns(config, cancellation.clone());
+    tokio::pin!(execution);
+    let signal = shutdown_signal();
+    tokio::pin!(signal);
+    let (stats, exit_code) = tokio::select! {
+        result = &mut execution => (result?, 0),
+        signal_code = &mut signal => {
+            let signal_code = signal_code?;
+            cancellation.cancel();
+            (execution.await?, signal_code)
         }
-    });
-    let run_result = run_dns(config, cancellation);
-    watcher_done.store(true, Ordering::Release);
-    let _ = signal_watcher.join();
-    let stats = run_result?;
-    let exit_code = match SIGNAL_CODE.load(Ordering::Acquire) {
-        130 => 130,
-        143 => 143,
-        _ if stats.cancelled => 130,
-        _ => 0,
     };
     let output = if output_json {
-        stats.to_json()
+        stats.to_json()?
     } else {
         stats.to_text()
     };
@@ -422,63 +418,28 @@ fn build_load_config(args: &LoadArgs) -> Result<LoadConfig> {
     Ok(config)
 }
 
-fn load_command(args: LoadArgs, output_json: bool) -> Result<(String, i32)> {
+async fn load_command(args: LoadArgs, output_json: bool) -> Result<(String, i32)> {
     let config = build_load_config(&args)?;
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(std::thread::available_parallelism().map_or(8, |n| n.get().min(48)))
-        .enable_io()
-        .enable_time()
-        .thread_name("wiresurge-io")
-        .build()
-        .map_err(|error| WireSurgeError::new("runtime_init_failed", error.to_string()))?;
-
-    let cancel = CancellationToken::new();
-    let (stats, signalled) = runtime.block_on(async {
-        let signal_cancel = cancel.clone();
-        let signal_task = tokio::spawn(async move {
-            wait_for_shutdown().await;
-            signal_cancel.cancel();
-        });
-        let stats = run_load(config, cancel.clone()).await;
-        // The run may have ended naturally; stop the listener and capture whether
-        // a signal fired (even if it raced in after the actors drained).
-        signal_task.abort();
-        let signalled = cancel.is_cancelled();
-        (stats, signalled)
-    });
-    let mut stats = stats?;
-    stats.cancelled |= signalled;
-
-    let exit_code = if stats.cancelled { 130 } else { 0 };
+    let cancellation = CancellationToken::new();
+    let execution = run_load(config, cancellation.clone());
+    tokio::pin!(execution);
+    let signal = shutdown_signal();
+    tokio::pin!(signal);
+    let (mut stats, exit_code) = tokio::select! {
+        result = &mut execution => (result?, 0),
+        signal_code = &mut signal => {
+            let signal_code = signal_code?;
+            cancellation.cancel();
+            (execution.await?, signal_code)
+        }
+    };
+    stats.cancelled |= exit_code != 0;
     let output = if output_json {
-        stats.to_json()
+        stats.to_json()?
     } else {
         format_load_text(&stats)
     };
     Ok((output, exit_code))
-}
-
-async fn wait_for_shutdown() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut interrupt = match signal(SignalKind::interrupt()) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        let mut terminate = match signal(SignalKind::terminate()) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        tokio::select! {
-            _ = interrupt.recv() => {}
-            _ = terminate.recv() => {}
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
 }
 
 fn format_load_text(stats: &LoadStats) -> String {
@@ -508,89 +469,26 @@ fn format_load_text(stats: &LoadStats) -> String {
 }
 
 #[cfg(unix)]
-extern "C" fn unix_signal_handler(signal: i32) {
-    let exit_code = if signal == 15 { 143 } else { 130 };
-    SIGNAL_CODE.store(exit_code, Ordering::Release);
-}
+async fn shutdown_signal() -> Result<i32> {
+    use tokio::signal::unix::{SignalKind, signal};
 
-#[cfg(unix)]
-unsafe extern "C" {
-    fn signal(signal: i32, handler: usize) -> usize;
-}
-
-#[cfg(unix)]
-fn install_signal_handlers() -> Result<SignalGuard> {
-    // The handler only performs an atomic store, keeping work out of signal context.
-    unsafe {
-        signal(2, unix_signal_handler as *const () as usize);
-        signal(15, unix_signal_handler as *const () as usize);
-    }
-    Ok(SignalGuard)
-}
-
-#[cfg(windows)]
-unsafe extern "system" fn windows_console_handler(control: u32) -> i32 {
-    let exit_code = if control == 0 || control == 1 {
-        130
-    } else {
-        143
-    };
-    SIGNAL_CODE.store(exit_code, Ordering::Release);
-    1
-}
-
-#[cfg(windows)]
-#[link(name = "Kernel32")]
-unsafe extern "system" {
-    fn SetConsoleCtrlHandler(
-        handler: Option<unsafe extern "system" fn(u32) -> i32>,
-        add: i32,
-    ) -> i32;
-}
-
-#[cfg(windows)]
-fn install_signal_handlers() -> Result<SignalGuard> {
-    let installed = unsafe { SetConsoleCtrlHandler(Some(windows_console_handler), 1) };
-    if installed == 0 {
-        Err(WireSurgeError::new(
-            "signal_handler_install_failed",
-            "failed to install the Windows console control handler",
-        ))
-    } else {
-        Ok(SignalGuard)
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn install_signal_handlers() -> Result<SignalGuard> {
-    Ok(SignalGuard)
-}
-
-struct SignalGuard;
-
-#[cfg(unix)]
-impl Drop for SignalGuard {
-    fn drop(&mut self) {
-        // SIG_DFL is represented by the null signal-handler pointer.
-        unsafe {
-            signal(2, 0);
-            signal(15, 0);
+    let mut terminate = signal(SignalKind::terminate())
+        .map_err(|error| WireSurgeError::new("signal_handler_install_failed", error.to_string()))?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            result.map_err(|error| WireSurgeError::new("signal_handler_failed", error.to_string()))?;
+            Ok(130)
         }
+        _ = terminate.recv() => Ok(143),
     }
 }
 
-#[cfg(windows)]
-impl Drop for SignalGuard {
-    fn drop(&mut self) {
-        unsafe {
-            SetConsoleCtrlHandler(Some(windows_console_handler), 0);
-        }
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-impl Drop for SignalGuard {
-    fn drop(&mut self) {}
+#[cfg(not(unix))]
+async fn shutdown_signal() -> Result<i32> {
+    tokio::signal::ctrl_c()
+        .await
+        .map_err(|error| WireSurgeError::new("signal_handler_failed", error.to_string()))?;
+    Ok(130)
 }
 
 fn workspace_command(
@@ -603,7 +501,9 @@ fn workspace_command(
             store.init()?;
             let workspace = store.workspace_json()?;
             if output_json {
-                Ok(json_object(&[("workspace", workspace)]))
+                serialize_json(&serde_json::json!({
+                    "workspace": parse_json_output(&workspace)?
+                }))
             } else {
                 Ok(format!(
                     "Initialized WireSurge workspace at {}",
@@ -613,7 +513,7 @@ fn workspace_command(
         }
         "list" => {
             if store.exists() {
-                Ok(json_array(&[store.workspace_json()?]))
+                serialize_json(&vec![parse_json_output(&store.workspace_json()?)?])
             } else {
                 Ok("[]".to_string())
             }
@@ -635,21 +535,21 @@ fn request_command(store: &WorkspaceStore, args: RequestArgs) -> Result<String> 
             })?;
             let request = RequestSpec::from_json(&input)?;
             store.create_request(&request)?;
-            Ok(json_object(&[("request", request.to_json())]))
+            serialize_json(&serde_json::json!({ "request": request.to_json_value()? }))
         }
         "list" => {
             let requests = store
                 .list_requests()?
                 .iter()
-                .map(RequestSpec::to_json)
-                .collect::<Vec<_>>();
-            Ok(json_array(&requests))
+                .map(RequestSpec::to_json_value)
+                .collect::<Result<Vec<_>>>()?;
+            serialize_json(&requests)
         }
         "show" => {
             let id = args.id.ok_or_else(|| {
                 WireSurgeError::new("missing_argument", "request show requires an id")
             })?;
-            Ok(store.load_request(&id)?.to_json())
+            store.load_request(&id)?.to_json()
         }
         "update" => {
             let id = args.id.ok_or_else(|| {
@@ -661,17 +561,16 @@ fn request_command(store: &WorkspaceStore, args: RequestArgs) -> Result<String> 
             })?;
             let request = RequestSpec::from_json(&input)?;
             store.update_request(&id, &request)?;
-            Ok(json_object(&[(
-                "request",
-                store.load_request(&id)?.to_json(),
-            )]))
+            serialize_json(&serde_json::json!({
+                "request": store.load_request(&id)?.to_json_value()?
+            }))
         }
         "delete" => {
             let id = args.id.ok_or_else(|| {
                 WireSurgeError::new("missing_argument", "request delete requires an id")
             })?;
             store.delete_request(&id)?;
-            Ok(json_object(&[("deleted", json_string(&id))]))
+            serialize_json(&serde_json::json!({ "deleted": id }))
         }
         _ => Err(WireSurgeError::new(
             "unknown_request_action",
@@ -680,7 +579,11 @@ fn request_command(store: &WorkspaceStore, args: RequestArgs) -> Result<String> 
     }
 }
 
-fn run_command(store: &WorkspaceStore, args: RunArgs) -> Result<String> {
+async fn run_command(
+    store: &WorkspaceStore,
+    args: RunArgs,
+    output_json: bool,
+) -> Result<(String, i32)> {
     let options = RunOptions {
         parallel: args.parallel,
         fail_fast: args.fail_fast,
@@ -688,12 +591,42 @@ fn run_command(store: &WorkspaceStore, args: RunArgs) -> Result<String> {
         verbose: args.verbose,
         report_dir: args.report,
     };
-    if PathBuf::from(&args.target).exists() {
-        let input = fs::read_to_string(&args.target)?;
-        let request = RequestSpec::from_yaml(&input)?;
-        Ok(run_request(store, request, options)?.to_json())
-    } else {
-        Ok(run_stored_request(store, &args.target, options)?.to_json())
+    let cancellation = CancellationToken::new();
+    let execution_cancellation = cancellation.clone();
+    let execution = async {
+        if PathBuf::from(&args.target).exists() {
+            let input = fs::read_to_string(&args.target)?;
+            let request = RequestSpec::from_yaml(&input)?;
+            run_request_with_cancellation(store, request, options, execution_cancellation).await
+        } else {
+            run_stored_request_with_cancellation(
+                store,
+                &args.target,
+                options,
+                execution_cancellation,
+            )
+            .await
+        }
+    };
+    tokio::pin!(execution);
+    let signal = shutdown_signal();
+    tokio::pin!(signal);
+    tokio::select! {
+        result = &mut execution => Ok((result?.to_json()?, 0)),
+        signal_code = &mut signal => {
+            let signal_code = signal_code?;
+            cancellation.cancel();
+            let cancellation_error = match execution.await {
+                Err(error) => error,
+                Ok(_) => WireSurgeError::new("run_cancelled", "HTTP run was cancelled"),
+            };
+            let output = if output_json {
+                serialize_json(&serde_json::json!({ "error": cancellation_error }))?
+            } else {
+                cancellation_error.to_string()
+            };
+            Ok((output, signal_code))
+        }
     }
 }
 
@@ -745,12 +678,22 @@ fn secret_command() -> Result<String> {
 
 fn plugin_command(action: Option<&str>) -> Result<String> {
     match action.unwrap_or("manifest-example") {
-        "manifest-example" => Ok(PluginManifestDraft::example().to_json()),
+        "manifest-example" => PluginManifestDraft::example().to_json(),
         _ => Err(WireSurgeError::new(
             "unknown_plugin_action",
             "plugin action must be manifest-example",
         )),
     }
+}
+
+fn parse_json_output(input: &str) -> Result<serde_json::Value> {
+    serde_json::from_str(input).map_err(|error| {
+        WireSurgeError::new("invalid_internal_json", error.to_string()).at(format!(
+            "line {}, column {}",
+            error.line(),
+            error.column()
+        ))
+    })
 }
 
 #[cfg(test)]

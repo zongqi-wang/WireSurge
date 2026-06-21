@@ -20,26 +20,29 @@ repository = "https://github.com/zongqi-wang/WireSurge"
 rust-version = "1.94"
 
 [workspace.dependencies]
-# default features disabled per docs/dependency-policy.md; enabled features are
-# documented inline. The CLI is human-first: color, suggestions ("did you mean"),
-# and wrap_help give a good terminal experience. clap auto-detects a non-TTY and
-# drops ANSI when output is piped, so the machine-readable --output json path
-# stays clean. std/derive/help/usage/error-context are needed to parse
-# subcommands and map clap errors into WireSurgeError JSON. env is omitted (no
-# flag should read ambient env implicitly).
-clap = { version = "=4.6.1", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "color", "suggestions", "wrap_help"] }
-domain = { version = "=0.12.1", default-features = false, features = ["std"] }
-futures-util = { version = "=0.3.31", default-features = false, features = ["std", "async-await"] }
-hdrhistogram = { version = "=7.5.4", default-features = false }
-memmap2 = { version = "=0.9.8" }
-# TLS for DoT/DoH (Stage 4+). ring provider per docs/adr/0001-ring-crypto-provider.md;
-# its ISC / OpenSSL-style license terms are cleared in deny.toml. Single rustls (own
-# connector, no hyper-rustls) keeps one TLS stack in the tree.
-rustls = { version = "=0.23.35", default-features = false, features = ["std", "ring", "tls12"] }
-rustls-native-certs = { version = "=0.8.2" }
-tokio = { version = "=1.52.3", default-features = false, features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal", "io-util"] }
-tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "logging", "tls12"] }
-tokio-util = { version = "=0.7.16", default-features = false, features = ["rt"] }
+# Versions are intentionally unpinned (`*`) so the tree tracks the latest
+# compatible release; only feature sets are fixed. The CLI is human-first
+# (color, suggestions, wrap_help) and clap drops ANSI on non-TTY so the
+# --output json path stays clean. TLS uses rustls with the ring provider.
+clap = { version = "*", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "color", "suggestions", "wrap_help"] }
+futures-util = { version = "*", default-features = false, features = ["std", "async-await"] }
+hdrhistogram = { version = "*", default-features = false }
+hickory-proto = { version = "*", default-features = false, features = ["std"] }
+http-body-util = { version = "*", default-features = false }
+hyper = { version = "*", default-features = false, features = ["client", "http1", "http2"] }
+hyper-rustls = { version = "*", default-features = false, features = ["http1", "http2", "native-tokio", "ring", "tls12"] }
+hyper-util = { version = "*", default-features = false, features = ["client", "client-legacy", "http1", "http2", "tokio"] }
+memmap2 = { version = "*" }
+rustls = { version = "*", default-features = false, features = ["std", "ring", "tls12"] }
+rustls-native-certs = { version = "*" }
+serde = { version = "*", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "*", default-features = false, features = ["std"] }
+serde_path_to_error = { version = "*", default-features = false }
+tokio = { version = "*", default-features = false, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-rustls = { version = "*", default-features = false, features = ["ring", "logging", "tls12"] }
+tokio-util = { version = "*", default-features = false, features = ["rt"] }
+url = { version = "*", default-features = false, features = ["std"] }
+yaml_serde = { version = "*", default-features = false }
 wiresurge-core = { path = "crates/core", version = "=0.1.0" }
 wiresurge-corpus = { path = "crates/corpus", version = "=0.1.0" }
 wiresurge-dns = { path = "crates/dns", version = "=0.1.0" }

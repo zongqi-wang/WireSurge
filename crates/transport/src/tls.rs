@@ -16,7 +16,7 @@ pub struct TlsParams {
 }
 
 /// Build a shared rustls `ClientConfig` for one protocol. `ring` is the explicit
-/// provider (ADR 0001); ALPN advertises the protocol; SNI and TLS 1.2 fallback
+/// provider; ALPN advertises the protocol; SNI and TLS 1.2 fallback
 /// are enabled because the target listener may not offer TLS 1.3.
 pub fn build_client_config(params: &TlsParams) -> Result<Arc<ClientConfig>> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
