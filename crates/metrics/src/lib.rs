@@ -1,104 +1,10 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use hdrhistogram::Histogram;
 use serde::Serialize;
-use wiresurge_core::{Result, WireSurgeError, serialize_json};
+use wiresurge_core::{Result, serialize_json};
 
 mod hist;
 pub use hist::LoadRecorder;
-
-const LATENCY_MIN_MICROS: u64 = 1;
-const LATENCY_MAX_MICROS: u64 = 60 * 60 * 1_000_000;
-const LATENCY_SIGNIFICANT_DIGITS: u8 = 3;
-
-#[derive(Debug, Clone)]
-pub struct LatencyHistogram {
-    histogram: Histogram<u64>,
-    total_micros: u128,
-    overflows: u64,
-}
-
-impl Default for LatencyHistogram {
-    fn default() -> Self {
-        Self {
-            histogram: Histogram::new_with_bounds(
-                LATENCY_MIN_MICROS,
-                LATENCY_MAX_MICROS,
-                LATENCY_SIGNIFICANT_DIGITS,
-            )
-            .expect("static latency histogram bounds are valid"),
-            total_micros: 0,
-            overflows: 0,
-        }
-    }
-}
-
-impl LatencyHistogram {
-    pub fn record(&mut self, duration: Duration) {
-        let micros = duration
-            .as_micros()
-            .max(LATENCY_MIN_MICROS as u128)
-            .min(u64::MAX as u128) as u64;
-        if self.histogram.record(micros).is_ok() {
-            self.total_micros += micros as u128;
-        } else {
-            self.overflows += 1;
-        }
-    }
-
-    pub fn merge(&mut self, other: &Self) -> Result<()> {
-        self.histogram.add(&other.histogram).map_err(|error| {
-            WireSurgeError::new("latency_histogram_merge_failed", error.to_string())
-        })?;
-        self.total_micros += other.total_micros;
-        self.overflows += other.overflows;
-        Ok(())
-    }
-
-    pub fn len(&self) -> u64 {
-        self.histogram.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.histogram.is_empty()
-    }
-
-    pub fn overflows(&self) -> u64 {
-        self.overflows
-    }
-
-    pub fn min_ms(&self) -> f64 {
-        if self.is_empty() {
-            0.0
-        } else {
-            self.histogram.min() as f64 / 1000.0
-        }
-    }
-
-    pub fn max_ms(&self) -> f64 {
-        if self.is_empty() {
-            0.0
-        } else {
-            self.histogram.max() as f64 / 1000.0
-        }
-    }
-
-    pub fn average_ms(&self) -> f64 {
-        if self.is_empty() {
-            0.0
-        } else {
-            self.total_micros as f64 / self.len() as f64 / 1000.0
-        }
-    }
-
-    pub fn percentile_ms(&self, quantile: f64) -> f64 {
-        if self.is_empty() {
-            0.0
-        } else {
-            self.histogram.value_at_quantile(quantile) as f64 / 1000.0
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WorkerStats {
@@ -190,26 +96,29 @@ impl RunnerStats {
     }
 
     pub fn finish_with_latency(mut self, duration_ms: f64, success: bool) -> Self {
-        self.status = "idle".to_string();
-        self.last_heartbeat = unix_timestamp();
-        self.rps = if duration_ms > 0.0 {
+        let rps = if duration_ms > 0.0 {
             1000.0 / duration_ms
         } else {
             0.0
         };
-        self.qps = self.rps;
+        let error_rate = if success { 0.0 } else { 1.0 };
+
+        self.status = "idle".to_string();
+        self.last_heartbeat = unix_timestamp();
+        self.rps = rps;
+        self.qps = rps;
         self.p50_ms = duration_ms;
         self.p95_ms = duration_ms;
         self.p99_ms = duration_ms;
-        self.error_rate = if success { 0.0 } else { 1.0 };
+        self.error_rate = error_rate;
         if let Some(worker) = self.workers.first_mut() {
             worker.status = "idle".to_string();
-            worker.rps = self.rps;
-            worker.qps = self.qps;
+            worker.rps = rps;
+            worker.qps = rps;
             worker.p50_ms = duration_ms;
             worker.p95_ms = duration_ms;
             worker.p99_ms = duration_ms;
-            worker.error_rate = self.error_rate;
+            worker.error_rate = error_rate;
         }
         self
     }
@@ -255,8 +164,8 @@ impl ReportSummary {
         }
     }
 
-    pub fn to_json(&self) -> Result<String> {
-        serialize_json(&ReportSummaryOutput {
+    fn output(&self) -> ReportSummaryOutput<'_> {
+        ReportSummaryOutput {
             id: &self.id,
             started_at: self.started_at,
             duration_ms: self.duration_ms,
@@ -272,28 +181,15 @@ impl ReportSummary {
             },
             error_summary: &self.error_summary,
             redaction_status: &self.redaction_status,
-        })
+        }
+    }
+
+    pub fn to_json(&self) -> Result<String> {
+        serialize_json(&self.output())
     }
 
     pub fn to_json_value(&self) -> Result<serde_json::Value> {
-        serde_json::to_value(ReportSummaryOutput {
-            id: &self.id,
-            started_at: self.started_at,
-            duration_ms: self.duration_ms,
-            workflow_hash: &self.workflow_hash,
-            git_commit: self.git_commit.as_deref(),
-            status: &self.status,
-            total_requests: self.total_requests,
-            total_errors: self.total_errors,
-            latency_percentiles: LatencyPercentiles {
-                p50_ms: self.p50_ms,
-                p95_ms: self.p95_ms,
-                p99_ms: self.p99_ms,
-            },
-            error_summary: &self.error_summary,
-            redaction_status: &self.redaction_status,
-        })
-        .map_err(|error| {
+        serde_json::to_value(self.output()).map_err(|error| {
             wiresurge_core::WireSurgeError::new("json_encode_failed", error.to_string())
         })
     }
@@ -338,28 +234,5 @@ mod tests {
         let json = stats.to_json().unwrap();
         assert!(json.contains("\"active_run_id\":\"run-1\""));
         assert!(json.contains("worker-1"));
-    }
-
-    #[test]
-    fn latency_histograms_merge_with_bounded_precision() {
-        let mut left = LatencyHistogram::default();
-        left.record(Duration::from_micros(100));
-        left.record(Duration::from_micros(200));
-        let mut right = LatencyHistogram::default();
-        right.record(Duration::from_micros(300));
-        left.merge(&right).unwrap();
-
-        assert_eq!(left.len(), 3);
-        assert_eq!(left.average_ms(), 0.2);
-        assert!((0.299..=0.301).contains(&left.percentile_ms(0.99)));
-        assert_eq!(left.overflows(), 0);
-    }
-
-    #[test]
-    fn latency_histogram_counts_out_of_range_samples() {
-        let mut histogram = LatencyHistogram::default();
-        histogram.record(Duration::from_secs(2 * 60 * 60));
-        assert!(histogram.is_empty());
-        assert_eq!(histogram.overflows(), 1);
     }
 }
