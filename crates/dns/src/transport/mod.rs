@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use wiresurge_transport::ConnectTarget;
@@ -8,12 +9,14 @@ pub mod doh;
 pub mod dot;
 pub mod framed;
 
-/// One prepared query. `wire` is the full DNS message; the connection assigns a
-/// transaction id at send time (writing it into `wire[0..2]`), so ids stay
-/// unique among the queries actually outstanding on that connection.
+/// One prepared query. `wire` is the full DNS message, shared immutably across
+/// every query that selects the same corpus row; the connection assigns a
+/// transaction id at send time by copying the message into its own send buffer
+/// and patching `[0..2]` there, so the shared buffer is never mutated and ids
+/// stay unique among the queries actually outstanding on that connection.
 #[derive(Clone, Debug)]
 pub struct DnsRequest {
-    pub wire: Vec<u8>,
+    pub wire: Arc<[u8]>,
 }
 
 #[derive(Debug)]

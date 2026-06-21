@@ -8,7 +8,7 @@ use wiresurge_core::{Result, WireSurgeError};
 
 mod ppv2;
 mod tls;
-pub use ppv2::ProxyHeader;
+pub use ppv2::{ProxyHeader, ProxyTransport};
 pub use tls::{TlsParams, build_client_config};
 
 /// Application protocol carried over a connection, used to negotiate ALPN and to
@@ -77,8 +77,8 @@ pub struct ConnectTarget {
     /// HTTP request template for request-carrying transports (DoH). `None` for
     /// Do53/DoT.
     pub http: Option<HttpTemplate>,
-    /// PROXY protocol v2 header to prepend to a TCP connection (before TLS/DNS).
-    /// `None` disables it; only valid on TCP-based transports.
+    /// PROXY protocol v2 header to advertise; written as the stream preamble on
+    /// TCP/DoT/DoH and prepended to each datagram on UDP. `None` disables it.
     pub proxy: Option<ProxyHeader>,
 }
 
@@ -135,7 +135,7 @@ pub async fn connect_tcp(target: &ConnectTarget) -> Result<TcpStream> {
     // stream to the TLS connector, which would otherwise interleave its own
     // first write.
     if let Some(proxy) = &target.proxy {
-        let header = proxy.encode()?;
+        let header = proxy.encode(ProxyTransport::Stream)?;
         stream.write_all(&header).await.map_err(|error| {
             WireSurgeError::new("proxy_write_failed", error.to_string())
                 .at("proxy")
@@ -148,6 +148,15 @@ pub async fn connect_tcp(target: &ConnectTarget) -> Result<TcpStream> {
         })?;
     }
     Ok(stream)
+}
+
+/// The PROXY v2 datagram prefix for this target, if one is configured, for a UDP
+/// transport to prepend to every datagram.
+pub fn udp_proxy_prefix(target: &ConnectTarget) -> Result<Option<Vec<u8>>> {
+    match &target.proxy {
+        Some(proxy) => Ok(Some(proxy.encode(ProxyTransport::Dgram)?)),
+        None => Ok(None),
+    }
 }
 
 pub async fn connect_udp(target: &ConnectTarget) -> Result<UdpSocket> {

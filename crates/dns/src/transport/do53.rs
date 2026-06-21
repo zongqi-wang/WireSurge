@@ -1,11 +1,10 @@
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 
 use tokio::net::UdpSocket;
-use wiresurge_transport::{ConnectTarget, connect_tcp, connect_udp};
+use wiresurge_transport::{ConnectTarget, connect_tcp, connect_udp, udp_proxy_prefix};
 
-use super::framed::{FramedConn, Pending, await_response, complete, drain_pending, register};
+use super::framed::{Correlator, FramedConn};
 use super::{Connection, DnsRequest, DnsResponse, Transport, TransportCaps, TransportError};
 use crate::MAX_DNS_MESSAGE_LEN;
 
@@ -16,32 +15,36 @@ pub struct UdpTransport;
 
 pub struct UdpConn {
     socket: Arc<UdpSocket>,
-    pending: Pending,
-    counter: AtomicU32,
+    correlator: Arc<Correlator>,
+    proxy_prefix: Vec<u8>,
 }
 
 impl Transport for UdpTransport {
     type Conn = UdpConn;
 
     async fn connect(target: ConnectTarget) -> Result<UdpConn, TransportError> {
+        let proxy_prefix = udp_proxy_prefix(&target)
+            .map_err(|error| TransportError::Io(error.to_string()))?
+            .unwrap_or_default();
         let socket = Arc::new(
             connect_udp(&target)
                 .await
                 .map_err(|error| TransportError::Io(error.to_string()))?,
         );
-        let pending: Pending = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let correlator = Correlator::new();
         let reader_socket = Arc::clone(&socket);
-        let reader_pending = Arc::clone(&pending);
+        let reader_correlator = Arc::clone(&correlator);
         tokio::spawn(async move {
             let mut buf = vec![0u8; MAX_DNS_MESSAGE_LEN];
             while let Ok(n) = reader_socket.recv(&mut buf).await {
-                complete(&reader_pending, &buf[..n]);
+                reader_correlator.complete(&buf[..n]);
             }
+            reader_correlator.close();
         });
         Ok(UdpConn {
             socket,
-            pending,
-            counter: AtomicU32::new(0),
+            correlator,
+            proxy_prefix,
         })
     }
 }
@@ -55,22 +58,26 @@ impl Connection for UdpConn {
 
     async fn exchange(
         &self,
-        mut request: DnsRequest,
+        request: DnsRequest,
         timeout: Duration,
     ) -> Result<DnsResponse, TransportError> {
         if request.wire.len() < 2 {
             return Err(TransportError::Protocol("query shorter than header".into()));
         }
-        let (id, rx) = register(&self.pending, &self.counter, &mut request.wire);
-        if let Err(error) = self.socket.send(&request.wire).await {
-            self.pending.lock().unwrap().remove(&id);
+        let prefix_len = self.proxy_prefix.len();
+        let mut datagram = Vec::with_capacity(prefix_len + request.wire.len());
+        datagram.extend_from_slice(&self.proxy_prefix);
+        datagram.extend_from_slice(&request.wire);
+        let (id, notify) = self.correlator.register(&mut datagram[prefix_len..]);
+        if let Err(error) = self.socket.send(&datagram).await {
+            self.correlator.cancel(id);
             return Err(TransportError::Io(error.to_string()));
         }
-        await_response(&self.pending, id, rx, timeout).await
+        self.correlator.await_response(id, notify, timeout).await
     }
 
     async fn drain(&self, grace: Duration) {
-        drain_pending(&self.pending, grace).await;
+        self.correlator.drain(grace).await;
     }
 }
 

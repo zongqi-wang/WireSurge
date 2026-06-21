@@ -1,6 +1,7 @@
-use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query};
+use hickory_proto::op::{Edns, Header, Message, MessageType, OpCode, Query};
 use hickory_proto::rr::rdata::opt::EdnsOption as HickoryEdnsOption;
 use hickory_proto::rr::{Name, RecordType};
+use hickory_proto::serialize::binary::BinDecodable;
 use wiresurge_core::{Result, WireSurgeError};
 
 pub mod transport;
@@ -30,35 +31,40 @@ pub struct ResponseHeader {
 /// resolver, forwarder, or HTTP cache may legitimately return any id, so an
 /// equality check there would reject valid answers.
 pub fn parse_response_header(response: &[u8], expected_id: Option<u16>) -> Result<ResponseHeader> {
-    let response = Message::from_vec(response).map_err(|error| {
+    // Decode only the fixed 12-byte DNS header — id, flags, rcode — which is all
+    // a load run records. `Header::from_bytes` reads exactly those bytes and
+    // skips the question/answer/authority/additional sections entirely, so a
+    // multi-million-reply run avoids hickory's full per-record decode and its
+    // allocations on the hot reply path.
+    let header = Header::from_bytes(response).map_err(|error| {
         WireSurgeError::new("invalid_dns_response", error.to_string()).retryable(false)
     })?;
     if let Some(expected_id) = expected_id
-        && response.metadata.id != expected_id
+        && header.id != expected_id
     {
         return Err(WireSurgeError::new(
             "dns_id_mismatch",
             format!(
                 "expected transaction ID {expected_id}, received {}",
-                response.metadata.id
+                header.id
             ),
         ));
     }
-    if response.metadata.message_type != MessageType::Response {
+    if header.message_type != MessageType::Response {
         return Err(WireSurgeError::new(
             "invalid_dns_response",
             "DNS packet does not have the response bit set",
         ));
     }
-    if response.metadata.op_code != OpCode::Query {
+    if header.op_code != OpCode::Query {
         return Err(WireSurgeError::new(
             "invalid_dns_response",
             "DNS response has an unexpected opcode",
         ));
     }
     Ok(ResponseHeader {
-        rcode: u16::from(response.metadata.response_code),
-        truncated: response.metadata.truncation,
+        rcode: u16::from(header.response_code),
+        truncated: header.truncation,
     })
 }
 

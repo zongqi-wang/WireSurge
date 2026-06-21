@@ -56,11 +56,14 @@ impl Default for H2Config {
 
 /// One HTTP request to issue. The `uri` must be absolute (scheme + authority +
 /// path + query); HTTP/2 derives its `:scheme`/`:authority`/`:path` pseudo
-/// headers from it, so a relative URI would be rejected by the peer.
-pub struct H2Request {
+/// headers from it, so a relative URI would be rejected by the peer. `headers`
+/// is borrowed: the set is connection-constant for a load run, so the caller
+/// holds it once and lends it per request rather than reallocating a `Vec` each
+/// time (the values still clone into hyper's owned `HeaderMap`).
+pub struct H2Request<'a> {
     pub method: Method,
     pub uri: Uri,
-    pub headers: Vec<(HeaderName, HeaderValue)>,
+    pub headers: &'a [(HeaderName, HeaderValue)],
     pub body: Bytes,
 }
 
@@ -100,12 +103,12 @@ impl H2Sender {
     }
 
     /// Issue one request and fully read its response body.
-    pub async fn send(&self, request: H2Request) -> Result<H2Response, H2Error> {
+    pub async fn send(&self, request: H2Request<'_>) -> Result<H2Response, H2Error> {
         let mut sender = self.inner.clone();
         let mut builder = Request::builder().method(request.method).uri(request.uri);
         if let Some(headers) = builder.headers_mut() {
             for (name, value) in request.headers {
-                headers.insert(name, value);
+                headers.insert(name.clone(), value.clone());
             }
         }
         let outbound = builder
