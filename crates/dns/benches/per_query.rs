@@ -127,9 +127,13 @@ async fn bench_framed_tcp(n: usize, in_flight: usize) {
         }
     });
 
-    let conn = TcpTransport::connect(ConnectTarget::new(addr)).await.unwrap();
+    let conn = TcpTransport::connect(ConnectTarget::new(addr))
+        .await
+        .unwrap();
     let wire = wire();
-    let req = || DnsRequest { wire: Arc::clone(&wire) };
+    let req = || DnsRequest {
+        wire: Arc::clone(&wire),
+    };
 
     // Warm up the connection + reader buffer.
     conn.exchange(req(), Duration::from_secs(5)).await.unwrap();

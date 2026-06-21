@@ -64,9 +64,9 @@ impl Prepared {
             .parse::<Uri>()
             .map_err(|error| TransportError::Protocol(format!("invalid DoH base URI: {error}")))?;
         let parts = uri.into_parts();
-        let scheme = parts.scheme.ok_or_else(|| {
-            TransportError::Protocol("DoH base URI is missing its scheme".into())
-        })?;
+        let scheme = parts
+            .scheme
+            .ok_or_else(|| TransportError::Protocol("DoH base URI is missing its scheme".into()))?;
         let authority = parts.authority.ok_or_else(|| {
             TransportError::Protocol("DoH base URI is missing its authority".into())
         })?;
