@@ -11,4 +11,5 @@ name = "wiresurge_plugins"
 path = "src/lib.rs"
 
 [dependencies]
+serde.workspace = true
 wiresurge-core.workspace = true

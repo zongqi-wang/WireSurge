@@ -1,19 +1,25 @@
-use domain::base::iana::OptionCode;
-use domain::base::opt::UnknownOptData;
-use domain::base::{Message, MessageBuilder, Name, Rtype};
-use std::io::{Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use hickory_proto::op::{Edns, Message, MessageType, OpCode, Query};
+use hickory_proto::rr::rdata::opt::EdnsOption as HickoryEdnsOption;
+use hickory_proto::rr::{DNSClass, Name, RecordType};
+use serde::Serialize;
+use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::thread;
-use std::time::{Duration, Instant};
-use wiresurge_core::{Result, WireSurgeError, json_object, json_string};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpStream, UdpSocket};
+use tokio::task::JoinSet;
+use tokio::time::{Instant, timeout, timeout_at};
+use tokio_util::sync::CancellationToken;
+use wiresurge_core::{Result, WireSurgeError, serialize_json};
+use wiresurge_metrics::LatencyHistogram;
 
 pub mod transport;
 
 const DNS_HEADER_LEN: usize = 12;
 const MAX_DNS_MESSAGE_LEN: usize = u16::MAX as usize;
+const MAX_EDNS_OPTION_PAYLOAD_LEN: usize = u16::MAX as usize - 4;
 
 /// Derive a transaction id from a query index, mixing in a per-run seed so two
 /// concurrent runs against the same target do not share an id stream.
@@ -141,67 +147,103 @@ pub struct DnsRunStats {
     pub p50_latency_ms: f64,
     pub p95_latency_ms: f64,
     pub p99_latency_ms: f64,
+    pub latency_overflows: u64,
     pub rcode_counts: [u64; 17],
     pub cancelled: bool,
     pub last_error: Option<String>,
 }
 
 impl DnsRunStats {
-    pub fn to_json(&self) -> String {
-        let rcode_counts = json_object(&[
-            ("NOERROR", self.rcode_counts[0].to_string()),
-            ("FORMERR", self.rcode_counts[1].to_string()),
-            ("SERVFAIL", self.rcode_counts[2].to_string()),
-            ("NXDOMAIN", self.rcode_counts[3].to_string()),
-            ("NOTIMP", self.rcode_counts[4].to_string()),
-            ("REFUSED", self.rcode_counts[5].to_string()),
-            (
-                "OTHER",
-                self.rcode_counts[6..].iter().sum::<u64>().to_string(),
-            ),
-        ]);
-        json_object(&[
-            ("target", json_string(&self.target)),
-            ("protocol", json_string(&self.transport)),
-            ("qname", json_string(&self.qname)),
-            ("qtype", self.qtype.to_string()),
-            ("requested", self.requested.to_string()),
-            ("sent", self.sent.to_string()),
-            ("received", self.received.to_string()),
-            ("timeouts", self.timeouts.to_string()),
-            ("errors", self.errors.to_string()),
-            ("mismatched", self.mismatched.to_string()),
-            ("truncated", self.truncated.to_string()),
-            ("duration_ms", format_float(self.duration_ms)),
-            (
-                "queries_per_second",
-                format_float(if self.duration_ms > 0.0 {
-                    self.received as f64 * 1000.0 / self.duration_ms
-                } else {
-                    0.0
-                }),
-            ),
-            (
-                "latency_ms",
-                json_object(&[
-                    ("min", format_float(self.min_latency_ms)),
-                    ("max", format_float(self.max_latency_ms)),
-                    ("average", format_float(self.average_latency_ms)),
-                    ("p50", format_float(self.p50_latency_ms)),
-                    ("p95", format_float(self.p95_latency_ms)),
-                    ("p99", format_float(self.p99_latency_ms)),
-                ]),
-            ),
-            ("rcode", rcode_counts),
-            ("cancelled", self.cancelled.to_string()),
-            (
-                "last_error",
-                self.last_error
-                    .as_ref()
-                    .map(|error| json_string(error))
-                    .unwrap_or_else(|| "null".to_string()),
-            ),
-        ])
+    pub fn to_json(&self) -> Result<String> {
+        #[derive(Serialize)]
+        struct Latency {
+            min: f64,
+            max: f64,
+            average: f64,
+            p50: f64,
+            p95: f64,
+            p99: f64,
+            overflows: u64,
+        }
+
+        #[derive(Serialize)]
+        struct Rcode {
+            #[serde(rename = "NOERROR")]
+            no_error: u64,
+            #[serde(rename = "FORMERR")]
+            format_error: u64,
+            #[serde(rename = "SERVFAIL")]
+            server_failure: u64,
+            #[serde(rename = "NXDOMAIN")]
+            name_error: u64,
+            #[serde(rename = "NOTIMP")]
+            not_implemented: u64,
+            #[serde(rename = "REFUSED")]
+            refused: u64,
+            #[serde(rename = "OTHER")]
+            other: u64,
+        }
+
+        #[derive(Serialize)]
+        struct Output<'a> {
+            target: &'a str,
+            protocol: &'a str,
+            qname: &'a str,
+            qtype: u16,
+            requested: u64,
+            sent: u64,
+            received: u64,
+            timeouts: u64,
+            errors: u64,
+            mismatched: u64,
+            truncated: u64,
+            duration_ms: f64,
+            queries_per_second: f64,
+            latency_ms: Latency,
+            rcode: Rcode,
+            cancelled: bool,
+            last_error: &'a Option<String>,
+        }
+
+        serialize_json(&Output {
+            target: &self.target,
+            protocol: &self.transport,
+            qname: &self.qname,
+            qtype: self.qtype,
+            requested: self.requested,
+            sent: self.sent,
+            received: self.received,
+            timeouts: self.timeouts,
+            errors: self.errors,
+            mismatched: self.mismatched,
+            truncated: self.truncated,
+            duration_ms: self.duration_ms,
+            queries_per_second: if self.duration_ms > 0.0 {
+                self.received as f64 * 1000.0 / self.duration_ms
+            } else {
+                0.0
+            },
+            latency_ms: Latency {
+                min: self.min_latency_ms,
+                max: self.max_latency_ms,
+                average: self.average_latency_ms,
+                p50: self.p50_latency_ms,
+                p95: self.p95_latency_ms,
+                p99: self.p99_latency_ms,
+                overflows: self.latency_overflows,
+            },
+            rcode: Rcode {
+                no_error: self.rcode_counts[0],
+                format_error: self.rcode_counts[1],
+                server_failure: self.rcode_counts[2],
+                name_error: self.rcode_counts[3],
+                not_implemented: self.rcode_counts[4],
+                refused: self.rcode_counts[5],
+                other: self.rcode_counts[6..].iter().sum(),
+            },
+            cancelled: self.cancelled,
+            last_error: &self.last_error,
+        })
     }
 
     pub fn to_text(&self) -> String {
@@ -252,27 +294,71 @@ struct WorkerStats {
 }
 
 impl WorkerStats {
-    fn observe_response(&mut self, response: &[u8], expected_id: u16, elapsed: Duration) {
-        match parse_response_header(response, expected_id) {
-            Ok(header) => {
-                self.received += 1;
-                self.truncated += u64::from(header.truncated);
-                let bucket = usize::from(header.rcode.min(16));
-                self.rcode_counts[bucket] += 1;
-                self.latency.record(elapsed);
-            }
-            Err(error) if error.code == "dns_id_mismatch" => {
-                self.mismatched += 1;
-                self.last_error = Some(error.message);
-            }
+    fn observe_response(
+        &mut self,
+        response: &[u8],
+        expected_id: u16,
+        expected_qname: &str,
+        expected_qtype: u16,
+        elapsed: Duration,
+    ) -> bool {
+        let parsed = match Message::from_vec(response) {
+            Ok(msg) => msg,
             Err(error) => {
                 self.errors += 1;
-                self.last_error = Some(error.message);
+                self.last_error = Some(error.to_string());
+                return true;
             }
+        };
+        if parsed.metadata.id != expected_id {
+            self.mismatched += 1;
+            self.last_error = Some(format!(
+                "expected transaction ID {expected_id}, received {}",
+                parsed.metadata.id
+            ));
+            return false;
         }
+        if parsed.metadata.message_type != MessageType::Response
+            || parsed.metadata.op_code != OpCode::Query
+        {
+            self.errors += 1;
+            self.last_error = Some("DNS response has invalid header flags".to_string());
+            return true;
+        }
+        let question_valid = (|| -> Result<()> {
+            if parsed.queries.len() != 1 {
+                return Err(WireSurgeError::new(
+                    "dns_question_mismatch",
+                    "DNS response must echo exactly one question",
+                ));
+            }
+            let expected_name = parse_dns_name(expected_qname)?;
+            let question = &parsed.queries[0];
+            if question.name() != &expected_name
+                || question.query_type() != RecordType::from(expected_qtype)
+                || question.query_class() != DNSClass::IN
+            {
+                return Err(WireSurgeError::new(
+                    "dns_question_mismatch",
+                    "DNS response question does not match the request",
+                ));
+            }
+            Ok(())
+        })();
+        if let Err(error) = question_valid {
+            self.errors += 1;
+            self.last_error = Some(error.message);
+            return true;
+        }
+        self.received += 1;
+        self.truncated += u64::from(parsed.metadata.truncation);
+        let bucket = usize::from(u16::from(parsed.metadata.response_code).min(16));
+        self.rcode_counts[bucket] += 1;
+        self.latency.record(elapsed);
+        true
     }
 
-    fn merge(&mut self, other: WorkerStats) {
+    fn merge(&mut self, other: WorkerStats) -> Result<()> {
         self.sent += other.sent;
         self.received += other.received;
         self.timeouts += other.timeouts;
@@ -282,105 +368,12 @@ impl WorkerStats {
         for (target, source) in self.rcode_counts.iter_mut().zip(other.rcode_counts) {
             *target += source;
         }
-        self.latency.merge(&other.latency);
+        self.latency.merge(&other.latency)?;
         if other.last_error.is_some() {
             self.last_error = other.last_error;
         }
+        Ok(())
     }
-}
-
-#[derive(Debug, Clone)]
-struct LatencyHistogram {
-    buckets: [u64; 64],
-    count: u64,
-    total_micros: u128,
-    min_micros: u64,
-    max_micros: u64,
-}
-
-impl Default for LatencyHistogram {
-    fn default() -> Self {
-        Self {
-            buckets: [0; 64],
-            count: 0,
-            total_micros: 0,
-            min_micros: u64::MAX,
-            max_micros: 0,
-        }
-    }
-}
-
-impl LatencyHistogram {
-    fn record(&mut self, duration: Duration) {
-        let micros = duration.as_micros().min(u64::MAX as u128) as u64;
-        let bucket = latency_bucket(micros);
-        self.buckets[bucket] += 1;
-        self.count += 1;
-        self.total_micros += micros as u128;
-        self.min_micros = self.min_micros.min(micros);
-        self.max_micros = self.max_micros.max(micros);
-    }
-
-    fn merge(&mut self, other: &Self) {
-        for (target, source) in self.buckets.iter_mut().zip(other.buckets) {
-            *target += source;
-        }
-        self.count += other.count;
-        self.total_micros += other.total_micros;
-        if other.count > 0 {
-            self.min_micros = self.min_micros.min(other.min_micros);
-            self.max_micros = self.max_micros.max(other.max_micros);
-        }
-    }
-
-    fn min_ms(&self) -> f64 {
-        if self.count == 0 {
-            0.0
-        } else {
-            self.min_micros as f64 / 1000.0
-        }
-    }
-
-    fn max_ms(&self) -> f64 {
-        self.max_micros as f64 / 1000.0
-    }
-
-    fn average_ms(&self) -> f64 {
-        if self.count == 0 {
-            0.0
-        } else {
-            self.total_micros as f64 / self.count as f64 / 1000.0
-        }
-    }
-
-    fn percentile_ms(&self, percentile: f64) -> f64 {
-        if self.count == 0 {
-            return 0.0;
-        }
-        let rank = (self.count as f64 * percentile).ceil().max(1.0) as u64;
-        let mut seen = 0;
-        for (index, count) in self.buckets.iter().enumerate() {
-            seen += count;
-            if seen >= rank {
-                let upper_bound = if index == 63 {
-                    u64::MAX
-                } else {
-                    1_u64 << index
-                };
-                return upper_bound as f64 / 1000.0;
-            }
-        }
-        self.max_ms()
-    }
-}
-
-fn latency_bucket(micros: u64) -> usize {
-    if micros <= 1 {
-        0
-    } else {
-        (u64::BITS - (micros - 1).leading_zeros()) as usize
-    }
-    .min(63)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -389,9 +382,9 @@ pub struct ResponseHeader {
     pub truncated: bool,
 }
 
-pub fn run_dns(config: DnsRunConfig, cancellation: Arc<AtomicBool>) -> Result<DnsRunStats> {
+pub async fn run_dns(config: DnsRunConfig, cancellation: CancellationToken) -> Result<DnsRunStats> {
     config.validate()?;
-    let target = resolve_target(&config.server, config.port)?;
+    let target = resolve_target(&config.server, config.port).await?;
     let query_template = Arc::new(build_query(
         0,
         &config.qname,
@@ -401,42 +394,50 @@ pub fn run_dns(config: DnsRunConfig, cancellation: Arc<AtomicBool>) -> Result<Dn
     let config = Arc::new(config);
     let next_query = Arc::new(AtomicU64::new(0));
     let started = Instant::now();
-    let mut workers = Vec::with_capacity(config.concurrency);
+    let mut workers = JoinSet::new();
 
     for worker_id in 0..config.concurrency {
         let worker_config = Arc::clone(&config);
         let worker_query = Arc::clone(&query_template);
         let worker_counter = Arc::clone(&next_query);
-        let worker_cancellation = Arc::clone(&cancellation);
-        workers.push(thread::spawn(move || match worker_config.transport {
-            DnsTransport::Udp => run_udp_worker(
-                worker_id,
-                target,
-                worker_config,
-                worker_query,
-                worker_counter,
-                worker_cancellation,
-                started,
-            ),
-            DnsTransport::Tcp => run_tcp_worker(
-                worker_id,
-                target,
-                worker_config,
-                worker_query,
-                worker_counter,
-                worker_cancellation,
-                started,
-            ),
-        }));
+        let worker_cancellation = cancellation.clone();
+        workers.spawn(async move {
+            match worker_config.transport {
+                DnsTransport::Udp => {
+                    run_udp_worker(
+                        worker_id,
+                        target,
+                        worker_config,
+                        worker_query,
+                        worker_counter,
+                        worker_cancellation,
+                        started,
+                    )
+                    .await
+                }
+                DnsTransport::Tcp => {
+                    run_tcp_worker(
+                        worker_id,
+                        target,
+                        worker_config,
+                        worker_query,
+                        worker_counter,
+                        worker_cancellation,
+                        started,
+                    )
+                    .await
+                }
+            }
+        });
     }
 
     let mut aggregate = WorkerStats::default();
-    for worker in workers {
-        match worker.join() {
-            Ok(stats) => aggregate.merge(stats),
-            Err(_) => {
+    while let Some(worker) = workers.join_next().await {
+        match worker {
+            Ok(stats) => aggregate.merge(stats)?,
+            Err(error) => {
                 aggregate.errors += 1;
-                aggregate.last_error = Some("DNS worker panicked".to_string());
+                aggregate.last_error = Some(format!("DNS worker failed: {error}"));
             }
         }
     }
@@ -461,19 +462,20 @@ pub fn run_dns(config: DnsRunConfig, cancellation: Arc<AtomicBool>) -> Result<Dn
         p50_latency_ms: aggregate.latency.percentile_ms(0.50),
         p95_latency_ms: aggregate.latency.percentile_ms(0.95),
         p99_latency_ms: aggregate.latency.percentile_ms(0.99),
+        latency_overflows: aggregate.latency.overflows(),
         rcode_counts: aggregate.rcode_counts,
-        cancelled: cancellation.load(Ordering::Acquire),
+        cancelled: cancellation.is_cancelled(),
         last_error: aggregate.last_error,
     })
 }
 
-fn run_udp_worker(
+async fn run_udp_worker(
     worker_id: usize,
     target: SocketAddr,
     config: Arc<DnsRunConfig>,
     query_template: Arc<Vec<u8>>,
     next_query: Arc<AtomicU64>,
-    cancellation: Arc<AtomicBool>,
+    cancellation: CancellationToken,
     run_started: Instant,
 ) -> WorkerStats {
     let mut stats = WorkerStats::default();
@@ -482,7 +484,7 @@ fn run_udp_worker(
     } else {
         "[::]:0"
     };
-    let socket = match UdpSocket::bind(bind_address) {
+    let socket = match UdpSocket::bind(bind_address).await {
         Ok(socket) => socket,
         Err(error) => {
             stats.errors += 1;
@@ -490,69 +492,82 @@ fn run_udp_worker(
             return stats;
         }
     };
-    if let Err(error) = socket.connect(target) {
+    if let Err(error) = socket.connect(target).await {
         stats.errors += 1;
         stats.last_error = Some(format!("failed to connect UDP socket: {error}"));
         return stats;
     }
-    if let Err(error) = socket.set_read_timeout(Some(config.timeout)) {
-        stats.errors += 1;
-        stats.last_error = Some(format!("failed to set UDP read timeout: {error}"));
-        return stats;
-    }
-    if let Err(error) = socket.set_write_timeout(Some(config.timeout)) {
-        stats.errors += 1;
-        stats.last_error = Some(format!("failed to set UDP write timeout: {error}"));
-        return stats;
-    }
-
     let mut query = (*query_template).clone();
     let mut response = vec![0_u8; MAX_DNS_MESSAGE_LEN];
-    loop {
+    'queries: loop {
         let query_index = next_query.fetch_add(1, Ordering::Relaxed);
-        if query_index >= config.count || cancellation.load(Ordering::Acquire) {
+        if query_index >= config.count || cancellation.is_cancelled() {
             break;
         }
-        if !wait_for_rate_slot(query_index, config.qps, run_started, &cancellation) {
+        if !wait_for_rate_slot(query_index, config.qps, run_started, &cancellation).await {
             break;
         }
         let transaction_id = transaction_id(worker_id, query_index);
         query[0..2].copy_from_slice(&transaction_id.to_be_bytes());
         stats.sent += 1;
         let attempt_started = Instant::now();
-        let outcome = socket.send(&query).and_then(|_| socket.recv(&mut response));
-        match outcome {
-            Ok(received) => {
-                stats.observe_response(
-                    &response[..received],
-                    transaction_id,
-                    attempt_started.elapsed(),
-                );
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                stats.timeouts += 1;
-            }
-            Err(error) => {
+        let send = tokio::select! {
+            _ = cancellation.cancelled() => break,
+            result = timeout(config.timeout, socket.send(&query)) => result,
+        };
+        match send {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
                 stats.errors += 1;
                 stats.last_error = Some(error.to_string());
+                continue;
+            }
+            Err(_) => {
+                stats.timeouts += 1;
+                continue;
+            }
+        }
+
+        let deadline = Instant::now() + config.timeout;
+        loop {
+            let received = tokio::select! {
+                _ = cancellation.cancelled() => break 'queries,
+                result = timeout_at(deadline, socket.recv(&mut response)) => result,
+            };
+            match received {
+                Ok(Ok(received)) => {
+                    if stats.observe_response(
+                        &response[..received],
+                        transaction_id,
+                        &config.qname,
+                        config.qtype,
+                        attempt_started.elapsed(),
+                    ) {
+                        break;
+                    }
+                }
+                Ok(Err(error)) => {
+                    stats.errors += 1;
+                    stats.last_error = Some(error.to_string());
+                    break;
+                }
+                Err(_) => {
+                    stats.timeouts += 1;
+                    break;
+                }
             }
         }
     }
     stats
 }
 
-fn run_tcp_worker(
+async fn run_tcp_worker(
     worker_id: usize,
     target: SocketAddr,
     config: Arc<DnsRunConfig>,
     query_template: Arc<Vec<u8>>,
     next_query: Arc<AtomicU64>,
-    cancellation: Arc<AtomicBool>,
+    cancellation: CancellationToken,
     run_started: Instant,
 ) -> WorkerStats {
     let mut stats = WorkerStats::default();
@@ -560,61 +575,63 @@ fn run_tcp_worker(
     let mut query = (*query_template).clone();
     loop {
         let query_index = next_query.fetch_add(1, Ordering::Relaxed);
-        if query_index >= config.count || cancellation.load(Ordering::Acquire) {
+        if query_index >= config.count || cancellation.is_cancelled() {
             break;
         }
-        if !wait_for_rate_slot(query_index, config.qps, run_started, &cancellation) {
+        if !wait_for_rate_slot(query_index, config.qps, run_started, &cancellation).await {
             break;
         }
         let transaction_id = transaction_id(worker_id, query_index);
         query[0..2].copy_from_slice(&transaction_id.to_be_bytes());
         stats.sent += 1;
         let attempt_started = Instant::now();
-        match tcp_exchange(&mut stream, target, &query, config.timeout) {
-            Ok(response) => {
-                stats.observe_response(&response, transaction_id, attempt_started.elapsed());
+        let outcome = tokio::select! {
+            _ = cancellation.cancelled() => break,
+            result = timeout(config.timeout, tcp_exchange(&mut stream, target, &query)) => result,
+        };
+        match outcome {
+            Ok(Ok(response)) => {
+                stats.observe_response(
+                    &response,
+                    transaction_id,
+                    &config.qname,
+                    config.qtype,
+                    attempt_started.elapsed(),
+                );
             }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
+            Err(_) => {
                 stream = None;
                 stats.timeouts += 1;
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 stream = None;
                 stats.errors += 1;
                 stats.last_error = Some(error.to_string());
             }
         }
     }
-    if let Some(stream) = stream {
-        let _ = stream.shutdown(std::net::Shutdown::Both);
+    if let Some(mut stream) = stream {
+        let _ = stream.shutdown().await;
     }
     stats
 }
 
-fn tcp_exchange(
+async fn tcp_exchange(
     stream: &mut Option<TcpStream>,
     target: SocketAddr,
     query: &[u8],
-    operation_timeout: Duration,
 ) -> std::io::Result<Vec<u8>> {
     if stream.is_none() {
-        let connected = TcpStream::connect_timeout(&target, operation_timeout)?;
+        let connected = TcpStream::connect(target).await?;
         connected.set_nodelay(true)?;
-        connected.set_read_timeout(Some(operation_timeout))?;
-        connected.set_write_timeout(Some(operation_timeout))?;
         *stream = Some(connected);
     }
     let stream = stream.as_mut().expect("TCP stream was initialized");
     let frame = tcp_frame(query)?;
-    stream.write_all(&frame)?;
+    stream.write_all(&frame).await?;
 
     let mut response_len = [0_u8; 2];
-    stream.read_exact(&mut response_len)?;
+    stream.read_exact(&mut response_len).await?;
     let response_len = u16::from_be_bytes(response_len) as usize;
     if response_len < DNS_HEADER_LEN {
         return Err(std::io::Error::new(
@@ -623,7 +640,7 @@ fn tcp_exchange(
         ));
     }
     let mut response = vec![0_u8; response_len];
-    stream.read_exact(&mut response)?;
+    stream.read_exact(&mut response).await?;
     Ok(response)
 }
 
@@ -640,35 +657,31 @@ fn tcp_frame(query: &[u8]) -> std::io::Result<Vec<u8>> {
     Ok(frame)
 }
 
-fn wait_for_rate_slot(
+async fn wait_for_rate_slot(
     query_index: u64,
     qps: Option<f64>,
     run_started: Instant,
-    cancellation: &AtomicBool,
+    cancellation: &CancellationToken,
 ) -> bool {
     let Some(qps) = qps else {
-        return !cancellation.load(Ordering::Acquire);
+        return !cancellation.is_cancelled();
     };
     let scheduled = run_started + Duration::from_secs_f64(query_index as f64 / qps);
-    while scheduled > Instant::now() {
-        if cancellation.load(Ordering::Acquire) {
-            return false;
-        }
-        let remaining = scheduled.saturating_duration_since(Instant::now());
-        thread::sleep(remaining.min(Duration::from_millis(10)));
+    tokio::select! {
+        _ = cancellation.cancelled() => false,
+        _ = tokio::time::sleep_until(scheduled) => true,
     }
-    !cancellation.load(Ordering::Acquire)
 }
 
-fn resolve_target(server: &str, port: u16) -> Result<SocketAddr> {
+async fn resolve_target(server: &str, port: u16) -> Result<SocketAddr> {
     if let Ok(socket) = server.parse::<SocketAddr>() {
         return Ok(socket);
     }
     if let Ok(ip) = server.parse::<IpAddr>() {
         return Ok(SocketAddr::new(ip, port));
     }
-    (server, port)
-        .to_socket_addrs()
+    tokio::net::lookup_host((server, port))
+        .await
         .map_err(|error| {
             WireSurgeError::new("dns_target_resolution_failed", error.to_string())
                 .at("server")
@@ -695,28 +708,44 @@ fn transaction_id(worker_id: usize, query_index: u64) -> u16 {
 }
 
 pub fn parse_response_header(response: &[u8], expected_id: u16) -> Result<ResponseHeader> {
-    let response = Message::from_octets(response).map_err(|error| {
+    let response = Message::from_vec(response).map_err(|error| {
         WireSurgeError::new("invalid_dns_response", error.to_string()).retryable(false)
     })?;
-    if response.header().id() != expected_id {
+    if response.metadata.id != expected_id {
         return Err(WireSurgeError::new(
             "dns_id_mismatch",
             format!(
                 "expected transaction ID {expected_id}, received {}",
-                response.header().id()
+                response.metadata.id
             ),
         ));
     }
-    if !response.header().qr() {
+    if response.metadata.message_type != MessageType::Response {
         return Err(WireSurgeError::new(
             "invalid_dns_response",
             "DNS packet does not have the response bit set",
         ));
     }
+    if response.metadata.op_code != OpCode::Query {
+        return Err(WireSurgeError::new(
+            "invalid_dns_response",
+            "DNS response has an unexpected opcode",
+        ));
+    }
     Ok(ResponseHeader {
-        rcode: response.opt_rcode().to_int(),
-        truncated: response.header().tc(),
+        rcode: u16::from(response.metadata.response_code),
+        truncated: response.metadata.truncation,
     })
+}
+
+fn parse_dns_name(qname: &str) -> Result<Name> {
+    let absolute_name = if qname.ends_with('.') {
+        qname.to_string()
+    } else {
+        format!("{qname}.")
+    };
+    Name::from_ascii(absolute_name)
+        .map_err(|error| WireSurgeError::new("invalid_dns_name", error.to_string()).at("qname"))
 }
 
 pub fn build_query(
@@ -725,41 +754,29 @@ pub fn build_query(
     qtype: u16,
     edns_option: Option<&EdnsOption>,
 ) -> Result<Vec<u8>> {
-    let absolute_name = if qname.ends_with('.') {
-        qname.to_string()
-    } else {
-        format!("{qname}.")
-    };
-    let name = absolute_name
-        .parse::<Name<Vec<u8>>>()
-        .map_err(|error| WireSurgeError::new("invalid_dns_name", error.to_string()).at("qname"))?;
-    let mut message = MessageBuilder::new_vec();
-    message.header_mut().set_id(transaction_id);
-    message.header_mut().set_rd(true);
-    let mut question = message.question();
-    question
-        .push((name, Rtype::from_int(qtype)))
-        .map_err(|error| WireSurgeError::new("dns_encode_failed", error.to_string()).at("qname"))?;
+    let name = parse_dns_name(qname)?;
+    let mut message = Message::new(transaction_id, MessageType::Query, OpCode::Query);
+    message.metadata.recursion_desired = true;
+    message.add_query(Query::query(name, RecordType::from(qtype)));
 
-    let packet = if let Some(edns) = edns_option {
-        let option =
-            UnknownOptData::new(OptionCode::from_int(edns.code), &edns.payload).map_err(|_| {
-                WireSurgeError::new("invalid_edns_payload", "EDNS payload exceeds 65535 bytes")
-                    .at("edns_payload")
-            })?;
-        let mut additional = question.additional();
-        additional
-            .opt(|opt| {
-                opt.set_udp_payload_size(1232);
-                opt.push(&option)
-            })
-            .map_err(|error| {
-                WireSurgeError::new("dns_encode_failed", error.to_string()).at("edns_payload")
-            })?;
-        additional.finish()
-    } else {
-        question.finish()
-    };
+    if let Some(edns) = edns_option {
+        if edns.payload.len() > MAX_EDNS_OPTION_PAYLOAD_LEN {
+            return Err(WireSurgeError::new(
+                "invalid_edns_payload",
+                "EDNS option payload exceeds 65531 bytes",
+            )
+            .at("edns_payload"));
+        }
+        let mut extension = Edns::new();
+        extension.set_max_payload(1232);
+        extension
+            .options_mut()
+            .insert(HickoryEdnsOption::Unknown(edns.code, edns.payload.clone()));
+        message.set_edns(extension);
+    }
+    let packet = message
+        .to_vec()
+        .map_err(|error| WireSurgeError::new("dns_encode_failed", error.to_string()).at("qname"))?;
     if packet.len() > MAX_DNS_MESSAGE_LEN {
         return Err(WireSurgeError::new(
             "dns_message_too_large",
@@ -828,23 +845,24 @@ pub fn decode_hex_payload(value: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
-fn format_float(value: f64) -> String {
-    if value.is_finite() {
-        format!("{value:.3}")
-    } else {
-        "0.000".to_string()
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, UdpSocket as StdUdpSocket};
+    use std::thread;
+
     use super::*;
 
     fn response_for(query: &[u8]) -> Vec<u8> {
-        let mut response = query.to_vec();
-        response[2] = 0x81;
-        response[3] = 0x80;
-        response
+        let query = Message::from_vec(query).unwrap();
+        let mut response = Message::response(query.metadata.id, query.metadata.op_code);
+        response.metadata.recursion_desired = query.metadata.recursion_desired;
+        response.metadata.recursion_available = true;
+        response.add_queries(query.queries);
+        if let Some(edns) = query.edns {
+            response.set_edns(edns);
+        }
+        response.to_vec().unwrap()
     }
 
     #[test]
@@ -911,9 +929,32 @@ mod tests {
     }
 
     #[test]
+    fn rejects_header_only_response() {
+        let response = [0x12, 0x34, 0x81, 0x80, 0, 0, 0, 0, 0, 0, 0, 0];
+        let header = parse_response_header(&response, 0x1234).unwrap();
+        assert_eq!(header.rcode, 0);
+    }
+
+    #[test]
+    fn observe_response_validates_question() {
+        let query = build_query(0x1234, "example.com", 1, None).unwrap();
+        let response = response_for(&query);
+        let mut stats = WorkerStats::default();
+        let result = stats.observe_response(
+            &response,
+            0x1234,
+            "example.net",
+            1,
+            Duration::from_micros(100),
+        );
+        assert!(result, "question mismatch should mark as counted error");
+        assert_eq!(stats.errors, 1);
+    }
+
+    #[tokio::test]
     #[ignore = "requires permission to bind localhost UDP sockets"]
-    fn runs_udp_queries() {
-        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+    async fn runs_udp_queries() {
+        let server = StdUdpSocket::bind("127.0.0.1:0").unwrap();
         let address = server.local_addr().unwrap();
         let server_task = thread::spawn(move || {
             let mut buffer = vec![0_u8; 2048];
@@ -936,8 +977,9 @@ mod tests {
                 qps: None,
                 edns_option: None,
             },
-            Arc::new(AtomicBool::new(false)),
+            CancellationToken::new(),
         )
+        .await
         .unwrap();
         server_task.join().unwrap();
         assert_eq!(stats.sent, 3);
@@ -945,10 +987,10 @@ mod tests {
         assert_eq!(stats.errors, 0);
     }
 
-    #[test]
+    #[tokio::test]
     #[ignore = "requires permission to bind localhost TCP sockets"]
-    fn reuses_tcp_connection() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    async fn reuses_tcp_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server_task = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -978,8 +1020,9 @@ mod tests {
                 qps: None,
                 edns_option: None,
             },
-            Arc::new(AtomicBool::new(false)),
+            CancellationToken::new(),
         )
+        .await
         .unwrap();
         server_task.join().unwrap();
         assert_eq!(stats.sent, 3);

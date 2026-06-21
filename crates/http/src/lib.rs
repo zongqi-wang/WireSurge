@@ -1,11 +1,164 @@
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use wiresurge_core::{
-    RequestSpec, Result, WireSurgeError, json_array, json_object, json_string, redact_sensitive,
-};
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
+use hyper::body::Bytes;
+use hyper::header::{HeaderName, HeaderValue, USER_AGENT};
+use hyper::{Method, Request, Uri};
+use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
+use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::rt::TokioExecutor;
+use serde::Serialize;
+use url::Url;
+use wiresurge_core::{RequestSpec, Result, WireSurgeError, redact_sensitive, serialize_json};
+
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+type HyperClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
+static SHARED_HTTP_CLIENT: OnceLock<std::result::Result<HyperClient, String>> = OnceLock::new();
+
+#[derive(Clone)]
+pub struct HttpClient {
+    client: HyperClient,
+}
+
+impl HttpClient {
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            client: build_hyper_client()?,
+        })
+    }
+
+    pub fn shared() -> Result<Self> {
+        match SHARED_HTTP_CLIENT.get_or_init(|| build_hyper_client().map_err(|error| error.message))
+        {
+            Ok(client) => Ok(Self {
+                client: client.clone(),
+            }),
+            Err(error) => Err(WireSurgeError::new("tls_root_load_failed", error.clone())
+                .with_hint("Check that the operating system trust store is available.")),
+        }
+    }
+
+    pub async fn send(&self, request: &RequestSpec) -> Result<HttpResponse> {
+        let url = parse_url(&request.url)?;
+        let method = Method::from_bytes(request.method.as_bytes()).map_err(|error| {
+            WireSurgeError::new("invalid_http_method", error.to_string()).at("method")
+        })?;
+        let uri = url
+            .as_str()
+            .parse::<Uri>()
+            .map_err(|error| WireSurgeError::new("invalid_url", error.to_string()).at("url"))?;
+        let body = Full::new(Bytes::from(request.body.clone().unwrap_or_default()));
+        let mut outbound = Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(body)
+            .map_err(|error| WireSurgeError::new("http_request_build_failed", error.to_string()))?;
+        outbound.headers_mut().insert(
+            USER_AGENT,
+            HeaderValue::from_static(concat!("WireSurge/", env!("CARGO_PKG_VERSION"))),
+        );
+        for (key, value) in &request.headers {
+            if key.eq_ignore_ascii_case("host")
+                || key.eq_ignore_ascii_case("connection")
+                || key.eq_ignore_ascii_case("content-length")
+            {
+                continue;
+            }
+            let name = HeaderName::from_bytes(key.as_bytes()).map_err(|error| {
+                WireSurgeError::new("invalid_http_header", error.to_string()).at(key.clone())
+            })?;
+            let value = HeaderValue::from_str(value).map_err(|error| {
+                WireSurgeError::new("invalid_http_header", error.to_string()).at(key.clone())
+            })?;
+            outbound.headers_mut().insert(name, value);
+        }
+
+        let started = Instant::now();
+        let deadline = tokio::time::Instant::now() + REQUEST_TIMEOUT;
+        let response = tokio::time::timeout_at(deadline, self.client.request(outbound))
+            .await
+            .map_err(|_| {
+                WireSurgeError::new("http_timeout", "HTTP request exceeded 30 seconds")
+                    .at("url")
+                    .retryable(true)
+            })?
+            .map_err(|error| {
+                WireSurgeError::new("http_request_failed", error.to_string())
+                    .at("url")
+                    .retryable(true)
+            })?;
+        let status = response.status();
+        let headers = response
+            .headers()
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.as_str().to_string(),
+                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let body = tokio::time::timeout_at(
+            deadline,
+            Limited::new(response.into_body(), MAX_RESPONSE_BODY_BYTES).collect(),
+        )
+        .await
+        .map_err(|_| {
+            WireSurgeError::new("http_timeout", "HTTP request exceeded 30 seconds")
+                .at("url")
+                .retryable(true)
+        })?
+        .map_err(|error| {
+            if error.downcast_ref::<LengthLimitError>().is_some() {
+                WireSurgeError::new(
+                    "http_response_too_large",
+                    "HTTP response body exceeds the 16 MiB limit",
+                )
+            } else {
+                WireSurgeError::new("http_response_body_failed", error.to_string()).retryable(true)
+            }
+        })?
+        .to_bytes();
+        let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let mut warnings = Vec::new();
+        if status.is_redirection() {
+            warnings.push(
+                "redirect response captured; automatic redirect following is disabled".to_string(),
+            );
+        }
+        Ok(HttpResponse {
+            status_code: status.as_u16(),
+            reason: status.canonical_reason().unwrap_or("").to_string(),
+            headers,
+            body: String::from_utf8_lossy(&body).into_owned(),
+            duration_ms,
+            warnings,
+        })
+    }
+}
+
+fn build_hyper_client() -> Result<HyperClient> {
+    let connector = HttpsConnectorBuilder::new()
+        .with_native_roots()
+        .map_err(|error| {
+            WireSurgeError::new("tls_root_load_failed", error.to_string())
+                .with_hint("Check that the operating system trust store is available.")
+        })?
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .build();
+    Ok(Client::builder(TokioExecutor::new()).build(connector))
+}
+
+pub async fn send_http_request(request: &RequestSpec) -> Result<HttpResponse> {
+    HttpClient::shared()?.send(request).await
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct HttpResponse {
@@ -18,179 +171,78 @@ pub struct HttpResponse {
 }
 
 impl HttpResponse {
-    pub fn to_json(&self) -> String {
+    pub fn to_json(&self) -> Result<String> {
+        serialize_json(&self.redacted_output())
+    }
+
+    pub fn to_json_value(&self) -> Result<serde_json::Value> {
+        serde_json::to_value(self.redacted_output())
+            .map_err(|error| WireSurgeError::new("json_encode_failed", error.to_string()))
+    }
+
+    fn redacted_output(&self) -> RedactedHttpResponse<'_> {
         let headers = self
             .headers
             .iter()
-            .map(|(key, value)| (key.as_str(), json_string(&redact_sensitive(value))))
-            .collect::<Vec<_>>();
-        json_object(&[
-            ("status_code", self.status_code.to_string()),
-            ("reason", json_string(&self.reason)),
-            ("headers", json_object(&headers)),
-            ("body", json_string(&redact_sensitive(&self.body))),
-            ("duration_ms", format!("{:.3}", self.duration_ms)),
-            (
-                "warnings",
-                json_array(
-                    &self
-                        .warnings
-                        .iter()
-                        .map(|warning| json_string(warning))
-                        .collect::<Vec<_>>(),
-                ),
-            ),
-        ])
-    }
-}
-
-pub fn send_http_request(request: &RequestSpec) -> Result<HttpResponse> {
-    let parsed = ParsedUrl::parse(&request.url)?;
-    if parsed.scheme == "https" {
-        return Err(WireSurgeError::new("https_not_supported_yet", "HTTPS execution is not implemented in the std-only runner")
-            .with_hint("Use http:// targets for the current scaffold; TLS support belongs in the next dependency-backed HTTP phase."));
-    }
-
-    let started = Instant::now();
-    let address = format!("{}:{}", parsed.host, parsed.port);
-    let mut stream = TcpStream::connect(address).map_err(|error| {
-        WireSurgeError::new("connect_failed", error.to_string())
-            .at("url")
-            .with_hint("Check that the target host and port are reachable.")
-            .retryable(true)
-    })?;
-    stream.set_read_timeout(Some(Duration::from_secs(30)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-
-    let body = request.body.as_deref().unwrap_or("");
-    let mut wire = String::new();
-    wire.push_str(&format!("{} {} HTTP/1.1\r\n", request.method, parsed.path));
-    wire.push_str(&format!("Host: {}\r\n", parsed.host_header()));
-    wire.push_str("User-Agent: WireSurge/0.1\r\n");
-    wire.push_str("Connection: close\r\n");
-    if !body.is_empty() && !request.headers.contains_key("content-length") {
-        wire.push_str(&format!("Content-Length: {}\r\n", body.len()));
-    }
-    for (key, value) in &request.headers {
-        if key.eq_ignore_ascii_case("host") || key.eq_ignore_ascii_case("connection") {
-            continue;
+            .map(|(key, value)| {
+                let value = if is_sensitive_header(key) {
+                    "[redacted]".to_string()
+                } else {
+                    redact_sensitive(value)
+                };
+                (key.clone(), value)
+            })
+            .collect();
+        RedactedHttpResponse {
+            status_code: self.status_code,
+            reason: &self.reason,
+            headers,
+            body: redact_sensitive(&self.body),
+            duration_ms: self.duration_ms,
+            warnings: &self.warnings,
         }
-        wire.push_str(&format!("{key}: {value}\r\n"));
     }
-    wire.push_str("\r\n");
-    wire.push_str(body);
-
-    stream.write_all(wire.as_bytes())?;
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response)?;
-    let duration_ms = started.elapsed().as_secs_f64() * 1000.0;
-    parse_response(&response, duration_ms)
 }
 
-fn parse_response(response: &[u8], duration_ms: f64) -> Result<HttpResponse> {
-    let raw = String::from_utf8_lossy(response);
-    let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
-    let mut lines = head.lines();
-    let status = lines.next().ok_or_else(|| {
-        WireSurgeError::new(
-            "invalid_http_response",
-            "response did not include a status line",
+#[derive(Serialize)]
+struct RedactedHttpResponse<'a> {
+    status_code: u16,
+    reason: &'a str,
+    headers: BTreeMap<String, String>,
+    body: String,
+    duration_ms: f64,
+    warnings: &'a [String],
+}
+
+fn parse_url(input: &str) -> Result<Url> {
+    let mut url = Url::parse(input)
+        .map_err(|error| WireSurgeError::new("invalid_url", error.to_string()).at("url"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(WireSurgeError::new(
+            "invalid_url",
+            "only http:// and https:// URLs are supported",
         )
-    })?;
-    let mut status_parts = status.splitn(3, ' ');
-    let _version = status_parts.next();
-    let status_code = status_parts
-        .next()
-        .ok_or_else(|| {
-            WireSurgeError::new("invalid_http_response", "response status line missing code")
-        })?
-        .parse::<u16>()
-        .map_err(|_| {
-            WireSurgeError::new(
-                "invalid_http_response",
-                "response status code was not numeric",
-            )
-        })?;
-    let reason = status_parts.next().unwrap_or("").to_string();
-    let mut headers = BTreeMap::new();
-    for line in lines {
-        if let Some((key, value)) = line.split_once(':') {
-            headers.insert(key.trim().to_ascii_lowercase(), value.trim().to_string());
-        }
+        .at("url"));
     }
-    let mut warnings = Vec::new();
-    if matches!(status_code, 301 | 302 | 303 | 307 | 308) {
-        warnings.push("redirect response captured; automatic redirect following is intentionally disabled in the current runner".to_string());
-        if status_code == 301 || status_code == 302 || status_code == 303 {
-            warnings.push("some clients drop request bodies or selected headers on this redirect class; WireSurge reports the redirect instead of rewriting it".to_string());
-        }
+    if url.host().is_none() {
+        return Err(WireSurgeError::new("invalid_url", "host is required").at("url"));
     }
-    Ok(HttpResponse {
-        status_code,
-        reason,
-        headers,
-        body: body.to_string(),
-        duration_ms,
-        warnings,
-    })
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(WireSurgeError::new(
+            "invalid_url",
+            "credentials in URLs are not supported; use an Authorization header",
+        )
+        .at("url"));
+    }
+    url.set_fragment(None);
+    Ok(url)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ParsedUrl {
-    scheme: String,
-    host: String,
-    port: u16,
-    path: String,
-}
-
-impl ParsedUrl {
-    fn parse(url: &str) -> Result<Self> {
-        let (scheme, rest) = url.split_once("://").ok_or_else(|| {
-            WireSurgeError::new("invalid_url", "url must include a scheme").at("url")
-        })?;
-        let scheme = scheme.to_ascii_lowercase();
-        if scheme != "http" && scheme != "https" {
-            return Err(WireSurgeError::new(
-                "invalid_url",
-                "only http:// and https:// URLs are supported",
-            )
-            .at("url"));
-        }
-        let (authority, path) = rest
-            .split_once('/')
-            .map(|(host, path)| (host, format!("/{path}")))
-            .unwrap_or((rest, "/".to_string()));
-        let (host, port) = if let Some((host, port)) = authority.rsplit_once(':') {
-            let port = port.parse::<u16>().map_err(|_| {
-                WireSurgeError::new("invalid_url", "port must be a number").at("url")
-            })?;
-            (host.to_string(), port)
-        } else {
-            (
-                authority.to_string(),
-                if scheme == "https" { 443 } else { 80 },
-            )
-        };
-        if host.is_empty() {
-            return Err(WireSurgeError::new("invalid_url", "host is required").at("url"));
-        }
-        Ok(Self {
-            scheme,
-            host,
-            port,
-            path,
-        })
-    }
-
-    fn host_header(&self) -> String {
-        if (self.scheme == "http" && self.port == 80)
-            || (self.scheme == "https" && self.port == 443)
-        {
-            self.host.clone()
-        } else {
-            format!("{}:{}", self.host, self.port)
-        }
-    }
+fn is_sensitive_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization" | "proxy-authorization" | "cookie" | "set-cookie" | "x-api-key"
+    )
 }
 
 #[cfg(test)]
@@ -202,8 +254,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rejects_url_credentials() {
+        let error = parse_url("https://user:pass@example.com/").unwrap_err();
+        assert_eq!(error.code, "invalid_url");
+    }
+
+    #[tokio::test]
     #[ignore = "requires permission to bind localhost TCP sockets"]
-    fn sends_local_http_request() {
+    async fn sends_local_http_request() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         thread::spawn(move || {
@@ -211,7 +269,9 @@ mod tests {
             let mut buffer = [0_u8; 1024];
             let _ = stream.read(&mut buffer).unwrap();
             stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nhello")
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello",
+                )
                 .unwrap();
         });
         let request = RequestSpec::from_json(&format!(
@@ -219,7 +279,7 @@ mod tests {
             addr
         ))
         .unwrap();
-        let response = send_http_request(&request).unwrap();
+        let response = send_http_request(&request).await.unwrap();
         assert_eq!(response.status_code, 200);
         assert_eq!(response.body, "hello");
     }

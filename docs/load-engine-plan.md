@@ -11,7 +11,7 @@ The structural backbone is a protocol-agnostic `Transport` trait + a per-connect
 - **No shared `&mut` connection.** `hyper`'s `SendRequest` is `&mut self` / `Clone`, so every DoH connection gets its own task that owns `SendRequest` + a `FuturesUnordered`, fed by an `mpsc` — the same channel-split shape as the DoT actor. Submit and collect never share a `&mut Conn`.
 - **Honor the peer stream cap.** Gate every DoH submission on connection readiness, clamp effective per-conn depth to `min(-q, live peer SETTINGS_MAX_CONCURRENT_STREAMS)`, and never count an over-cap RST as a query error. Default pool shape `-c 32 × -q 64` keeps average streams/conn under the documented `max_streams: 100` (see [Data and Connections](architecture/data-and-connections.md)).
 - **One semaphore per connection** of size `-q` (or a single global of size `c*q`), never one shared semaphore of size `-q` — that would cap total in-flight 16× low.
-- **`ring` requires an ADR.** It ships native code + a build script, which the [Dependency Policy](dependency-policy.md) requires an ADR for ([ADR 0001](adr/0001-ring-crypto-provider.md)). Its `ISC`/OpenSSL-style license terms are added to the `deny.toml` `[licenses] allow` list, or the `confidence-threshold = 0.93` gate fails.
+- **`ring` ships native code + a build script.** Its `ISC`/OpenSSL-style license terms are added to the `deny.toml` `[licenses] allow` list, or the `confidence-threshold = 0.93` gate fails.
 - **DoH `exchange` fully drains the response body** (so hyper auto-emits `WINDOW_UPDATE`), parses the DNS body for rcode/tc, and treats HTTP status != 200 (e.g. 403 bad token) distinctly from a DNS error.
 - **Bounded reconnect.** GOAWAY/connection-closed reconnect uses bounded backoff + a per-actor reconnect-rate cap; in-flight requests on a dead connection are recorded as errors, never silently dropped (which would inflate apparent QPS).
 - **No `async-trait`.** The trait uses native RPITIT `async fn` with explicit `+ Send` return bounds (avoids an extra dep, per-call `Box`, and cargo-deny surface). The engine is generic over `T: Transport`, monomorphized per protocol.
@@ -49,7 +49,7 @@ Throughput (Little's Law): `QPS = c × min(q, peer_streams) / RTT`. The default 
 
 The TCP target is the **pod IP**; the PPv2 src/dst are the **mocked customer src + NLB VIP dst**, independent of the socket peer. So PPv2 must be the **first bytes on the freshly connected TCP stream, before any TLS ClientHello or DNS bytes**. The engine drives the H2 handshake on its own already-PPv2+TLS-wrapped stream, rather than a pooling HTTP client that would hide byte ordering and connection identity.
 
-The PPv2 v2 encoder is hand-rolled (the dependency policy permits a small well-contained helper; a reviewed crate is the fallback). TCPv4 header layout:
+The PPv2 v2 encoder is hand-rolled (a small well-contained helper; a reviewed crate is the fallback). TCPv4 header layout:
 
 ```
 sig (12): 0D 0A 0D 0A 00 0D 0A 51 55 49 54 0A
@@ -98,14 +98,14 @@ The final summary keeps the existing `DnsRunStats` field names plus `conns/strea
 
 ## Dependencies
 
-New crates are declared once in root `[workspace.dependencies]`, pinned to exact reviewed versions, consumed with `workspace = true`, and gated on `cargo deny check` + `cargo tree --duplicates`:
+New crates are declared once in root `[workspace.dependencies]`, consumed with `workspace = true`, and gated on `cargo deny check` + `cargo tree --duplicates`:
 
 - **Async runtime** — `tokio` (multi-thread, net, time, sync, signal, io-util), `tokio-util` (`CancellationToken`), `futures-util` (`FuturesUnordered`), `bytes`.
-- **TLS** — `rustls` and `tokio-rustls` (both with the `ring` and `tls12` features), `rustls-native-certs` for the OS trust store. `rustls-pki-types` comes transitively. See [ADR 0001](adr/0001-ring-crypto-provider.md).
-- **DoH** — `hyper` + `hyper-util` (h2 only, no http1, no legacy pooling client), `http`, `http-body-util`, `base64` (GET base64url).
-- **Corpus / metrics** — `memmap2`, `hdrhistogram` (no flate2/serde features). Both are build-script-free / pure-Rust.
+- **TLS** — `rustls` and `tokio-rustls` (both with the `ring` and `tls12` features), `rustls-native-certs` for the OS trust store.
+- **DoH** — `hyper` + `hyper-util`, `http`, `http-body-util`, `base64` (GET base64url).
+- **Corpus / metrics** — `memmap2`, `hdrhistogram`. Both are build-script-free / pure-Rust.
 
-Single `rustls` in the tree (own connector, no `hyper-rustls`). `ring` (not `aws-lc-rs`) avoids a second native-build ADR and builds clean on `aarch64-unknown-linux-musl`. `domain` 0.12.1 std-only stays as the DNS codec.
+The DoT/DoH connector uses `rustls` with the `ring` provider; `ring` (not `aws-lc-rs`) builds clean on `aarch64-unknown-linux-musl`. The DNS codec is `hickory-proto`.
 
 ## Validation
 
