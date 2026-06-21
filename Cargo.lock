@@ -865,6 +865,7 @@ version = "0.23.40"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
 dependencies = [
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -1410,10 +1411,12 @@ dependencies = [
  "tokio",
  "tokio-util",
  "wiresurge-core",
+ "wiresurge-corpus",
  "wiresurge-dns",
  "wiresurge-engine",
  "wiresurge-plugins",
  "wiresurge-storage",
+ "wiresurge-transport",
 ]
 
 [[package]]
@@ -1438,9 +1441,12 @@ dependencies = [
 name = "wiresurge-dns"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "hickory-proto",
+ "rustls",
  "serde",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "wiresurge-core",
  "wiresurge-metrics",
@@ -1510,7 +1516,10 @@ dependencies = [
 name = "wiresurge-transport"
 version = "0.1.0"
 dependencies = [
+ "rustls",
+ "rustls-native-certs",
  "tokio",
+ "tokio-rustls",
  "wiresurge-core",
 ]
 

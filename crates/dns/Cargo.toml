@@ -18,3 +18,8 @@ tokio-util.workspace = true
 wiresurge-core.workspace = true
 wiresurge-metrics.workspace = true
 wiresurge-transport.workspace = true
+
+[dev-dependencies]
+futures-util.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true

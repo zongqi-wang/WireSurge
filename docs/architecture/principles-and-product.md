@@ -34,7 +34,7 @@ Standards-heavy and security-sensitive behavior uses established first-party or 
 
 WireSurge owns the behavior that differentiates the product: scheduling, pacing, connection lifecycle, cancellation policy, workflow execution, and metrics semantics. Small, well-contained helpers can remain local. A custom parser, protocol codec, argument scanner, or cryptographic implementation is technical debt unless an architecture decision record documents why an established library cannot meet the requirement.
 
-The current CLI uses `clap`, Serde, Tokio, Hyper/rustls, `hickory-proto`, and `hdrhistogram` for their respective standards-heavy concerns. WireSurge retains scheduling, pacing, connection ownership, cancellation policy, workflow semantics, and metrics aggregation. See the [Dependency Policy](../dependency-policy.md).
+The current CLI uses `clap`, Serde, Tokio, Hyper/rustls, `hickory-proto`, and `hdrhistogram` for their respective standards-heavy concerns. WireSurge retains scheduling, pacing, connection ownership, cancellation policy, workflow semantics, and metrics aggregation.
 
 ## Product Shape
 

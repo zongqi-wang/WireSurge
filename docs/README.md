@@ -2,7 +2,7 @@
 
 WireSurge is a local-first desktop and CLI application for API exploration, protocol workflows, and high-rate traffic generation. It combines an API request workspace with a controlled load engine and a path toward composable protocol stages.
 
-This book is the canonical source for the project's architecture, current implementation status, policies, and roadmap. It replaces the former duplicate `architecture.html` documents.
+This book is the canonical source for the project's architecture, current implementation status, policies, and roadmap.
 
 ## Reading the Book
 
