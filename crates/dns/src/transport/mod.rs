@@ -4,6 +4,8 @@ use std::time::Duration;
 use wiresurge_transport::ConnectTarget;
 
 pub mod do53;
+pub mod dot;
+pub mod framed;
 
 /// One prepared query. `wire` is the full DNS message; the connection assigns a
 /// transaction id at send time (writing it into `wire[0..2]`), so ids stay

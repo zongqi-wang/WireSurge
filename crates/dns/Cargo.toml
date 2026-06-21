@@ -15,3 +15,8 @@ domain.workspace = true
 tokio.workspace = true
 wiresurge-core.workspace = true
 wiresurge-transport.workspace = true
+
+[dev-dependencies]
+futures-util.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true

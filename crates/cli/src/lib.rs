@@ -6,17 +6,23 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread;
 use std::time::Duration;
 
+use std::net::{SocketAddr, ToSocketAddrs};
+
 use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{Args, Parser, Subcommand};
+use tokio_util::sync::CancellationToken;
 use wiresurge_core::{
     RequestSpec, Result, WireSurgeError, json_array, json_object, json_string, schema_for,
 };
+use wiresurge_corpus::Corpus;
 use wiresurge_dns::{
     DnsRunConfig, DnsTransport, EdnsOption, decode_hex_payload, parse_qtype, run_dns,
 };
+use wiresurge_engine::load::{LoadConfig, LoadProto, LoadStats, run_load};
 use wiresurge_engine::{RunOptions, run_request, run_stored_request};
 use wiresurge_plugins::PluginManifestDraft;
 use wiresurge_storage::WorkspaceStore;
+use wiresurge_transport::{AppProto, ConnectTarget, TlsParams, build_client_config};
 
 static SIGNAL_CODE: AtomicU8 = AtomicU8::new(0);
 
@@ -48,6 +54,8 @@ enum Command {
     },
     #[command(arg_required_else_help = true)]
     Dns(DnsArgs),
+    #[command(arg_required_else_help = true)]
+    Load(LoadArgs),
     Workspace {
         action: Option<String>,
     },
@@ -91,6 +99,55 @@ struct DnsArgs {
     edns_payload_hex: Option<String>,
     #[arg(long = "edns-code", value_name = "CODE")]
     edns_code: Option<u16>,
+}
+
+#[derive(Args)]
+struct LoadArgs {
+    /// Server address; pod IP:port the socket actually opens.
+    server: String,
+    #[arg(long, value_name = "udp|tcp|dot", default_value = "udp")]
+    protocol: String,
+    #[arg(long, default_value_t = 53)]
+    port: u16,
+    /// Path to a newline-delimited query-name corpus; falls back to --name.
+    #[arg(long)]
+    corpus: Option<PathBuf>,
+    #[arg(long, default_value = "example.com")]
+    name: String,
+    #[arg(long = "type", default_value = "A")]
+    qtype: String,
+    /// Connections (-c): each owns one socket and its own in-flight window.
+    #[arg(short = 'c', long, default_value_t = 32)]
+    concurrency: usize,
+    /// In-flight queries per connection (-q): total in-flight = c * q.
+    #[arg(short = 'q', long = "in-flight", default_value_t = 64)]
+    in_flight: usize,
+    /// Run duration in seconds (-l); mutually exclusive with --count.
+    #[arg(short = 'l', long)]
+    duration_s: Option<f64>,
+    #[arg(long)]
+    count: Option<u64>,
+    /// Process-wide query rate cap; unset means as fast as possible.
+    #[arg(long)]
+    qps: Option<f64>,
+    #[arg(long = "timeout-ms", default_value_t = 2000)]
+    timeout_ms: u64,
+    #[arg(long)]
+    randomize: bool,
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
+    /// Auth token: EDNS 65184 on Do53/DoT (URL query on DoH, later).
+    #[arg(long)]
+    token: Option<String>,
+    /// TLS SNI for DoT; defaults to the server IP when unset.
+    #[arg(long)]
+    sni: Option<String>,
+    /// Proceed when the TLS peer negotiates no ALPN (assume the protocol).
+    #[arg(long = "alpn-relaxed")]
+    alpn_relaxed: bool,
+    /// Skip TLS certificate verification (self-signed test targets only).
+    #[arg(long)]
+    insecure: bool,
 }
 
 #[derive(Args)]
@@ -169,6 +226,7 @@ fn run(cli: Cli, cwd: PathBuf) -> Result<(String, i32)> {
     let output = match cli.command {
         Command::Schema { resource } => schema_for(&resource)?,
         Command::Dns(args) => return dns_command(args, output_json),
+        Command::Load(args) => return load_command(args, output_json),
         Command::Workspace { action } => workspace_command(&store, action.as_deref(), output_json)?,
         Command::Request(args) => request_command(&store, args)?,
         Command::Run(args) => run_command(&store, args)?,
@@ -272,6 +330,181 @@ fn dns_command(args: DnsArgs, output_json: bool) -> Result<(String, i32)> {
         stats.to_text()
     };
     Ok((output, exit_code))
+}
+
+fn resolve_addr(server: &str, port: u16) -> Result<SocketAddr> {
+    if let Ok(addr) = server.parse::<SocketAddr>() {
+        return Ok(addr);
+    }
+    if let Ok(ip) = server.parse::<std::net::IpAddr>() {
+        return Ok(SocketAddr::new(ip, port));
+    }
+    (server, port)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut addrs| addrs.next())
+        .ok_or_else(|| {
+            WireSurgeError::new("invalid_server", format!("could not resolve {server}"))
+                .at("server")
+        })
+}
+
+fn build_load_config(args: &LoadArgs) -> Result<LoadConfig> {
+    let addr = resolve_addr(&args.server, args.port)?;
+    let proto = match args.protocol.to_ascii_lowercase().as_str() {
+        "udp" => LoadProto::Do53Udp,
+        "tcp" => LoadProto::Do53Tcp,
+        "dot" => LoadProto::Dot,
+        other => {
+            return Err(WireSurgeError::new(
+                "invalid_dns_transport",
+                format!("protocol must be udp, tcp, or dot, got {other}"),
+            )
+            .at("protocol"));
+        }
+    };
+    let is_dot = proto == LoadProto::Dot;
+    if !is_dot && (args.insecure || args.sni.is_some() || args.alpn_relaxed) {
+        return Err(WireSurgeError::new(
+            "tls_flag_without_tls",
+            "--sni, --alpn-relaxed, and --insecure apply only to --protocol dot",
+        )
+        .at("protocol"));
+    }
+    if args.duration_s.is_some() && args.count.is_some() {
+        return Err(WireSurgeError::new(
+            "conflicting_stop_conditions",
+            "set either --duration-s (-l) or --count, not both",
+        )
+        .at("duration-s"));
+    }
+    if args.token.is_some() && !is_dot {
+        return Err(WireSurgeError::new(
+            "token_requires_encrypted_transport",
+            "--token rides in EDNS 65184 and is only sent over the encrypted dot transport; plain udp/tcp would expose the credential in cleartext",
+        )
+        .at("token"));
+    }
+    let target = if is_dot {
+        let config = build_client_config(&TlsParams {
+            proto: AppProto::Dot,
+            insecure: args.insecure,
+        })?;
+        ConnectTarget::new(addr).with_tls(
+            config,
+            AppProto::Dot,
+            args.sni.clone(),
+            args.alpn_relaxed,
+        )
+    } else {
+        ConnectTarget::new(addr)
+    };
+    let corpus = match &args.corpus {
+        Some(path) => Corpus::load(path)?,
+        None => Corpus::single(&args.name),
+    };
+    let config = LoadConfig {
+        proto,
+        target,
+        corpus,
+        qtype: parse_qtype(&args.qtype)?,
+        concurrency: args.concurrency,
+        in_flight: args.in_flight,
+        timeout: Duration::from_millis(args.timeout_ms),
+        qps_cap: args.qps,
+        duration: args.duration_s.map(Duration::from_secs_f64),
+        count: args.count,
+        randomize: args.randomize,
+        seed: args.seed,
+        token: args.token.clone(),
+    };
+    config.validate()?;
+    Ok(config)
+}
+
+fn load_command(args: LoadArgs, output_json: bool) -> Result<(String, i32)> {
+    let config = build_load_config(&args)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(std::thread::available_parallelism().map_or(8, |n| n.get().min(48)))
+        .enable_io()
+        .enable_time()
+        .thread_name("wiresurge-io")
+        .build()
+        .map_err(|error| WireSurgeError::new("runtime_init_failed", error.to_string()))?;
+
+    let cancel = CancellationToken::new();
+    let (stats, signalled) = runtime.block_on(async {
+        let signal_cancel = cancel.clone();
+        let signal_task = tokio::spawn(async move {
+            wait_for_shutdown().await;
+            signal_cancel.cancel();
+        });
+        let stats = run_load(config, cancel.clone()).await;
+        // The run may have ended naturally; stop the listener and capture whether
+        // a signal fired (even if it raced in after the actors drained).
+        signal_task.abort();
+        let signalled = cancel.is_cancelled();
+        (stats, signalled)
+    });
+    let mut stats = stats?;
+    stats.cancelled |= signalled;
+
+    let exit_code = if stats.cancelled { 130 } else { 0 };
+    let output = if output_json {
+        stats.to_json()
+    } else {
+        format_load_text(&stats)
+    };
+    Ok((output, exit_code))
+}
+
+async fn wait_for_shutdown() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut interrupt = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let mut terminate = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+fn format_load_text(stats: &LoadStats) -> String {
+    let recorder = &stats.recorder;
+    format!(
+        "duration {:.2}s  sent {}  received {}  recv_qps {:.0}\n\
+         timeouts {}  errors {}  conn_errors {}  truncated {}\n\
+         latency_ms  p50 {:.2}  p95 {:.2}  p99 {:.2}  max {:.2}{}",
+        stats.duration_s,
+        recorder.sent,
+        recorder.received,
+        stats.recv_qps(),
+        recorder.timeouts,
+        recorder.errors,
+        recorder.conn_errors,
+        recorder.truncated,
+        recorder.percentile_ms(0.50),
+        recorder.percentile_ms(0.95),
+        recorder.percentile_ms(0.99),
+        recorder.max_ms(),
+        if stats.cancelled {
+            "\ncancelled by signal"
+        } else {
+            ""
+        },
+    )
 }
 
 #[cfg(unix)]
@@ -597,6 +830,90 @@ mod tests {
         );
         assert_eq!(outcome.code, 1);
         assert!(outcome.stdout.contains("unknown_argument"));
+    }
+
+    #[test]
+    fn load_rejects_token_on_cleartext_transport() {
+        let outcome = dispatch(
+            &[
+                "load".into(),
+                "127.0.0.1".into(),
+                "--protocol".into(),
+                "udp".into(),
+                "--count".into(),
+                "1".into(),
+                "--token".into(),
+                "secret".into(),
+                "--output".into(),
+                "json".into(),
+            ],
+            temp_dir(),
+        );
+        assert_eq!(outcome.code, 1);
+        assert!(
+            outcome
+                .stdout
+                .contains("token_requires_encrypted_transport")
+        );
+    }
+
+    #[test]
+    fn load_rejects_tls_flags_on_plain_transport() {
+        let outcome = dispatch(
+            &[
+                "load".into(),
+                "127.0.0.1".into(),
+                "--protocol".into(),
+                "tcp".into(),
+                "--count".into(),
+                "1".into(),
+                "--insecure".into(),
+                "--output".into(),
+                "json".into(),
+            ],
+            temp_dir(),
+        );
+        assert_eq!(outcome.code, 1);
+        assert!(outcome.stdout.contains("tls_flag_without_tls"));
+    }
+
+    #[test]
+    fn load_rejects_both_duration_and_count() {
+        let outcome = dispatch(
+            &[
+                "load".into(),
+                "127.0.0.1".into(),
+                "--count".into(),
+                "1".into(),
+                "--duration-s".into(),
+                "1".into(),
+                "--output".into(),
+                "json".into(),
+            ],
+            temp_dir(),
+        );
+        assert_eq!(outcome.code, 1);
+        assert!(outcome.stdout.contains("conflicting_stop_conditions"));
+    }
+
+    #[test]
+    fn load_protocol_is_case_insensitive() {
+        let outcome = dispatch(
+            &[
+                "load".into(),
+                "127.0.0.1".into(),
+                "--protocol".into(),
+                "UDP".into(),
+                "--count".into(),
+                "0".into(),
+                "--output".into(),
+                "json".into(),
+            ],
+            temp_dir(),
+        );
+        // count 0 means no work; the run completes immediately. The point is the
+        // uppercase protocol is accepted rather than rejected as invalid.
+        assert_eq!(outcome.code, 0, "{}", outcome.stdout);
     }
 
     #[test]

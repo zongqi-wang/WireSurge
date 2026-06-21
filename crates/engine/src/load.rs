@@ -7,15 +7,27 @@ use tokio::time::sleep_until;
 use tokio_util::sync::CancellationToken;
 use wiresurge_core::{Result, WireSurgeError, json_object};
 use wiresurge_corpus::{Corpus, SelectMode};
+use wiresurge_dns::EdnsOption;
 use wiresurge_dns::transport::do53::{TcpTransport, UdpTransport};
+use wiresurge_dns::transport::dot::DotTransport;
 use wiresurge_dns::transport::{Connection, DnsRequest, Transport, TransportError};
 use wiresurge_metrics::LoadRecorder;
 use wiresurge_transport::ConnectTarget;
+
+/// EDNS0 option code carrying the Global Resolver auth token on Do53/DoT
+/// (0xFEA0); on DoH the token rides in the URL query instead.
+pub const TOKEN_EDNS_CODE: u16 = 65184;
+
+/// Upper bound on how long a cancelled actor waits for in-flight queries to
+/// finish before dropping them, so a signal interrupts promptly instead of
+/// blocking up to the full per-request timeout on stalled queries.
+const CANCEL_GRACE: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadProto {
     Do53Udp,
     Do53Tcp,
+    Dot,
 }
 
 #[derive(Clone)]
@@ -32,6 +44,7 @@ pub struct LoadConfig {
     pub count: Option<u64>,
     pub randomize: bool,
     pub seed: u64,
+    pub token: Option<String>,
 }
 
 impl LoadConfig {
@@ -87,6 +100,7 @@ struct WorkSource {
     qtype: u16,
     seed: u64,
     mode: SelectMode,
+    edns_option: Option<EdnsOption>,
 }
 
 impl WorkSource {
@@ -105,7 +119,8 @@ impl WorkSource {
             }
         }
         let name = self.corpus.select(index, self.seed, self.mode);
-        let wire = wiresurge_dns::build_query(0, name, self.qtype, None).ok()?;
+        let wire =
+            wiresurge_dns::build_query(0, name, self.qtype, self.edns_option.as_ref()).ok()?;
         Some(DnsRequest { wire })
     }
 
@@ -158,8 +173,18 @@ async fn run_actor<T: Transport>(
 
         tokio::select! {
             _ = cancel.cancelled() => {
-                while let Some((result, elapsed)) = inflight.next().await {
-                    record(&mut recorder, result, elapsed);
+                // Drain in-flight, but bounded by a short grace so a signal does
+                // not wait up to the full per-request timeout on stalled queries.
+                let grace = tokio::time::sleep(CANCEL_GRACE);
+                tokio::pin!(grace);
+                loop {
+                    tokio::select! {
+                        done = inflight.next() => match done {
+                            Some((result, elapsed)) => record(&mut recorder, result, elapsed),
+                            None => break,
+                        },
+                        _ = &mut grace => break,
+                    }
                 }
                 break;
             }
@@ -171,7 +196,7 @@ async fn run_actor<T: Transport>(
         }
     }
 
-    conn.drain(timeout).await;
+    conn.drain(CANCEL_GRACE.min(timeout)).await;
     recorder
 }
 
@@ -209,6 +234,10 @@ pub async fn run_load(config: LoadConfig, cancel: CancellationToken) -> Result<L
         } else {
             SelectMode::Sequential
         },
+        edns_option: config.token.as_ref().map(|token| EdnsOption {
+            code: TOKEN_EDNS_CODE,
+            payload: token.as_bytes().to_vec(),
+        }),
     });
 
     let mut actors = Vec::with_capacity(config.concurrency);
@@ -223,6 +252,9 @@ pub async fn run_load(config: LoadConfig, cancel: CancellationToken) -> Result<L
                 target, work, in_flight, timeout, cancel,
             )),
             LoadProto::Do53Tcp => tokio::spawn(run_actor::<TcpTransport>(
+                target, work, in_flight, timeout, cancel,
+            )),
+            LoadProto::Dot => tokio::spawn(run_actor::<DotTransport>(
                 target, work, in_flight, timeout, cancel,
             )),
         };

@@ -1,4 +1,4 @@
-# WireSurge Dependency Policy
+# Dependency Policy
 
 WireSurge uses established first-party or third-party libraries for protocol parsing, cryptography, async I/O, signals, serialization, CLI parsing, storage, histograms, and other security-sensitive or standards-heavy work. It does not add a library merely to avoid writing a small, well-contained helper.
 
@@ -36,9 +36,7 @@ The `net`, `resolv`, and `unstable-*` features are not enabled. NLnet Labs curre
 
 ## CLI Decision
 
-WireSurge uses `clap = 4.6.1` with default features disabled and an explicit feature allowlist. In this version, `std`, `color`, `help`, `usage`, `error-context`, and `suggestions` are exactly Clap's default feature set; WireSurge additionally enables `derive` and `wrap_help`. The current declaration therefore does not reduce the dependency graph compared with enabling defaults and adding those two features. Its benefit is review control: a future Clap release cannot add a new default feature to WireSurge without a manifest change and dependency review.
-
-The `env` feature is not part of Clap's defaults and remains intentionally omitted so flags do not read ambient environment variables implicitly. If explicit feature allowlisting stops being a project requirement, the simpler equivalent declaration is to enable Clap defaults and request only `derive` and `wrap_help`.
+WireSurge uses `clap = 4.6.1` with default features disabled and an explicit feature allowlist: Clap's default set (`std`, `color`, `help`, `usage`, `error-context`, `suggestions`) plus `derive` and `wrap_help`. This matches the default graph today, so its only benefit is review control — a future Clap release cannot add a new default feature without a manifest change and dependency review. The `env` feature is intentionally omitted so flags never read ambient environment variables implicitly.
 
 `clap` owns top-level command parsing, option parsing, typed value conversion, help, and generic argument validation. WireSurge maps its parse errors into the existing structured error envelope when `--output json` is selected. Domain-specific parsing remains in the owning crate so stable codes such as `invalid_dns_transport` and `invalid_dns_qtype` do not become generic CLI errors.
 

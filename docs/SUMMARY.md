@@ -20,4 +20,12 @@
 # Delivery
 
 - [Implementation Plan](implementation-plan.md)
+- [Load Engine Plan](load-engine-plan.md)
+
+# Decisions
+
+- [ADR 0001: ring crypto provider](adr/0001-ring-crypto-provider.md)
+
+# Reference
+
 - [References](references.md)

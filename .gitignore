@@ -6,3 +6,4 @@
 /.wiresurge/secrets/
 /.wiresurge/tmp/
 .DS_Store
+/docs-local/
