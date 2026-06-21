@@ -10,7 +10,7 @@ These projects and specifications inform the steering architecture. A reference 
 - [Tokio runtime builder](https://docs.rs/tokio/latest/tokio/runtime/struct.Builder.html): bounded worker-thread configuration.
 - [Tokio signals](https://docs.rs/tokio/latest/tokio/signal/): asynchronous platform signal integration.
 - [Tokio `CancellationToken`](https://docs.rs/tokio-util/latest/tokio_util/sync/struct.CancellationToken.html): hierarchical cooperative cancellation.
-- [Hyper client](https://docs.rs/hyper-util/latest/hyper_util/client/legacy/struct.Client.html): reusable connection pools.
+- [Hyper HTTP/2 client connection](https://docs.rs/hyper/latest/hyper/client/conn/http2/index.html): low-level connection driver used for DoH.
 
 ## Protocols and Dependencies
 
@@ -25,5 +25,6 @@ These projects and specifications inform the steering architecture. A reference 
 
 ## Documentation
 
+- [ADR 0001: ring crypto provider](adr/0001-ring-crypto-provider.md): the recorded TLS crypto-provider decision.
 - [mdBook](https://rust-lang.github.io/mdBook/): the Rust project documentation system used to render this book.
 - [GitHub Pages custom workflows](https://docs.github.com/en/pages/getting-started-with-github-pages/using-custom-workflows-with-github-pages): build-artifact deployment model.

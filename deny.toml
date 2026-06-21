@@ -1,3 +1,9 @@
+# Build/ship targets WireSurge supports. aarch64-pc-windows-msvc is intentionally
+# absent: on that platform alone, ring (the TLS provider, ADR 0001) pulls
+# windows-sys 0.52 for ARM CPU-feature detection while clap's anstyle pulls 0.61,
+# an unavoidable ring-internal duplicate. WireSurge ships only to Graviton/Linux
+# and is developed on macOS, so Windows-on-ARM is out of scope rather than carrying
+# a bans skip for a duplicate we can neither dedupe nor ever build.
 [graph]
 targets = [
   "aarch64-apple-darwin",
@@ -28,9 +34,12 @@ unused = "deny"
 
 [licenses]
 confidence-threshold = 0.93
+# ISC clears ring (Apache-2.0 AND ISC), untrusted, and rustls-webpki, pulled in
+# by the rustls/ring TLS stack (ADR docs/adr/0001-ring-crypto-provider.md).
 allow = [
   "Apache-2.0",
   "BSD-3-Clause",
+  "ISC",
   "MIT",
   "Unicode-3.0",
 ]
