@@ -8,7 +8,6 @@
 //! transaction-id demux as on Do53/DoT. RFC 8484 §4.1 says the DNS ID SHOULD be
 //! 0 on DoH; the query is built with id 0 and we report it verbatim.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use data_encoding::BASE64URL_NOPAD;
@@ -115,10 +114,11 @@ impl Transport for DohTransport {
 
 /// Build the variable per-query path-and-query string and the body. GET carries
 /// the message as a base64url (`?dns=`) parameter and an empty body; POST carries
-/// the raw wire bytes as the body. Any template query is joined ahead of `dns=`. The POST body shares the prebuilt wire buffer (no copy); GET
-/// encodes straight into the path-and-query buffer. Only the path-and-query is
-/// rebuilt per query — the scheme/authority are connection-constant.
-fn build_path_and_query(prepared: &Prepared, wire: &Arc<[u8]>) -> (String, Bytes) {
+/// the raw wire bytes as the body. Any template query is joined ahead of `dns=`.
+/// The POST body is copied out of the owned wire buffer into a private `Bytes`;
+/// GET encodes straight into the path-and-query buffer. Only the path-and-query
+/// is rebuilt per query — the scheme/authority are connection-constant.
+fn build_path_and_query(prepared: &Prepared, wire: &[u8]) -> (String, Bytes) {
     match prepared.method {
         HttpMethod::Get => {
             let mut pq = String::with_capacity(
@@ -144,7 +144,7 @@ fn build_path_and_query(prepared: &Prepared, wire: &Arc<[u8]>) -> (String, Bytes
                 pq.push('?');
                 pq.push_str(&prepared.query);
             }
-            (pq, Bytes::from_owner(Arc::clone(wire)))
+            (pq, Bytes::copy_from_slice(wire))
         }
     }
 }
@@ -155,7 +155,7 @@ fn build_path_and_query(prepared: &Prepared, wire: &Arc<[u8]>) -> (String, Bytes
 /// scheme and authority are cloned (refcount bumps) from `Prepared`, and the
 /// headers are borrowed straight off `Prepared` (no per-query Vec).
 #[doc(hidden)]
-pub fn assemble(prepared: &Prepared, wire: &Arc<[u8]>) -> Result<(Uri, Bytes), TransportError> {
+pub fn assemble(prepared: &Prepared, wire: &[u8]) -> Result<(Uri, Bytes), TransportError> {
     let (pq, body) = build_path_and_query(prepared, wire);
     let path_and_query = PathAndQuery::try_from(pq)
         .map_err(|error| TransportError::Protocol(format!("invalid DoH URI: {error}")))?;

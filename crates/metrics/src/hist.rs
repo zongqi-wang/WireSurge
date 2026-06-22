@@ -43,6 +43,8 @@ impl LoadRecorder {
         self.received += 1;
         self.bytes_in += bytes_in as u64;
         self.truncated += u64::from(truncated);
+        // rcode is the DNS header low-nibble only (see parse_response_header);
+        // index 16 is the catch-all for any code >= 16.
         self.rcodes[usize::from(rcode.min(16))] += 1;
         let _ = self.hist.record(latency_us.max(1));
     }

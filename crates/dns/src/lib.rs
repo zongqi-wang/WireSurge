@@ -62,6 +62,13 @@ pub fn parse_response_header(response: &[u8], expected_id: Option<u16>) -> Resul
         ));
     }
     Ok(ResponseHeader {
+        // Low 4 bits only: `Header::from_bytes` masks rcode to the header nibble
+        // (hickory `ResponseCode::from_low`). The 12-bit EDNS extended rcode lives
+        // in the OPT RR TTL high byte (additional section); recovering it would
+        // require a full `Message::from_vec` decode of every reply, defeating this
+        // header-only fast path. rcode is stats-only (never gates retry/error) and
+        // extended rcodes (>= 16) do not occur under plain query load, so the
+        // low-nibble value is sufficient.
         rcode: u16::from(header.response_code),
         truncated: header.truncation,
     })

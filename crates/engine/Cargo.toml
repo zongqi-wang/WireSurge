@@ -30,3 +30,7 @@ hyper = { workspace = true, features = ["server"] }
 hyper-util.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
+
+[[bench]]
+name = "load_qps"
+harness = false
