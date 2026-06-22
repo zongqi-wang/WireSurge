@@ -10,8 +10,7 @@ pub(crate) const MAX_DNS_MESSAGE_LEN: usize = u16::MAX as usize;
 const MAX_EDNS_OPTION_PAYLOAD_LEN: usize = u16::MAX as usize - 4;
 
 /// A single EDNS0 OPT option: a caller-supplied option code plus its raw payload
-/// bytes. The code is configurable (not hardcoded) so callers can emit real
-/// options such as the Global Resolver DoT auth token (code 65184 / 0xFEA0).
+/// bytes. The code is configurable so callers can emit any option.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EdnsOption {
     pub code: u16,
@@ -82,26 +81,29 @@ pub fn build_query(
     transaction_id: u16,
     qname: &str,
     qtype: u16,
-    edns_option: Option<&EdnsOption>,
+    edns_options: &[EdnsOption],
 ) -> Result<Vec<u8>> {
     let name = parse_dns_name(qname)?;
     let mut message = Message::new(transaction_id, MessageType::Query, OpCode::Query);
     message.metadata.recursion_desired = true;
     message.add_query(Query::query(name, RecordType::from(qtype)));
 
-    if let Some(edns) = edns_option {
-        if edns.payload.len() > MAX_EDNS_OPTION_PAYLOAD_LEN {
-            return Err(WireSurgeError::new(
-                "invalid_edns_payload",
-                "EDNS option payload exceeds 65531 bytes",
-            )
-            .at("edns_payload"));
-        }
+    if !edns_options.is_empty() {
         let mut extension = Edns::new();
         extension.set_max_payload(1232);
-        extension
-            .options_mut()
-            .insert(HickoryEdnsOption::Unknown(edns.code, edns.payload.clone()));
+        for option in edns_options {
+            if option.payload.len() > MAX_EDNS_OPTION_PAYLOAD_LEN {
+                return Err(WireSurgeError::new(
+                    "invalid_edns_payload",
+                    "EDNS option payload exceeds 65531 bytes",
+                )
+                .at("edns_payload"));
+            }
+            extension.options_mut().insert(HickoryEdnsOption::Unknown(
+                option.code,
+                option.payload.clone(),
+            ));
+        }
         message.set_edns(extension);
     }
     let packet = message
@@ -112,6 +114,18 @@ pub fn build_query(
             "dns_message_too_large",
             "DNS query exceeds the 65535-byte message limit",
         ));
+    }
+    // The static payload cap admits values that, combined with the question
+    // section, push the message past 65535 bytes — where the encoder silently
+    // drops the whole OPT record (ARCOUNT, header bytes 10..12, falls to 0)
+    // rather than erroring. Reject that so a requested option never vanishes
+    // from the wire unnoticed.
+    if !edns_options.is_empty() && u16::from_be_bytes([packet[10], packet[11]]) == 0 {
+        return Err(WireSurgeError::new(
+            "edns_option_dropped",
+            "EDNS option does not fit within the 65535-byte message limit for this query name",
+        )
+        .at("edns_payload"));
     }
     Ok(packet)
 }
@@ -177,7 +191,7 @@ mod tests {
             code: 65001,
             payload: vec![0xca, 0xfe],
         };
-        let packet = build_query(0xbeef, "example.com", 1, Some(&option)).unwrap();
+        let packet = build_query(0xbeef, "example.com", 1, std::slice::from_ref(&option)).unwrap();
         assert_eq!(&packet[0..2], &0xbeef_u16.to_be_bytes());
         assert!(
             packet
@@ -189,19 +203,19 @@ mod tests {
 
     #[test]
     fn encodes_configurable_edns0_option_code() {
-        // The Global Resolver DoT auth token rides in EDNS0 option 65184 (0xFEA0);
-        // the option code must be caller-supplied, not hardcoded to 65001.
-        let token = b"a-token-value".to_vec();
+        // The option code must be caller-supplied, not hardcoded. NSID (3) is a
+        // registered EDNS0 option code (RFC 5001).
+        let payload = b"option-value".to_vec();
         let option = EdnsOption {
-            code: 65184,
-            payload: token.clone(),
+            code: 3,
+            payload: payload.clone(),
         };
-        let packet = build_query(0x1234, "example.com", 1, Some(&option)).unwrap();
+        let packet = build_query(0x1234, "example.com", 1, std::slice::from_ref(&option)).unwrap();
         assert!(
             packet
                 .windows(2)
-                .any(|window| window == 65184_u16.to_be_bytes()),
-            "option code 65184 must appear in the OPT record"
+                .any(|window| window == 3_u16.to_be_bytes()),
+            "option code 3 must appear in the OPT record"
         );
         assert!(
             !packet
@@ -209,7 +223,44 @@ mod tests {
                 .any(|window| window == 65001_u16.to_be_bytes()),
             "the old hardcoded 65001 code must not leak through"
         );
-        assert!(packet.ends_with(&token));
+        assert!(packet.ends_with(&payload));
+    }
+
+    #[test]
+    fn rejects_edns_option_that_overflows_the_message() {
+        // A payload that fits the per-option cap but pushes the whole message
+        // past 65535 bytes makes the encoder silently drop the OPT record; that
+        // must surface as an error rather than a plain query.
+        let option = EdnsOption {
+            code: 65001,
+            payload: vec![0u8; MAX_EDNS_OPTION_PAYLOAD_LEN],
+        };
+        let error =
+            build_query(0x1234, "example.com", 1, std::slice::from_ref(&option)).unwrap_err();
+        assert_eq!(error.code, "edns_option_dropped");
+    }
+
+    #[test]
+    fn encodes_multiple_edns0_options() {
+        let options = [
+            EdnsOption {
+                code: 3,
+                payload: b"nsid".to_vec(),
+            },
+            EdnsOption {
+                code: 8,
+                payload: b"ecs".to_vec(),
+            },
+        ];
+        let packet = build_query(0x1234, "example.com", 1, &options).unwrap();
+        assert!(
+            packet.windows(2).any(|w| w == 3_u16.to_be_bytes()),
+            "first option code must appear"
+        );
+        assert!(
+            packet.windows(2).any(|w| w == 8_u16.to_be_bytes()),
+            "second option code must appear"
+        );
     }
 
     #[test]

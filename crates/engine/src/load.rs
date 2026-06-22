@@ -39,10 +39,6 @@ impl Default for WorkerSlot {
     }
 }
 
-/// EDNS0 option code carrying the Global Resolver auth token on Do53/DoT
-/// (0xFEA0); on DoH the token rides in the URL query instead.
-pub const TOKEN_EDNS_CODE: u16 = 65184;
-
 /// Upper bound on how long a cancelled actor waits for in-flight queries to
 /// finish before dropping them, so a signal interrupts promptly instead of
 /// blocking up to the full per-request timeout on stalled queries.
@@ -54,14 +50,6 @@ pub enum LoadProto {
     Do53Tcp,
     Dot,
     Doh,
-}
-
-impl LoadProto {
-    /// DoH carries the auth token in the URL query, not in an EDNS option, so
-    /// the work source must not append the token OPT for this protocol.
-    fn token_rides_in_edns(self) -> bool {
-        !matches!(self, LoadProto::Doh)
-    }
 }
 
 #[derive(Clone)]
@@ -78,7 +66,8 @@ pub struct LoadConfig {
     pub count: Option<u64>,
     pub randomize: bool,
     pub seed: u64,
-    pub token: Option<String>,
+    /// EDNS0 OPT options attached to every query (all transports); empty for none.
+    pub edns_options: Vec<EdnsOption>,
 }
 
 impl LoadConfig {
@@ -370,14 +359,7 @@ pub async fn run_load_with_progress(
 ) -> Result<LoadStats> {
     config.validate()?;
 
-    let edns_option = config
-        .token
-        .as_ref()
-        .filter(|_| config.proto.token_rides_in_edns())
-        .map(|token| EdnsOption {
-            code: TOKEN_EDNS_CODE,
-            payload: token.as_bytes().to_vec(),
-        });
+    let edns_options = config.edns_options.as_slice();
 
     // Encode every corpus row's wire message once, before the run clock starts,
     // so the hot path only clones a prebuilt buffer and a large corpus cannot
@@ -387,8 +369,7 @@ pub async fn run_load_with_progress(
         .corpus
         .iter_rows()
         .map(|name| {
-            wiresurge_dns::build_query(0, name, config.qtype, edns_option.as_ref())
-                .map(Arc::<[u8]>::from)
+            wiresurge_dns::build_query(0, name, config.qtype, edns_options).map(Arc::<[u8]>::from)
         })
         .collect::<Result<Vec<_>>>()?;
 

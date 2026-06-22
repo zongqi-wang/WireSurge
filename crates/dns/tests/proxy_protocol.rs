@@ -71,7 +71,7 @@ async fn spawn_proxy_checked_echo(report: tokio::sync::oneshot::Sender<Vec<u8>>)
 
 fn request() -> DnsRequest {
     DnsRequest {
-        wire: build_query(0, "example.com", 1, None).unwrap().into(),
+        wire: build_query(0, "example.com", 1, &[]).unwrap().into(),
     }
 }
 

@@ -11,15 +11,14 @@ use comfy_table::{Cell, ContentArrangement, Table, presets::UTF8_FULL};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use url::{Position, Url};
+use wiresurge_core::scenario::RunSpec;
 use wiresurge_core::{RequestSpec, Result, WireSurgeError, schema_for, serialize_json};
 use wiresurge_corpus::Corpus;
-use wiresurge_dns::parse_qtype;
+use wiresurge_dns::{EdnsOption, parse_qtype};
 use wiresurge_engine::load::{
     LoadConfig, LoadProto, LoadStats, ProgressConfig, run_load, run_load_with_progress,
 };
-use wiresurge_engine::{
-    RunOptions, run_request_with_cancellation, run_stored_request_with_cancellation,
-};
+use wiresurge_engine::{RunOptions, run_run_spec_with_cancellation};
 use wiresurge_metrics::RunSnapshot;
 use wiresurge_plugins::PluginManifestDraft;
 use wiresurge_storage::WorkspaceStore;
@@ -120,9 +119,13 @@ struct LoadArgs {
     randomize: bool,
     #[arg(long, default_value_t = 0)]
     seed: u64,
-    /// Auth token: EDNS 65184 on DoT, `?token=` URL query on DoH.
-    #[arg(long)]
-    token: Option<String>,
+    /// EDNS0 OPT option attached to every query, as CODE:VALUE (decimal code,
+    /// UTF-8 value), e.g. 65001:hello; repeatable.
+    #[arg(long = "edns-option", value_name = "CODE:VALUE")]
+    edns_options: Vec<String>,
+    /// Extra DoH URL query parameter as KEY=VALUE; repeatable. DoH only.
+    #[arg(long = "http-param", value_name = "KEY=VALUE")]
+    http_params: Vec<String>,
     /// PROXY protocol v2 source (mocked customer) as IP:PORT, e.g.
     /// 192.0.2.10:50000. Requires --proxy-dst. Stream transports send a
     /// connection preamble; UDP prefixes every datagram.
@@ -170,6 +173,14 @@ struct RunArgs {
     verbose: bool,
     #[arg(long)]
     report: Option<PathBuf>,
+    /// Template variable as NAME=VALUE (repeatable); overrides a file `vars`
+    /// entry of the same name. Available to request fields as `{{vars.NAME}}`.
+    #[arg(long = "var", value_name = "NAME=VALUE")]
+    vars: Vec<String>,
+    /// Secret as NAME=VALUE (repeatable); available as `{{secrets.NAME}}` and
+    /// redacted in all output. Never store secret values in the request file.
+    #[arg(long = "secret", value_name = "NAME=VALUE")]
+    secrets: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -351,23 +362,14 @@ fn build_load_config(args: &LoadArgs) -> Result<LoadConfig> {
         )
         .at("duration-s"));
     }
-    if args.token.is_some() && !is_tls {
+    if !args.http_params.is_empty() && !is_doh {
         return Err(WireSurgeError::new(
-            "token_requires_encrypted_transport",
-            "--token is a credential and is only sent over the encrypted dot or doh transports; plain udp/tcp would expose it in cleartext",
+            "http_param_requires_doh",
+            "--http-param is only used by --protocol doh",
         )
-        .at("token"));
+        .at("http-param"));
     }
-    if args.token.is_some() && args.insecure {
-        // --insecure installs a no-op certificate verifier, so the peer identity
-        // is unauthenticated; sending the credential then exposes it to any MITM
-        // that can terminate the TLS handshake. Refuse the combination.
-        return Err(WireSurgeError::new(
-            "token_requires_verified_peer",
-            "--token must not be combined with --insecure: an unverified peer could capture the credential; drop --insecure or omit the token",
-        )
-        .at("token"));
-    }
+    let edns_options = parse_edns_options(&args.edns_options)?;
     let proxy = build_proxy_header(args)?;
     let mut target = if is_dot {
         let config = build_client_config(&TlsParams {
@@ -405,16 +407,43 @@ fn build_load_config(args: &LoadArgs) -> Result<LoadConfig> {
         count: args.count,
         randomize: args.randomize,
         seed: args.seed,
-        token: args.token.clone(),
+        edns_options,
     };
     config.validate()?;
     Ok(config)
 }
 
-/// Build a DoH connect target from the load args. The socket opens to `addr`
-/// (the pod), while the `--url` host supplies the TLS SNI and the HTTP
-/// `:authority`; the auth token is folded into the request query so it rides
-/// the URL rather than an EDNS option.
+/// Parse each `--edns-option CODE:VALUE` into an `EdnsOption` (decimal code,
+/// UTF-8 value bytes).
+fn parse_edns_options(specs: &[String]) -> Result<Vec<EdnsOption>> {
+    specs
+        .iter()
+        .map(|spec| {
+            let (code, value) = spec.split_once(':').ok_or_else(|| {
+                WireSurgeError::new(
+                    "invalid_edns_option",
+                    format!("--edns-option must be CODE:VALUE, got {spec}"),
+                )
+                .at("edns-option")
+            })?;
+            let code = code.parse::<u16>().map_err(|_| {
+                WireSurgeError::new(
+                    "invalid_edns_option",
+                    format!("--edns-option code must be 0-65535, got {code}"),
+                )
+                .at("edns-option")
+            })?;
+            Ok(EdnsOption {
+                code,
+                payload: value.as_bytes().to_vec(),
+            })
+        })
+        .collect()
+}
+
+/// Build a DoH connect target from the load args. The socket opens to `addr`,
+/// while the `--url` host supplies the TLS SNI and the HTTP `:authority`; any
+/// `--http-param` pairs are folded into the request query.
 fn build_doh_target(args: &LoadArgs, addr: SocketAddr) -> Result<ConnectTarget> {
     let raw = args.url.as_deref().ok_or_else(|| {
         WireSurgeError::new(
@@ -431,10 +460,10 @@ fn build_doh_target(args: &LoadArgs, addr: SocketAddr) -> Result<ConnectTarget> 
     if !url.username().is_empty() || url.password().is_some() {
         // Userinfo would ride into the HTTP/2 :authority pseudo-header, which
         // RFC 9113 §8.3.1 forbids; a conformant peer rejects the request and the
-        // embedded credential leaks. Reject up front rather than fail every query.
+        // embedded value leaks. Reject up front rather than fail every query.
         return Err(WireSurgeError::new(
             "invalid_url",
-            "DoH URL must not embed userinfo (user:pass@); pass credentials via --token",
+            "DoH URL must not embed userinfo (user:pass@); pass query params via --http-param",
         )
         .at("url"));
     }
@@ -466,14 +495,28 @@ fn build_doh_target(args: &LoadArgs, addr: SocketAddr) -> Result<ConnectTarget> 
         }
     };
 
-    // Scheme + authority + path, no query/fragment: the per-query suffix
-    // (?dns=, ?token=) is appended by the adapter from `query` below.
+    // Scheme + authority + path, no query/fragment: the per-query suffix (?dns=)
+    // is appended by the adapter from `query` below.
     let base_uri = url[..Position::AfterPath].to_string();
-    // Preserve any query already on the URL, then fold the token in with proper
-    // percent-encoding via the url crate rather than hand-splicing.
+    // Preserve any query already on the URL, then fold in --http-param pairs with
+    // proper percent-encoding via the url crate rather than hand-splicing.
     let mut query_url = url.clone();
-    if let Some(token) = &args.token {
-        query_url.query_pairs_mut().append_pair("token", token);
+    for pair in &args.http_params {
+        let (key, value) = pair.split_once('=').ok_or_else(|| {
+            WireSurgeError::new(
+                "invalid_http_param",
+                format!("--http-param must be KEY=VALUE, got {pair}"),
+            )
+            .at("http-param")
+        })?;
+        if key.is_empty() {
+            return Err(WireSurgeError::new(
+                "invalid_http_param",
+                "--http-param key must not be empty",
+            )
+            .at("http-param"));
+        }
+        query_url.query_pairs_mut().append_pair(key, value);
     }
     let query = query_url.query().unwrap_or("").to_string();
 
@@ -622,19 +665,7 @@ fn format_load_banner(args: &LoadArgs, config: &LoadConfig) -> String {
             "Using {} connections (-c), each keeping {} queries in flight (-q) = {} concurrent queries total ({rate}).",
             config.concurrency, config.in_flight, total_in_flight,
         ),
-        format!(
-            "Running {stop}. PROXY header: {}. Auth token: {}.",
-            if config.target.proxy.is_some() {
-                "on"
-            } else {
-                "off"
-            },
-            if config.token.is_some() {
-                "set"
-            } else {
-                "none"
-            },
-        ),
+        format!("Running {stop}."),
     ];
     lines.push(String::new());
     lines.push(
@@ -961,29 +992,45 @@ async fn run_command(
         dry_run: args.dry_run,
         verbose: args.verbose,
         report_dir: args.report,
+        secret_values: Vec::new(),
     };
+    // --var/--secret are CLI-supplied template inputs, parsed before any I/O so
+    // a malformed pair fails fast with a structured error.
+    let cli_vars = parse_kv_pairs(&args.vars, "var")?;
+    let cli_secrets = parse_kv_pairs(&args.secrets, "secret")?;
+
     let cancellation = CancellationToken::new();
     let execution_cancellation = cancellation.clone();
     let execution = async {
-        if PathBuf::from(&args.target).exists() {
+        // A file target may carry `vars`/`expect` (a RunSpec); a stored request
+        // is lifted into a RunSpec with neither, so both paths share templating.
+        let spec = if PathBuf::from(&args.target).exists() {
             let input = fs::read_to_string(&args.target)?;
-            let request = RequestSpec::from_yaml(&input)?;
-            run_request_with_cancellation(store, request, options, execution_cancellation).await
+            RunSpec::from_yaml(&input)?
         } else {
-            run_stored_request_with_cancellation(
-                store,
-                &args.target,
-                options,
-                execution_cancellation,
-            )
-            .await
-        }
+            run_spec_from_request(store.load_request(&args.target)?)
+        };
+        run_run_spec_with_cancellation(
+            store,
+            spec,
+            cli_vars,
+            cli_secrets,
+            options,
+            execution_cancellation,
+        )
+        .await
     };
     tokio::pin!(execution);
     let signal = shutdown_signal();
     tokio::pin!(signal);
     tokio::select! {
-        result = &mut execution => Ok((result?.to_json()?, 0)),
+        result = &mut execution => {
+            let result = result?;
+            // A failed `expect:` assertion exits 1 — the request succeeded but the
+            // contract did not hold — distinct from a transport error or a signal.
+            let code = if result.assertion_failed() { 1 } else { 0 };
+            Ok((result.to_json()?, code))
+        }
         signal_code = &mut signal => {
             let signal_code = signal_code?;
             cancellation.cancel();
@@ -998,6 +1045,49 @@ async fn run_command(
             };
             Ok((output, signal_code))
         }
+    }
+}
+
+/// Parse repeated `NAME=VALUE` CLI pairs into a map, rejecting a missing `=` or
+/// empty name with a structured error keyed on the flag.
+fn parse_kv_pairs(
+    pairs: &[String],
+    flag: &str,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut map = std::collections::BTreeMap::new();
+    for pair in pairs {
+        let (name, value) = pair.split_once('=').ok_or_else(|| {
+            WireSurgeError::new(
+                format!("invalid_{flag}"),
+                format!("--{flag} must be NAME=VALUE, got {pair}"),
+            )
+            .at(flag.to_string())
+        })?;
+        if name.is_empty() {
+            return Err(WireSurgeError::new(
+                format!("invalid_{flag}"),
+                format!("--{flag} name must not be empty"),
+            )
+            .at(flag.to_string()));
+        }
+        map.insert(name.to_string(), value.to_string());
+    }
+    Ok(map)
+}
+
+/// Lift a stored [`RequestSpec`] into a [`RunSpec`] with no `vars`/`expect`, so a
+/// stored request runs through the same templating path as a file (and can still
+/// reference `{{vars.*}}`/`{{secrets.*}}` supplied on the command line).
+fn run_spec_from_request(request: RequestSpec) -> RunSpec {
+    RunSpec {
+        id: request.id,
+        name: request.name,
+        method: request.method,
+        url: request.url,
+        headers: request.headers,
+        body: request.body,
+        vars: std::collections::BTreeMap::new(),
+        expect: None,
     }
 }
 
@@ -1176,7 +1266,7 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_token_on_cleartext_transport() {
+    fn load_rejects_http_param_on_non_doh() {
         let outcome = dispatch(
             &[
                 "load".into(),
@@ -1185,19 +1275,15 @@ mod tests {
                 "udp".into(),
                 "--count".into(),
                 "1".into(),
-                "--token".into(),
-                "secret".into(),
+                "--http-param".into(),
+                "key=value".into(),
                 "--output".into(),
                 "json".into(),
             ],
             temp_dir(),
         );
         assert_eq!(outcome.code, 1);
-        assert!(
-            outcome
-                .stdout
-                .contains("token_requires_encrypted_transport")
-        );
+        assert!(outcome.stdout.contains("http_param_requires_doh"));
     }
 
     #[test]
@@ -1221,27 +1307,24 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_token_with_insecure() {
+    fn load_rejects_malformed_edns_option() {
         let outcome = dispatch(
             &[
                 "load".into(),
                 "127.0.0.1".into(),
                 "--protocol".into(),
-                "doh".into(),
-                "--url".into(),
-                "https://r.example/dns-query".into(),
-                "--token".into(),
-                "secret".into(),
-                "--insecure".into(),
+                "udp".into(),
                 "--count".into(),
                 "1".into(),
+                "--edns-option".into(),
+                "not-a-pair".into(),
                 "--output".into(),
                 "json".into(),
             ],
             temp_dir(),
         );
         assert_eq!(outcome.code, 1);
-        assert!(outcome.stdout.contains("token_requires_verified_peer"));
+        assert!(outcome.stdout.contains("invalid_edns_option"));
     }
 
     #[test]
@@ -1497,5 +1580,130 @@ mod tests {
         );
         assert_eq!(outcome.code, 1);
         assert!(outcome.stdout.contains("\"code\":\"workspace_not_found\""));
+    }
+
+    /// Write a request/scenario YAML file under a fresh, initialized workspace
+    /// and return both the workspace root and the file path. The run path writes
+    /// a runner snapshot, so the workspace must exist first.
+    fn write_run_file(contents: &str) -> (PathBuf, PathBuf) {
+        let root = temp_dir();
+        std::fs::create_dir_all(&root).unwrap();
+        let init = dispatch(&["workspace".into(), "init".into()], root.clone());
+        assert_eq!(init.code, 0, "{}", init.stderr);
+        let file = root.join("req.yaml");
+        std::fs::write(&file, contents).unwrap();
+        (root, file)
+    }
+
+    #[test]
+    fn run_rejects_malformed_var() {
+        let (root, file) = write_run_file("id: r\nname: r\nurl: http://127.0.0.1:1/x\n");
+        let outcome = dispatch(
+            &[
+                "run".into(),
+                file.to_string_lossy().into_owned(),
+                "--var".into(),
+                "noequals".into(),
+                "--output".into(),
+                "json".into(),
+            ],
+            root.clone(),
+        );
+        assert_eq!(outcome.code, 1);
+        assert!(outcome.stdout.contains("invalid_var"), "{}", outcome.stdout);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_rejects_unknown_var_in_template() {
+        // --dry-run still expands templates, so an undefined var fails fast
+        // without sending traffic.
+        let (root, file) = write_run_file("id: r\nname: r\nurl: \"{{vars.missing}}/x\"\n");
+        let outcome = dispatch(
+            &[
+                "run".into(),
+                file.to_string_lossy().into_owned(),
+                "--dry-run".into(),
+                "--output".into(),
+                "json".into(),
+            ],
+            root.clone(),
+        );
+        assert_eq!(outcome.code, 1);
+        assert!(outcome.stdout.contains("unknown_var"), "{}", outcome.stdout);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_expands_cli_var_on_dry_run() {
+        // A CLI --var feeds the template; --dry-run reports the expanded request
+        // without sending, and exits 0 (no assertion to fail).
+        let (root, file) = write_run_file("id: r\nname: r\nurl: \"{{vars.base}}/health\"\n");
+        let outcome = dispatch(
+            &[
+                "run".into(),
+                file.to_string_lossy().into_owned(),
+                "--var".into(),
+                "base=http://127.0.0.1:9".into(),
+                "--dry-run".into(),
+                "--output".into(),
+                "json".into(),
+            ],
+            root.clone(),
+        );
+        assert_eq!(outcome.code, 0, "{}", outcome.stdout);
+        assert!(
+            outcome.stdout.contains("http://127.0.0.1:9/health"),
+            "{}",
+            outcome.stdout
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_accepts_flat_request_file_unchanged() {
+        // A plain request file (no vars/expect) still runs as before.
+        let (root, file) = write_run_file("id: r\nname: r\nurl: http://127.0.0.1:9/x\n");
+        let outcome = dispatch(
+            &[
+                "run".into(),
+                file.to_string_lossy().into_owned(),
+                "--dry-run".into(),
+                "--output".into(),
+                "json".into(),
+            ],
+            root.clone(),
+        );
+        assert_eq!(outcome.code, 0, "{}", outcome.stdout);
+        assert!(outcome.stdout.contains("\"dry_run\":true"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_redacts_secret_value_in_output() {
+        // A secret value carries no redaction marker, so it must be masked by
+        // value: it must never appear verbatim in the emitted request.
+        let (root, file) =
+            write_run_file("id: r\nname: r\nurl: \"http://127.0.0.1:9/x?k={{secrets.k}}\"\n");
+        let outcome = dispatch(
+            &[
+                "run".into(),
+                file.to_string_lossy().into_owned(),
+                "--secret".into(),
+                "k=aGVsbG8xMjM0NQ".into(),
+                "--dry-run".into(),
+                "--output".into(),
+                "json".into(),
+            ],
+            root.clone(),
+        );
+        assert_eq!(outcome.code, 0, "{}", outcome.stdout);
+        assert!(
+            !outcome.stdout.contains("aGVsbG8xMjM0NQ"),
+            "secret value leaked into output: {}",
+            outcome.stdout
+        );
+        assert!(outcome.stdout.contains("[redacted]"), "{}", outcome.stdout);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

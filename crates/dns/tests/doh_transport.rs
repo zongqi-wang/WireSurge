@@ -28,7 +28,7 @@ use wiresurge_transport::{
 const CERT_DER: &[u8] = include_bytes!("fixtures/cert.der");
 const KEY_DER: &[u8] = include_bytes!("fixtures/key.der");
 const DNS_MESSAGE: &str = "application/dns-message";
-const TOKEN: &str = "at-test-secret";
+const QUERY_PARAM: &str = "key=test-value";
 
 #[derive(Clone, Copy)]
 enum ServerMode {
@@ -37,8 +37,8 @@ enum ServerMode {
     /// Echo, but stall one in every two queries past the client timeout so the
     /// client must reap the slot.
     StallEveryOther,
-    /// Echo only when the request query carries `token=<TOKEN>`; otherwise 403.
-    RequireToken,
+    /// Echo only when the request query carries `QUERY_PARAM`; otherwise 403.
+    RequireQueryParam,
     /// Model a spec-compliant resolver that returns DNS id 0 (RFC 8484 §4.1)
     /// regardless of the request id, plus a 2xx-but-not-200 status. Exercises
     /// the client paths that must NOT reject on id-mismatch or non-200 2xx.
@@ -123,11 +123,8 @@ async fn spawn_doh_echo(mode: ServerMode) -> SocketAddr {
                                 }
                                 Ok(dns_response(wire))
                             }
-                            ServerMode::RequireToken => {
-                                if query
-                                    .split('&')
-                                    .any(|pair| pair == format!("token={TOKEN}"))
-                                {
+                            ServerMode::RequireQueryParam => {
+                                if query.split('&').any(|pair| pair == QUERY_PARAM) {
                                     Ok(dns_response(wire))
                                 } else {
                                     Ok(Response::builder()
@@ -176,7 +173,7 @@ fn doh_target(addr: SocketAddr, method: HttpMethod, query: &str) -> ConnectTarge
 
 fn request_with_id(id: u16) -> DnsRequest {
     DnsRequest {
-        wire: build_query(id, "example.com", 1, None).unwrap().into(),
+        wire: build_query(id, "example.com", 1, &[]).unwrap().into(),
     }
 }
 
@@ -256,33 +253,29 @@ async fn doh_timeout_frees_the_slot() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn doh_token_rides_in_url_query() {
-    let addr = spawn_doh_echo(ServerMode::RequireToken).await;
+async fn doh_query_param_rides_in_url_query() {
+    let addr = spawn_doh_echo(ServerMode::RequireQueryParam).await;
 
-    // With the token in the query the responder echoes a DNS answer.
-    let with_token = DohTransport::connect(doh_target(
-        addr,
-        HttpMethod::Post,
-        &format!("token={TOKEN}"),
-    ))
-    .await
-    .unwrap();
-    let response = with_token
+    // With the query param present the responder echoes a DNS answer.
+    let with_param = DohTransport::connect(doh_target(addr, HttpMethod::Post, QUERY_PARAM))
+        .await
+        .unwrap();
+    let response = with_param
         .exchange(request_with_id(1), Duration::from_secs(5))
         .await
         .unwrap();
     assert_eq!(response.rcode, 0);
 
     // Without it the responder returns 403, surfaced as a protocol error.
-    let without_token = DohTransport::connect(doh_target(addr, HttpMethod::Post, ""))
+    let without_param = DohTransport::connect(doh_target(addr, HttpMethod::Post, ""))
         .await
         .unwrap();
-    let result = without_token
+    let result = without_param
         .exchange(request_with_id(2), Duration::from_secs(5))
         .await;
     assert!(
         matches!(result, Err(TransportError::Protocol(_))),
-        "missing token must be rejected, got {result:?}"
+        "missing query param must be rejected, got {result:?}"
     );
 }
 

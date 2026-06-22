@@ -49,7 +49,7 @@ fn config(
         count,
         randomize: false,
         seed: 0,
-        token: None,
+        edns_options: Vec::new(),
     }
 }
 

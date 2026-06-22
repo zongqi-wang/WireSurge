@@ -14,7 +14,8 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use serde::Serialize;
 use url::Url;
-use wiresurge_core::{RequestSpec, Result, WireSurgeError, redact_sensitive, serialize_json};
+use wiresurge_core::scenario::CallResponse;
+use wiresurge_core::{RequestSpec, Result, WireSurgeError, redact_value, serialize_json};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
@@ -168,15 +169,35 @@ pub struct HttpResponse {
 
 impl HttpResponse {
     pub fn to_json(&self) -> Result<String> {
-        serialize_json(&self.redacted_output())
+        serialize_json(&self.redacted_output(&[]))
+    }
+
+    /// Normalize into the protocol-blind [`CallResponse`] that templating,
+    /// extraction, and assertions operate on. HTTP has a status but no separate
+    /// protocol code, so `code` is `None`.
+    pub fn to_call_response(&self) -> CallResponse {
+        CallResponse {
+            status: Some(self.status_code),
+            code: None,
+            headers: self.headers.clone(),
+            body: self.body.clone(),
+            duration_ms: self.duration_ms,
+            warnings: self.warnings.clone(),
+        }
     }
 
     pub fn to_json_value(&self) -> Result<serde_json::Value> {
-        serde_json::to_value(self.redacted_output())
+        self.to_json_value_with(&[])
+    }
+
+    /// Like [`HttpResponse::to_json_value`], but also masks the given secret
+    /// values — e.g. a `--secret` the target echoes back in its body or a header.
+    pub fn to_json_value_with(&self, secret_values: &[String]) -> Result<serde_json::Value> {
+        serde_json::to_value(self.redacted_output(secret_values))
             .map_err(|error| WireSurgeError::new("json_encode_failed", error.to_string()))
     }
 
-    fn redacted_output(&self) -> RedactedHttpResponse<'_> {
+    fn redacted_output(&self, secret_values: &[String]) -> RedactedHttpResponse<'_> {
         let headers = self
             .headers
             .iter()
@@ -184,7 +205,7 @@ impl HttpResponse {
                 let value = if is_sensitive_header(key) {
                     "[redacted]".to_string()
                 } else {
-                    redact_sensitive(value)
+                    redact_value(value, secret_values)
                 };
                 (key.clone(), value)
             })
@@ -193,7 +214,7 @@ impl HttpResponse {
             status_code: self.status_code,
             reason: &self.reason,
             headers,
-            body: redact_sensitive(&self.body),
+            body: redact_value(&self.body, secret_values),
             duration_ms: self.duration_ms,
             warnings: &self.warnings,
         }
@@ -253,6 +274,26 @@ mod tests {
     fn rejects_url_credentials() {
         let error = parse_url("https://user:pass@example.com/").unwrap_err();
         assert_eq!(error.code, "invalid_url");
+    }
+
+    #[test]
+    fn masks_echoed_secret_value_in_response() {
+        // A secret value the target echoes back (no redaction marker) must be
+        // masked when the response is serialized.
+        let response = HttpResponse {
+            status_code: 200,
+            reason: "OK".to_string(),
+            headers: BTreeMap::new(),
+            body: r#"{"echo":"aGVsbG8xMjM0NQ"}"#.to_string(),
+            duration_ms: 0.0,
+            warnings: Vec::new(),
+        };
+        let value = response
+            .to_json_value_with(&["aGVsbG8xMjM0NQ".to_string()])
+            .unwrap();
+        let body = value.get("body").and_then(|b| b.as_str()).unwrap();
+        assert!(!body.contains("aGVsbG8xMjM0NQ"), "{body}");
+        assert!(body.contains("[redacted]"), "{body}");
     }
 
     #[tokio::test]

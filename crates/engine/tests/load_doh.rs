@@ -150,7 +150,7 @@ fn doh_config(addr: SocketAddr, count: u64) -> LoadConfig {
         count: Some(count),
         randomize: false,
         seed: 0,
-        token: None,
+        edns_options: Vec::new(),
     }
 }
 
