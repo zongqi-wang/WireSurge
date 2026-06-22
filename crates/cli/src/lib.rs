@@ -124,7 +124,8 @@ struct LoadArgs {
     #[arg(long)]
     token: Option<String>,
     /// PROXY protocol v2 source (mocked customer) as IP:PORT, e.g.
-    /// 192.0.2.10:50000. Requires --proxy-dst; TCP-based transports only.
+    /// 192.0.2.10:50000. Requires --proxy-dst. Stream transports send a
+    /// connection preamble; UDP prefixes every datagram.
     #[arg(long = "proxy-src", value_name = "IP:PORT")]
     proxy_src: Option<String>,
     /// PROXY protocol v2 destination (NLB VIP) as IP:PORT. Requires --proxy-src.
@@ -139,11 +140,11 @@ struct LoadArgs {
     /// Skip TLS certificate verification (self-signed test targets only).
     #[arg(long)]
     insecure: bool,
-    /// Suppress the live progress line even on a TTY (banner and final summary
+    /// Suppress live progress samples even on a TTY (banner and final summary
     /// still print). Progress is always off under --output json or non-TTY.
     #[arg(long = "no-progress")]
     no_progress: bool,
-    /// Live progress refresh interval in milliseconds.
+    /// Live progress sample interval in milliseconds.
     #[arg(long = "progress-interval", value_name = "MS", default_value_t = 1000)]
     progress_interval_ms: u64,
 }

@@ -1,6 +1,6 @@
 # System Design
 
-> **Target architecture.** The current engine is an async single-request orchestrator with Tokio cancellation. This chapter defines the supervised runtime it should evolve toward.
+> **Target architecture.** The current engine combines an async single-request HTTP orchestrator with a many-in-flight DNS load engine and optional process-local progress snapshots. This chapter defines the supervised runtime they should evolve toward.
 
 ## Process Model
 
