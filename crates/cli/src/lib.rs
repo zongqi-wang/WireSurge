@@ -597,38 +597,115 @@ where
 
 fn format_load_banner(args: &LoadArgs, config: &LoadConfig) -> String {
     let query = match &args.corpus {
-        Some(path) => format!("corpus {}", path.display()),
-        None => format!("{} {}", args.name, args.qtype),
+        Some(path) => format!("names from corpus {}", path.display()),
+        None => format!("{} {} queries", args.name, args.qtype.to_uppercase()),
     };
     let stop = match (args.duration_s, args.count) {
-        (Some(secs), _) => format!("{secs}s"),
-        (_, Some(count)) => format!("{count} queries"),
-        _ => "until stopped".to_string(),
+        (Some(secs), _) => format!("for {secs} seconds"),
+        (_, Some(count)) => format!("until {} queries are sent", group_u64(count)),
+        _ => "until interrupted".to_string(),
     };
-    let proxy = match config.target.proxy.is_some() {
-        true => "on",
-        false => "off",
+    let total_in_flight = config.concurrency * config.in_flight;
+    let rate = match args.qps {
+        Some(qps) => format!("capped at {} queries/sec", group_u64(qps as u64)),
+        None => "as fast as the target allows".to_string(),
     };
-    let token = match config.token.is_some() {
-        true => "set",
-        false => "none",
-    };
-    let mut line = format!(
-        "wiresurge load -> {} | {} | -c {} -q {} (in-flight {}) | query {} | stop {} | proxy {} | token {}",
-        config.target.tcp_addr,
-        args.protocol,
-        config.concurrency,
-        config.in_flight,
-        config.concurrency * config.in_flight,
-        query,
-        stop,
-        proxy,
-        token,
+
+    let mut lines = vec![
+        format!(
+            "Load test: sending {query} to {} over {}.",
+            config.target.tcp_addr,
+            args.protocol.to_uppercase(),
+        ),
+        format!(
+            "Using {} connections (-c), each keeping {} queries in flight (-q) = {} concurrent queries total ({rate}).",
+            config.concurrency, config.in_flight, total_in_flight,
+        ),
+        format!(
+            "Running {stop}. PROXY header: {}. Auth token: {}.",
+            if config.target.proxy.is_some() {
+                "on"
+            } else {
+                "off"
+            },
+            if config.token.is_some() {
+                "set"
+            } else {
+                "none"
+            },
+        ),
+    ];
+    lines.push(String::new());
+    lines.push(
+        "── Live progress ─────────────────────────────────────────────────────────────"
+            .to_string(),
     );
-    if let Some(qps) = args.qps {
-        line.push_str(&format!(" | qps-cap {qps:.0}"));
+    lines.push(
+        "Each line is one sample. Counts are cumulative; rates are instantaneous.".to_string(),
+    );
+    lines.push(progress_header());
+    lines.join("\n")
+}
+
+/// Column titles for the live progress rows, aligned to `format_progress_row`.
+fn progress_header() -> String {
+    format!(
+        "{:>6}  {:>11}  {:>11}  {:>9}  {:>9}  {:>6}  {:>7}  {:>7}  {:>6}  {:>6}   {}",
+        "time",
+        "sent",
+        "received",
+        "recv/s",
+        "noerror/s",
+        "infl",
+        "p50 ms",
+        "p99 ms",
+        "tmout",
+        "error",
+        "rcodes",
+    )
+}
+
+fn format_progress_row(snap: &RunSnapshot, recv_qps: f64, noerror_qps: f64) -> String {
+    format!(
+        "{:>5.1}s  {:>11}  {:>11}  {:>9.0}  {:>9.0}  {:>6}  {:>7.1}  {:>7.1}  {:>6}  {:>6}   {}",
+        snap.elapsed_s,
+        group_u64(snap.aggregate.sent),
+        group_u64(snap.aggregate.received),
+        recv_qps,
+        noerror_qps,
+        snap.aggregate.in_flight,
+        snap.aggregate.p50_ms,
+        snap.aggregate.p99_ms,
+        snap.aggregate.timeouts,
+        snap.aggregate.errors + snap.aggregate.conn_errors,
+        format_rcodes_inline(&snap.aggregate.rcodes),
+    )
+}
+
+/// Compact `NAME=count` rcode list for one progress line (`-` when empty).
+fn format_rcodes_inline(rcodes: &std::collections::BTreeMap<String, u64>) -> String {
+    if rcodes.is_empty() {
+        return "-".to_string();
     }
-    line
+    rcodes
+        .iter()
+        .map(|(name, count)| format!("{name}={count}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Thousands-grouped decimal (e.g. 1234567 -> "1,234,567").
+fn group_u64(value: u64) -> String {
+    let digits = value.to_string();
+    let bytes = digits.as_bytes();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, &b) in bytes.iter().enumerate() {
+        if i != 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(b as char);
+    }
+    out
 }
 
 async fn render_progress(mut rx: watch::Receiver<RunSnapshot>) {
@@ -652,58 +729,83 @@ async fn render_progress(mut rx: watch::Receiver<RunSnapshot>) {
             _ => (snap.aggregate.recv_qps, snap.aggregate.noerror_qps),
         };
         // One persistent line per tick: a scrolling log, not an in-place redraw.
-        eprintln!(
-            "{:>5.1}s | recv {:>7.0}/s noerr {:>7.0}/s (inst) | infl {:>5} | p50 {:>5.1} p99 {:>5.1} | to {} err {}",
-            snap.elapsed_s,
-            recv_qps,
-            noerror_qps,
-            snap.aggregate.in_flight,
-            snap.aggregate.p50_ms,
-            snap.aggregate.p99_ms,
-            snap.aggregate.timeouts,
-            snap.aggregate.errors + snap.aggregate.conn_errors,
-        );
+        eprintln!("{}", format_progress_row(&snap, recv_qps, noerror_qps));
         prev = Some(snap);
     }
 }
 
 fn format_load_text(stats: &LoadStats) -> String {
     let recorder = &stats.recorder;
-    let rcodes = recorder
-        .rcode_breakdown()
-        .into_iter()
-        .map(|(name, count)| format!("{name} {count}"))
-        .collect::<Vec<_>>()
-        .join("  ");
-    let summary = format!(
-        "duration {:.2}s  sent {}  received {}  recv_qps {:.0}  noerror_qps {:.0}\n\
-         timeouts {}  errors {}  conn_errors {}  truncated {}\n\
-         rcodes  {}\n\
-         latency_ms  p50 {:.2}  p95 {:.2}  p99 {:.2}  max {:.2}{}",
+    let sent = recorder.sent;
+    let received = recorder.received;
+    let noerror = recorder.noerror();
+    let response_pct = |count: u64| {
+        if sent > 0 {
+            100.0 * count as f64 / sent as f64
+        } else {
+            0.0
+        }
+    };
+
+    let rcodes = recorder.rcode_breakdown();
+    let rcode_lines = if rcodes.is_empty() {
+        "    (no responses)".to_string()
+    } else {
+        rcodes
+            .iter()
+            .map(|(name, count)| {
+                format!(
+                    "    {name:<10} {:>13}  ({:.1}% of sent)",
+                    group_u64(*count),
+                    response_pct(*count)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let mut summary = format!(
+        "── Summary (totals over the whole run) ───────────────────────────────────────\n\
+         duration         {:>10.2}  seconds\n\
+         sent             {:>10}  queries\n\
+         received         {:>10}  responses  ({:.1}% of sent)\n\
+         noerror          {:>10}  responses  ({:.1}% of sent)\n\
+         throughput       {:>10}  responses/sec (received)\n\
+         goodput          {:>10}  responses/sec (noerror)\n\
+         timeouts         {:>10}  queries\n\
+         transport errors {:>10}  queries\n\
+         conn errors      {:>10}  connections\n\
+         truncated        {:>10}  responses\n\
+         latency          p50 {:.2} ms   p95 {:.2} ms   p99 {:.2} ms   max {:.2} ms\n\
+         rcodes:\n{}",
         stats.duration_s,
-        recorder.sent,
-        recorder.received,
-        stats.recv_qps(),
-        stats.noerror_qps(),
-        recorder.timeouts,
-        recorder.errors,
-        recorder.conn_errors,
-        recorder.truncated,
-        if rcodes.is_empty() { "none" } else { &rcodes },
+        group_u64(sent),
+        group_u64(received),
+        response_pct(received),
+        group_u64(noerror),
+        response_pct(noerror),
+        group_u64(stats.recv_qps() as u64),
+        group_u64(stats.noerror_qps() as u64),
+        group_u64(recorder.timeouts),
+        group_u64(recorder.errors),
+        group_u64(recorder.conn_errors),
+        group_u64(recorder.truncated),
         recorder.percentile_ms(0.50),
         recorder.percentile_ms(0.95),
         recorder.percentile_ms(0.99),
         recorder.max_ms(),
-        if stats.cancelled {
-            "\ncancelled by signal"
-        } else {
-            ""
-        },
+        rcode_lines,
     );
+    if stats.cancelled {
+        summary.push_str("\ncancelled by signal");
+    }
     if stats.workers.is_empty() {
         return summary;
     }
-    format!("{summary}\n{}", format_worker_table(&stats.workers))
+    format!(
+        "{summary}\n\n── Per-connection breakdown ──────────────────────────────────────────────────\n{}",
+        format_worker_table(&stats.workers)
+    )
 }
 
 fn format_worker_table(workers: &[wiresurge_metrics::WorkerStats]) -> String {
@@ -712,7 +814,14 @@ fn format_worker_table(workers: &[wiresurge_metrics::WorkerStats]) -> String {
         .load_preset(UTF8_FULL)
         .set_content_arrangement(ContentArrangement::Dynamic)
         .set_header(vec![
-            "worker", "qps", "rps", "p50 ms", "p95 ms", "p99 ms", "err/s", "to/s",
+            "connection",
+            "sent q/s",
+            "recv q/s",
+            "p50 ms",
+            "p95 ms",
+            "p99 ms",
+            "err q/s",
+            "tmout q/s",
         ]);
     for worker in workers {
         table.add_row(vec![
