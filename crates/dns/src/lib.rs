@@ -10,8 +10,7 @@ pub(crate) const MAX_DNS_MESSAGE_LEN: usize = u16::MAX as usize;
 const MAX_EDNS_OPTION_PAYLOAD_LEN: usize = u16::MAX as usize - 4;
 
 /// A single EDNS0 OPT option: a caller-supplied option code plus its raw payload
-/// bytes. The code is configurable (not hardcoded) so callers can emit real
-/// options such as the Global Resolver DoT auth token (code 65184 / 0xFEA0).
+/// bytes. The code is configurable so callers can emit any option.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EdnsOption {
     pub code: u16,
@@ -189,12 +188,11 @@ mod tests {
 
     #[test]
     fn encodes_configurable_edns0_option_code() {
-        // The Global Resolver DoT auth token rides in EDNS0 option 65184 (0xFEA0);
-        // the option code must be caller-supplied, not hardcoded to 65001.
-        let token = b"a-token-value".to_vec();
+        // The option code must be caller-supplied, not hardcoded.
+        let payload = b"option-value".to_vec();
         let option = EdnsOption {
             code: 65184,
-            payload: token.clone(),
+            payload: payload.clone(),
         };
         let packet = build_query(0x1234, "example.com", 1, Some(&option)).unwrap();
         assert!(
@@ -209,7 +207,7 @@ mod tests {
                 .any(|window| window == 65001_u16.to_be_bytes()),
             "the old hardcoded 65001 code must not leak through"
         );
-        assert!(packet.ends_with(&token));
+        assert!(packet.ends_with(&payload));
     }
 
     #[test]

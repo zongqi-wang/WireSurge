@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use url::{Position, Url};
 use wiresurge_core::{RequestSpec, Result, WireSurgeError, schema_for, serialize_json};
 use wiresurge_corpus::Corpus;
-use wiresurge_dns::parse_qtype;
+use wiresurge_dns::{EdnsOption, parse_qtype};
 use wiresurge_engine::load::{
     LoadConfig, LoadProto, LoadStats, ProgressConfig, run_load, run_load_with_progress,
 };
@@ -120,9 +120,13 @@ struct LoadArgs {
     randomize: bool,
     #[arg(long, default_value_t = 0)]
     seed: u64,
-    /// Auth token: EDNS 65184 on DoT, `?token=` URL query on DoH.
-    #[arg(long)]
-    token: Option<String>,
+    /// EDNS0 OPT option attached to every query, as CODE:VALUE (decimal code,
+    /// UTF-8 value), e.g. 65001:hello.
+    #[arg(long = "edns-option", value_name = "CODE:VALUE")]
+    edns_option: Option<String>,
+    /// Extra DoH URL query parameter as KEY=VALUE; repeatable. DoH only.
+    #[arg(long = "http-param", value_name = "KEY=VALUE")]
+    http_params: Vec<String>,
     /// PROXY protocol v2 source (mocked customer) as IP:PORT, e.g.
     /// 192.0.2.10:50000. Requires --proxy-dst. Stream transports send a
     /// connection preamble; UDP prefixes every datagram.
@@ -351,23 +355,14 @@ fn build_load_config(args: &LoadArgs) -> Result<LoadConfig> {
         )
         .at("duration-s"));
     }
-    if args.token.is_some() && !is_tls {
+    if !args.http_params.is_empty() && !is_doh {
         return Err(WireSurgeError::new(
-            "token_requires_encrypted_transport",
-            "--token is a credential and is only sent over the encrypted dot or doh transports; plain udp/tcp would expose it in cleartext",
+            "http_param_requires_doh",
+            "--http-param is only used by --protocol doh",
         )
-        .at("token"));
+        .at("http-param"));
     }
-    if args.token.is_some() && args.insecure {
-        // --insecure installs a no-op certificate verifier, so the peer identity
-        // is unauthenticated; sending the credential then exposes it to any MITM
-        // that can terminate the TLS handshake. Refuse the combination.
-        return Err(WireSurgeError::new(
-            "token_requires_verified_peer",
-            "--token must not be combined with --insecure: an unverified peer could capture the credential; drop --insecure or omit the token",
-        )
-        .at("token"));
-    }
+    let edns_option = parse_edns_option(args.edns_option.as_deref())?;
     let proxy = build_proxy_header(args)?;
     let mut target = if is_dot {
         let config = build_client_config(&TlsParams {
@@ -405,16 +400,41 @@ fn build_load_config(args: &LoadArgs) -> Result<LoadConfig> {
         count: args.count,
         randomize: args.randomize,
         seed: args.seed,
-        token: args.token.clone(),
+        edns_option,
     };
     config.validate()?;
     Ok(config)
 }
 
-/// Build a DoH connect target from the load args. The socket opens to `addr`
-/// (the pod), while the `--url` host supplies the TLS SNI and the HTTP
-/// `:authority`; the auth token is folded into the request query so it rides
-/// the URL rather than an EDNS option.
+/// Parse `--edns-option CODE:VALUE` into an `EdnsOption` (decimal code, UTF-8
+/// value bytes). `None` in, `None` out.
+fn parse_edns_option(spec: Option<&str>) -> Result<Option<EdnsOption>> {
+    let Some(spec) = spec else {
+        return Ok(None);
+    };
+    let (code, value) = spec.split_once(':').ok_or_else(|| {
+        WireSurgeError::new(
+            "invalid_edns_option",
+            format!("--edns-option must be CODE:VALUE, got {spec}"),
+        )
+        .at("edns-option")
+    })?;
+    let code = code.parse::<u16>().map_err(|_| {
+        WireSurgeError::new(
+            "invalid_edns_option",
+            format!("--edns-option code must be 0-65535, got {code}"),
+        )
+        .at("edns-option")
+    })?;
+    Ok(Some(EdnsOption {
+        code,
+        payload: value.as_bytes().to_vec(),
+    }))
+}
+
+/// Build a DoH connect target from the load args. The socket opens to `addr`,
+/// while the `--url` host supplies the TLS SNI and the HTTP `:authority`; any
+/// `--http-param` pairs are folded into the request query.
 fn build_doh_target(args: &LoadArgs, addr: SocketAddr) -> Result<ConnectTarget> {
     let raw = args.url.as_deref().ok_or_else(|| {
         WireSurgeError::new(
@@ -431,10 +451,10 @@ fn build_doh_target(args: &LoadArgs, addr: SocketAddr) -> Result<ConnectTarget> 
     if !url.username().is_empty() || url.password().is_some() {
         // Userinfo would ride into the HTTP/2 :authority pseudo-header, which
         // RFC 9113 §8.3.1 forbids; a conformant peer rejects the request and the
-        // embedded credential leaks. Reject up front rather than fail every query.
+        // embedded value leaks. Reject up front rather than fail every query.
         return Err(WireSurgeError::new(
             "invalid_url",
-            "DoH URL must not embed userinfo (user:pass@); pass credentials via --token",
+            "DoH URL must not embed userinfo (user:pass@); pass query params via --http-param",
         )
         .at("url"));
     }
@@ -466,14 +486,21 @@ fn build_doh_target(args: &LoadArgs, addr: SocketAddr) -> Result<ConnectTarget> 
         }
     };
 
-    // Scheme + authority + path, no query/fragment: the per-query suffix
-    // (?dns=, ?token=) is appended by the adapter from `query` below.
+    // Scheme + authority + path, no query/fragment: the per-query suffix (?dns=)
+    // is appended by the adapter from `query` below.
     let base_uri = url[..Position::AfterPath].to_string();
-    // Preserve any query already on the URL, then fold the token in with proper
-    // percent-encoding via the url crate rather than hand-splicing.
+    // Preserve any query already on the URL, then fold in --http-param pairs with
+    // proper percent-encoding via the url crate rather than hand-splicing.
     let mut query_url = url.clone();
-    if let Some(token) = &args.token {
-        query_url.query_pairs_mut().append_pair("token", token);
+    for pair in &args.http_params {
+        let (key, value) = pair.split_once('=').ok_or_else(|| {
+            WireSurgeError::new(
+                "invalid_http_param",
+                format!("--http-param must be KEY=VALUE, got {pair}"),
+            )
+            .at("http-param")
+        })?;
+        query_url.query_pairs_mut().append_pair(key, value);
     }
     let query = query_url.query().unwrap_or("").to_string();
 
@@ -622,19 +649,7 @@ fn format_load_banner(args: &LoadArgs, config: &LoadConfig) -> String {
             "Using {} connections (-c), each keeping {} queries in flight (-q) = {} concurrent queries total ({rate}).",
             config.concurrency, config.in_flight, total_in_flight,
         ),
-        format!(
-            "Running {stop}. PROXY header: {}. Auth token: {}.",
-            if config.target.proxy.is_some() {
-                "on"
-            } else {
-                "off"
-            },
-            if config.token.is_some() {
-                "set"
-            } else {
-                "none"
-            },
-        ),
+        format!("Running {stop}."),
     ];
     lines.push(String::new());
     lines.push(
@@ -1176,7 +1191,7 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_token_on_cleartext_transport() {
+    fn load_rejects_http_param_on_non_doh() {
         let outcome = dispatch(
             &[
                 "load".into(),
@@ -1185,19 +1200,15 @@ mod tests {
                 "udp".into(),
                 "--count".into(),
                 "1".into(),
-                "--token".into(),
-                "secret".into(),
+                "--http-param".into(),
+                "token=x".into(),
                 "--output".into(),
                 "json".into(),
             ],
             temp_dir(),
         );
         assert_eq!(outcome.code, 1);
-        assert!(
-            outcome
-                .stdout
-                .contains("token_requires_encrypted_transport")
-        );
+        assert!(outcome.stdout.contains("http_param_requires_doh"));
     }
 
     #[test]
@@ -1221,27 +1232,24 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_token_with_insecure() {
+    fn load_rejects_malformed_edns_option() {
         let outcome = dispatch(
             &[
                 "load".into(),
                 "127.0.0.1".into(),
                 "--protocol".into(),
-                "doh".into(),
-                "--url".into(),
-                "https://r.example/dns-query".into(),
-                "--token".into(),
-                "secret".into(),
-                "--insecure".into(),
+                "udp".into(),
                 "--count".into(),
                 "1".into(),
+                "--edns-option".into(),
+                "not-a-pair".into(),
                 "--output".into(),
                 "json".into(),
             ],
             temp_dir(),
         );
         assert_eq!(outcome.code, 1);
-        assert!(outcome.stdout.contains("token_requires_verified_peer"));
+        assert!(outcome.stdout.contains("invalid_edns_option"));
     }
 
     #[test]

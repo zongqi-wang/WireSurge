@@ -50,8 +50,8 @@ impl HttpMethod {
 /// Everything a request-carrying transport needs to address an HTTP endpoint,
 /// independent of the payload. The adapter (e.g. DoH) fills in scheme, authority
 /// (`https://abc.example/dns-query`), method, and an optional static query
-/// string (the auth token rides here). Generic by design so the same HTTP/2
-/// transport can drive a non-DNS API load test.
+/// string. Generic by design so the same HTTP/2 transport can drive a non-DNS
+/// API load test.
 #[derive(Clone)]
 pub struct HttpTemplate {
     pub method: HttpMethod,
