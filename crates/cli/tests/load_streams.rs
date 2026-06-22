@@ -46,12 +46,12 @@ fn human_mode_banner_on_stderr_summary_on_stdout() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("wiresurge load ->"),
+        stderr.contains("Load test: sending"),
         "banner on stderr: {stderr}"
     );
     assert!(
-        !stdout.contains("wiresurge load ->"),
+        !stdout.contains("Load test: sending"),
         "banner must not leak into stdout: {stdout}"
     );
-    assert!(stdout.contains("duration"), "summary on stdout: {stdout}");
+    assert!(stdout.contains("── Summary"), "summary on stdout: {stdout}");
 }
