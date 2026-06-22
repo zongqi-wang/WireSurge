@@ -19,7 +19,7 @@ mdbook serve --open
 
 ## Status Vocabulary
 
-The architecture intentionally describes more than the current scaffold implements. Every chapter uses these terms consistently:
+The architecture intentionally describes more than the current implementation provides. Every chapter uses these terms consistently:
 
 - **Current** means the behavior exists in the repository now.
 - **Target** means an accepted design direction that is not fully implemented.

@@ -30,11 +30,11 @@ UI cancellation, Ctrl-C, and SIGTERM enter the same shutdown state machine. Pers
 
 ### Established libraries over handrolled code
 
-Standards-heavy and security-sensitive behavior uses established first-party or third-party libraries instead of bespoke reimplementations. This includes TLS, HTTP/1.1 and HTTP/2, async runtime and signals, DNS and EDNS0 messages, PROXY protocol framing, JSON/YAML serialization, CLI parsing, and latency histograms.
+Standards-heavy and security-sensitive behavior uses established first-party or third-party libraries instead of bespoke reimplementations. This includes TLS, HTTP/1.1 and HTTP/2, async runtime and signals, DNS and EDNS0 messages, JSON/YAML serialization, CLI parsing, and latency histograms.
 
 WireSurge owns the behavior that differentiates the product: scheduling, pacing, connection lifecycle, cancellation policy, workflow execution, and metrics semantics. Small, well-contained helpers can remain local. A custom parser, protocol codec, argument scanner, or cryptographic implementation is technical debt unless an architecture decision record documents why an established library cannot meet the requirement.
 
-The current CLI uses `clap`, Serde, Tokio, Hyper/rustls, `hickory-proto`, and `hdrhistogram` for their respective standards-heavy concerns. WireSurge retains scheduling, pacing, connection ownership, cancellation policy, workflow semantics, and metrics aggregation.
+The current CLI uses `clap`, Serde, Tokio, Hyper/rustls, `hickory-proto`, and `hdrhistogram` for their respective standards-heavy concerns. WireSurge retains scheduling, pacing, connection ownership, cancellation policy, workflow semantics, metrics aggregation, and a small tested PROXY v2 encoder where a separate dependency was not justified.
 
 ## Product Shape
 
@@ -83,4 +83,4 @@ WireSurge can generate meaningful traffic, including from automation. Safety con
 - Local secret-access audit records.
 - No secrets in workflow files unless intentionally marked unsafe.
 
-The current scaffold provides dry runs and basic output redaction. It does not yet implement target allowlists, keychain storage, or signed run profiles.
+The current implementation provides dry runs and basic output redaction. It does not yet implement target allowlists, keychain storage, or signed run profiles.
