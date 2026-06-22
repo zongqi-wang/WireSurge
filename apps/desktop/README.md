@@ -4,3 +4,4 @@ This directory is reserved for the Tauri desktop shell. The first desktop milest
 
 The initial Runners UI contract is visible in `apps/web/index.html`.
 
+The scoped information architecture, native boundary, and delivery milestones are documented in [`docs/ui-plan.md`](../../docs/ui-plan.md).
