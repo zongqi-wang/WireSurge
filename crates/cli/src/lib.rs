@@ -1201,7 +1201,7 @@ mod tests {
                 "--count".into(),
                 "1".into(),
                 "--http-param".into(),
-                "token=x".into(),
+                "key=value".into(),
                 "--output".into(),
                 "json".into(),
             ],
