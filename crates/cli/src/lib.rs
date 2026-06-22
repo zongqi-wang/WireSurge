@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -6,15 +7,20 @@ use std::net::{SocketAddr, ToSocketAddrs};
 
 use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{Args, Parser, Subcommand};
+use comfy_table::{Cell, ContentArrangement, Table, presets::UTF8_FULL};
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use url::{Position, Url};
 use wiresurge_core::{RequestSpec, Result, WireSurgeError, schema_for, serialize_json};
 use wiresurge_corpus::Corpus;
 use wiresurge_dns::parse_qtype;
-use wiresurge_engine::load::{LoadConfig, LoadProto, LoadStats, run_load};
+use wiresurge_engine::load::{
+    LoadConfig, LoadProto, LoadStats, ProgressConfig, run_load, run_load_with_progress,
+};
 use wiresurge_engine::{
     RunOptions, run_request_with_cancellation, run_stored_request_with_cancellation,
 };
+use wiresurge_metrics::RunSnapshot;
 use wiresurge_plugins::PluginManifestDraft;
 use wiresurge_storage::WorkspaceStore;
 use wiresurge_transport::{
@@ -133,6 +139,13 @@ struct LoadArgs {
     /// Skip TLS certificate verification (self-signed test targets only).
     #[arg(long)]
     insecure: bool,
+    /// Suppress the live progress line even on a TTY (banner and final summary
+    /// still print). Progress is always off under --output json or non-TTY.
+    #[arg(long = "no-progress")]
+    no_progress: bool,
+    /// Live progress refresh interval in milliseconds.
+    #[arg(long = "progress-interval", value_name = "MS", default_value_t = 1000)]
+    progress_interval_ms: u64,
 }
 
 #[derive(Args)]
@@ -526,19 +539,33 @@ fn parse_proxy_addr(value: &str, field: &str) -> Result<SocketAddr> {
 
 async fn load_command(args: LoadArgs, output_json: bool) -> Result<(String, i32)> {
     let config = build_load_config(&args)?;
+
+    let progress_enabled = !output_json && !args.no_progress && std::io::stderr().is_terminal();
+    if !output_json {
+        eprintln!("{}", format_load_banner(&args, &config));
+    }
+
     let cancellation = CancellationToken::new();
-    let execution = run_load(config, cancellation.clone());
-    tokio::pin!(execution);
-    let signal = shutdown_signal();
-    tokio::pin!(signal);
-    let (mut stats, exit_code) = tokio::select! {
-        result = &mut execution => (result?, 0),
-        signal_code = &mut signal => {
-            let signal_code = signal_code?;
-            cancellation.cancel();
-            (execution.await?, signal_code)
-        }
+    let (mut stats, exit_code) = if progress_enabled {
+        // Floored: each tick clones every actor's histogram, so a sub-50ms
+        // cadence at high -c would perturb the throughput being measured.
+        let interval = Duration::from_millis(args.progress_interval_ms.max(50));
+        let (tx, rx) = watch::channel(RunSnapshot::default());
+        let renderer = tokio::spawn(render_progress(rx));
+        let execution = run_load_with_progress(
+            config,
+            cancellation.clone(),
+            Some((ProgressConfig { interval }, tx)),
+        );
+        let result = drive_with_signal(execution, &cancellation).await;
+        renderer.abort();
+        let _ = renderer.await;
+        result?
+    } else {
+        let execution = run_load(config, cancellation.clone());
+        drive_with_signal(execution, &cancellation).await?
     };
+
     stats.cancelled |= exit_code != 0;
     let output = if output_json {
         stats.to_json()?
@@ -548,39 +575,267 @@ async fn load_command(args: LoadArgs, output_json: bool) -> Result<(String, i32)
     Ok((output, exit_code))
 }
 
+async fn drive_with_signal<F>(
+    execution: F,
+    cancellation: &CancellationToken,
+) -> Result<(LoadStats, i32)>
+where
+    F: std::future::Future<Output = Result<LoadStats>>,
+{
+    tokio::pin!(execution);
+    let signal = shutdown_signal();
+    tokio::pin!(signal);
+    tokio::select! {
+        result = &mut execution => Ok((result?, 0)),
+        signal_code = &mut signal => {
+            let signal_code = signal_code?;
+            cancellation.cancel();
+            Ok((execution.await?, signal_code))
+        }
+    }
+}
+
+fn format_load_banner(args: &LoadArgs, config: &LoadConfig) -> String {
+    let query = match &args.corpus {
+        Some(path) => format!("names from corpus {}", path.display()),
+        None => format!("{} {} queries", args.name, args.qtype.to_uppercase()),
+    };
+    let stop = match (args.duration_s, args.count) {
+        (Some(secs), _) => format!("for {secs} seconds"),
+        (_, Some(count)) => format!("until {} queries are sent", group_u64(count)),
+        _ => "until interrupted".to_string(),
+    };
+    let total_in_flight = config.concurrency * config.in_flight;
+    let rate = match args.qps {
+        Some(qps) => format!("capped at {} queries/sec", group_u64(qps as u64)),
+        None => "as fast as the target allows".to_string(),
+    };
+
+    let mut lines = vec![
+        format!(
+            "Load test: sending {query} to {} over {}.",
+            config.target.tcp_addr,
+            args.protocol.to_uppercase(),
+        ),
+        format!(
+            "Using {} connections (-c), each keeping {} queries in flight (-q) = {} concurrent queries total ({rate}).",
+            config.concurrency, config.in_flight, total_in_flight,
+        ),
+        format!(
+            "Running {stop}. PROXY header: {}. Auth token: {}.",
+            if config.target.proxy.is_some() {
+                "on"
+            } else {
+                "off"
+            },
+            if config.token.is_some() {
+                "set"
+            } else {
+                "none"
+            },
+        ),
+    ];
+    lines.push(String::new());
+    lines.push(
+        "── Live progress ─────────────────────────────────────────────────────────────"
+            .to_string(),
+    );
+    lines.push(
+        "Each line is one sample. Counts are cumulative; rates are instantaneous.".to_string(),
+    );
+    lines.push(progress_header());
+    lines.join("\n")
+}
+
+/// Column titles for the live progress rows, aligned to `format_progress_row`.
+fn progress_header() -> String {
+    format!(
+        "{:>6}  {:>11}  {:>11}  {:>9}  {:>9}  {:>6}  {:>7}  {:>7}  {:>6}  {:>6}   {}",
+        "time",
+        "sent",
+        "received",
+        "recv/s",
+        "noerror/s",
+        "infl",
+        "p50 ms",
+        "p99 ms",
+        "tmout",
+        "error",
+        "rcodes",
+    )
+}
+
+fn format_progress_row(snap: &RunSnapshot, recv_qps: f64, noerror_qps: f64) -> String {
+    format!(
+        "{:>5.1}s  {:>11}  {:>11}  {:>9.0}  {:>9.0}  {:>6}  {:>7.1}  {:>7.1}  {:>6}  {:>6}   {}",
+        snap.elapsed_s,
+        group_u64(snap.aggregate.sent),
+        group_u64(snap.aggregate.received),
+        recv_qps,
+        noerror_qps,
+        snap.aggregate.in_flight,
+        snap.aggregate.p50_ms,
+        snap.aggregate.p99_ms,
+        snap.aggregate.timeouts,
+        snap.aggregate.errors + snap.aggregate.conn_errors,
+        format_rcodes_inline(&snap.aggregate.rcodes),
+    )
+}
+
+/// Compact `NAME=count` rcode list for one progress line (`-` when empty).
+fn format_rcodes_inline(rcodes: &std::collections::BTreeMap<String, u64>) -> String {
+    if rcodes.is_empty() {
+        return "-".to_string();
+    }
+    rcodes
+        .iter()
+        .map(|(name, count)| format!("{name}={count}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Thousands-grouped decimal (e.g. 1234567 -> "1,234,567").
+fn group_u64(value: u64) -> String {
+    let digits = value.to_string();
+    let bytes = digits.as_bytes();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, &b) in bytes.iter().enumerate() {
+        if i != 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(b as char);
+    }
+    out
+}
+
+async fn render_progress(mut rx: watch::Receiver<RunSnapshot>) {
+    let mut prev: Option<RunSnapshot> = None;
+    while rx.changed().await.is_ok() {
+        let snap = rx.borrow().clone();
+        // Final frame is shown as the summary table; the t=0 seed has nothing.
+        if snap.final_sample || snap.elapsed_s == 0.0 {
+            continue;
+        }
+        // First frame has no prior; fall back to the cumulative rate.
+        let (recv_qps, noerror_qps) = match &prev {
+            Some(p) if snap.elapsed_s > p.elapsed_s => {
+                let dt = snap.elapsed_s - p.elapsed_s;
+                let delta = |now: u64, was: u64| now.saturating_sub(was) as f64 / dt;
+                (
+                    delta(snap.aggregate.received, p.aggregate.received),
+                    delta(snap.aggregate.noerror, p.aggregate.noerror),
+                )
+            }
+            _ => (snap.aggregate.recv_qps, snap.aggregate.noerror_qps),
+        };
+        // One persistent line per tick: a scrolling log, not an in-place redraw.
+        eprintln!("{}", format_progress_row(&snap, recv_qps, noerror_qps));
+        prev = Some(snap);
+    }
+}
+
 fn format_load_text(stats: &LoadStats) -> String {
     let recorder = &stats.recorder;
-    let rcodes = recorder
-        .rcode_breakdown()
-        .into_iter()
-        .map(|(name, count)| format!("{name} {count}"))
-        .collect::<Vec<_>>()
-        .join("  ");
-    format!(
-        "duration {:.2}s  sent {}  received {}  recv_qps {:.0}  noerror_qps {:.0}\n\
-         timeouts {}  errors {}  conn_errors {}  truncated {}\n\
-         rcodes  {}\n\
-         latency_ms  p50 {:.2}  p95 {:.2}  p99 {:.2}  max {:.2}{}",
+    let sent = recorder.sent;
+    let received = recorder.received;
+    let noerror = recorder.noerror();
+    let response_pct = |count: u64| {
+        if sent > 0 {
+            100.0 * count as f64 / sent as f64
+        } else {
+            0.0
+        }
+    };
+
+    let rcodes = recorder.rcode_breakdown();
+    let rcode_lines = if rcodes.is_empty() {
+        "    (no responses)".to_string()
+    } else {
+        rcodes
+            .iter()
+            .map(|(name, count)| {
+                format!(
+                    "    {name:<10} {:>13}  ({:.1}% of sent)",
+                    group_u64(*count),
+                    response_pct(*count)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let mut summary = format!(
+        "── Summary (totals over the whole run) ───────────────────────────────────────\n\
+         duration         {:>10.2}  seconds\n\
+         sent             {:>10}  queries\n\
+         received         {:>10}  responses  ({:.1}% of sent)\n\
+         noerror          {:>10}  responses  ({:.1}% of sent)\n\
+         throughput       {:>10}  responses/sec (received)\n\
+         goodput          {:>10}  responses/sec (noerror)\n\
+         timeouts         {:>10}  queries\n\
+         transport errors {:>10}  queries\n\
+         conn errors      {:>10}  connections\n\
+         truncated        {:>10}  responses\n\
+         latency          p50 {:.2} ms   p95 {:.2} ms   p99 {:.2} ms   max {:.2} ms\n\
+         rcodes:\n{}",
         stats.duration_s,
-        recorder.sent,
-        recorder.received,
-        stats.recv_qps(),
-        stats.noerror_qps(),
-        recorder.timeouts,
-        recorder.errors,
-        recorder.conn_errors,
-        recorder.truncated,
-        if rcodes.is_empty() { "none" } else { &rcodes },
+        group_u64(sent),
+        group_u64(received),
+        response_pct(received),
+        group_u64(noerror),
+        response_pct(noerror),
+        group_u64(stats.recv_qps() as u64),
+        group_u64(stats.noerror_qps() as u64),
+        group_u64(recorder.timeouts),
+        group_u64(recorder.errors),
+        group_u64(recorder.conn_errors),
+        group_u64(recorder.truncated),
         recorder.percentile_ms(0.50),
         recorder.percentile_ms(0.95),
         recorder.percentile_ms(0.99),
         recorder.max_ms(),
-        if stats.cancelled {
-            "\ncancelled by signal"
-        } else {
-            ""
-        },
+        rcode_lines,
+    );
+    if stats.cancelled {
+        summary.push_str("\ncancelled by signal");
+    }
+    if stats.workers.is_empty() {
+        return summary;
+    }
+    format!(
+        "{summary}\n\n── Per-connection breakdown ──────────────────────────────────────────────────\n{}",
+        format_worker_table(&stats.workers)
     )
+}
+
+fn format_worker_table(workers: &[wiresurge_metrics::WorkerStats]) -> String {
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            "connection",
+            "sent q/s",
+            "recv q/s",
+            "p50 ms",
+            "p95 ms",
+            "p99 ms",
+            "err q/s",
+            "tmout q/s",
+        ]);
+    for worker in workers {
+        table.add_row(vec![
+            Cell::new(&worker.id),
+            Cell::new(format!("{:.0}", worker.qps)),
+            Cell::new(format!("{:.0}", worker.rps)),
+            Cell::new(format!("{:.2}", worker.p50_ms)),
+            Cell::new(format!("{:.2}", worker.p95_ms)),
+            Cell::new(format!("{:.2}", worker.p99_ms)),
+            Cell::new(format!("{:.1}", worker.error_rate)),
+            Cell::new(format!("{:.1}", worker.timeout_rate)),
+        ]);
+    }
+    table.to_string()
 }
 
 #[cfg(unix)]
@@ -888,6 +1143,35 @@ mod tests {
         );
         assert_eq!(outcome.code, 1);
         assert!(outcome.stdout.contains("unknown_argument"));
+    }
+
+    #[test]
+    fn load_json_output_carries_workers() {
+        // --count 0 completes without a server; fd-level stream cleanliness is
+        // covered in tests/load_streams.rs.
+        let outcome = dispatch(
+            &[
+                "load".into(),
+                "127.0.0.1".into(),
+                "--protocol".into(),
+                "udp".into(),
+                "--count".into(),
+                "0".into(),
+                "--output".into(),
+                "json".into(),
+            ],
+            temp_dir(),
+        );
+        assert_eq!(outcome.code, 0);
+        let value: serde_json::Value =
+            serde_json::from_str(&outcome.stdout).expect("stdout is a single JSON value");
+        assert!(
+            value.get("workers").is_some(),
+            "json carries workers: {}",
+            outcome.stdout
+        );
+        assert!(value.get("noerror_qps").is_some());
+        assert!(value["workers"].is_array());
     }
 
     #[test]

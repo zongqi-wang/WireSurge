@@ -1,9 +1,10 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
-use tokio::time::sleep_until;
+use tokio::sync::watch;
+use tokio::time::{MissedTickBehavior, sleep_until};
 use tokio_util::sync::CancellationToken;
 use wiresurge_core::{Result, WireSurgeError, serialize_json};
 use wiresurge_corpus::{Corpus, SelectMode};
@@ -12,8 +13,31 @@ use wiresurge_dns::transport::do53::{TcpTransport, UdpTransport};
 use wiresurge_dns::transport::doh::DohTransport;
 use wiresurge_dns::transport::dot::DotTransport;
 use wiresurge_dns::transport::{Connection, DnsRequest, Transport, TransportError};
-use wiresurge_metrics::LoadRecorder;
+use wiresurge_metrics::{AggregateStats, LoadRecorder, RunSnapshot, WorkerStats};
 use wiresurge_transport::ConnectTarget;
+
+/// Live-progress sampling cadence for `run_load_with_progress`.
+pub struct ProgressConfig {
+    pub interval: Duration,
+}
+
+/// Live slot one actor writes and the sampler reads. Stores the full recorder,
+/// not reduced percentiles, so the sampler merges true histograms.
+struct WorkerSlot {
+    recorder: LoadRecorder,
+    in_flight: u64,
+    status: &'static str,
+}
+
+impl Default for WorkerSlot {
+    fn default() -> Self {
+        Self {
+            recorder: LoadRecorder::default(),
+            in_flight: 0,
+            status: "starting",
+        }
+    }
+}
 
 /// EDNS0 option code carrying the Global Resolver auth token on Do53/DoT
 /// (0xFEA0); on DoH the token rides in the URL query instead.
@@ -143,23 +167,35 @@ impl WorkSource {
 }
 
 async fn run_actor<T: Transport>(
+    worker_id: usize,
     target: ConnectTarget,
     work: Arc<WorkSource>,
     in_flight: usize,
     timeout: Duration,
     cancel: CancellationToken,
-) -> LoadRecorder {
+    slot: Option<(Arc<Mutex<WorkerSlot>>, Duration)>,
+) -> (usize, LoadRecorder) {
     let mut recorder = LoadRecorder::default();
     let conn = match T::connect(target).await {
         Ok(conn) => conn,
         Err(_) => {
             recorder.on_conn_error();
-            return recorder;
+            if let Some((slot, _)) = &slot {
+                publish_slot(slot, &recorder, 0, "failed");
+            }
+            return (worker_id, recorder);
         }
     };
     let cap = conn.caps().max_in_flight.min(in_flight);
     let conn_ref = &conn;
     let mut inflight = FuturesUnordered::new();
+
+    // No slot -> no interval -> no tick: zero cost on the measurement path.
+    let mut ticker = slot.as_ref().map(|(_, interval)| {
+        let mut ticker = tokio::time::interval(*interval);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        ticker
+    });
 
     loop {
         // Stop feeding a dead connection. A closed transport (peer GOAWAY,
@@ -211,11 +247,96 @@ async fn run_actor<T: Transport>(
                     record(&mut recorder, result, elapsed);
                 }
             }
+            _ = tick(ticker.as_mut()) => {
+                if let Some((slot, _)) = &slot {
+                    publish_slot(slot, &recorder, inflight.len() as u64, "running");
+                }
+            }
         }
     }
 
     conn.drain(CANCEL_GRACE.min(timeout)).await;
-    recorder
+    if let Some((slot, _)) = &slot {
+        publish_slot(slot, &recorder, 0, "done");
+    }
+    (worker_id, recorder)
+}
+
+/// Tick arm of the actor select. With no interval the future stays pending, so
+/// the arm never fires.
+async fn tick(ticker: Option<&mut tokio::time::Interval>) {
+    match ticker {
+        Some(ticker) => {
+            ticker.tick().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+fn publish_slot(
+    slot: &Arc<Mutex<WorkerSlot>>,
+    recorder: &LoadRecorder,
+    in_flight: u64,
+    status: &'static str,
+) {
+    if let Ok(mut guard) = slot.lock() {
+        guard.recorder = recorder.clone();
+        guard.in_flight = in_flight;
+        guard.status = status;
+    }
+}
+
+async fn sample_progress(
+    slots: Vec<Arc<Mutex<WorkerSlot>>>,
+    sender: Arc<watch::Sender<RunSnapshot>>,
+    start: Instant,
+    interval: Duration,
+    cancel: CancellationToken,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    ticker.tick().await; // first tick is immediate; skip the empty t=0 sample.
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = ticker.tick() => {
+                let snapshot = collect_snapshot(&slots, start.elapsed().as_secs_f64(), false);
+                if sender.send(snapshot).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn collect_snapshot(
+    slots: &[Arc<Mutex<WorkerSlot>>],
+    elapsed_s: f64,
+    final_sample: bool,
+) -> RunSnapshot {
+    let mut aggregate = LoadRecorder::default();
+    let mut total_in_flight = 0u64;
+    let mut workers = Vec::with_capacity(slots.len());
+    for (index, slot) in slots.iter().enumerate() {
+        let (recorder, in_flight, status) = match slot.lock() {
+            Ok(guard) => (guard.recorder.clone(), guard.in_flight, guard.status),
+            Err(_) => continue,
+        };
+        total_in_flight += in_flight;
+        workers.push(recorder.snapshot_worker(
+            format!("worker-{index}"),
+            status,
+            elapsed_s,
+            in_flight,
+        ));
+        aggregate.merge(&recorder);
+    }
+    RunSnapshot {
+        elapsed_s,
+        final_sample,
+        aggregate: AggregateStats::from_recorder(&aggregate, elapsed_s, total_in_flight),
+        workers,
+    }
 }
 
 fn record(
@@ -237,6 +358,16 @@ fn record(
 }
 
 pub async fn run_load(config: LoadConfig, cancel: CancellationToken) -> Result<LoadStats> {
+    run_load_with_progress(config, cancel, None).await
+}
+
+/// Same as `run_load`, plus optional live progress. With `progress = None` no
+/// slots, ticker, or sampler exist, so this path is identical to the batch run.
+pub async fn run_load_with_progress(
+    config: LoadConfig,
+    cancel: CancellationToken,
+    progress: Option<(ProgressConfig, watch::Sender<RunSnapshot>)>,
+) -> Result<LoadStats> {
     config.validate()?;
 
     let edns_option = config
@@ -277,40 +408,87 @@ pub async fn run_load(config: LoadConfig, cancel: CancellationToken) -> Result<L
         },
     });
 
+    // Sender is shared (Arc) so the run loop can emit the final snapshot after
+    // the sampler stops.
+    let (slots, interval, sender, sampler) = match progress {
+        Some((cfg, sender)) => {
+            let sender = Arc::new(sender);
+            let slots: Vec<Arc<Mutex<WorkerSlot>>> = (0..config.concurrency)
+                .map(|_| Arc::new(Mutex::new(WorkerSlot::default())))
+                .collect();
+            let sampler = tokio::spawn(sample_progress(
+                slots.clone(),
+                Arc::clone(&sender),
+                start,
+                cfg.interval,
+                cancel.clone(),
+            ));
+            (Some(slots), Some(cfg.interval), Some(sender), Some(sampler))
+        }
+        None => (None, None, None, None),
+    };
+
     let mut actors = Vec::with_capacity(config.concurrency);
-    for _ in 0..config.concurrency {
+    for worker_id in 0..config.concurrency {
         let target = config.target.clone();
         let work = Arc::clone(&work);
         let cancel = cancel.clone();
         let in_flight = config.in_flight;
         let timeout = config.timeout;
+        let slot = slots
+            .as_ref()
+            .map(|slots| (Arc::clone(&slots[worker_id]), interval.unwrap()));
         let handle = match config.proto {
             LoadProto::Do53Udp => tokio::spawn(run_actor::<UdpTransport>(
-                target, work, in_flight, timeout, cancel,
+                worker_id, target, work, in_flight, timeout, cancel, slot,
             )),
             LoadProto::Do53Tcp => tokio::spawn(run_actor::<TcpTransport>(
-                target, work, in_flight, timeout, cancel,
+                worker_id, target, work, in_flight, timeout, cancel, slot,
             )),
             LoadProto::Dot => tokio::spawn(run_actor::<DotTransport>(
-                target, work, in_flight, timeout, cancel,
+                worker_id, target, work, in_flight, timeout, cancel, slot,
             )),
             LoadProto::Doh => tokio::spawn(run_actor::<DohTransport>(
-                target, work, in_flight, timeout, cancel,
+                worker_id, target, work, in_flight, timeout, cancel, slot,
             )),
         };
         actors.push(handle);
     }
 
     let mut aggregate = LoadRecorder::default();
+    let mut recorders = Vec::with_capacity(config.concurrency);
     for actor in actors {
-        if let Ok(recorder) = actor.await {
+        if let Ok((worker_id, recorder)) = actor.await {
             aggregate.merge(&recorder);
+            recorders.push((worker_id, recorder));
         }
+    }
+    let duration_s = start.elapsed().as_secs_f64();
+    let workers = recorders
+        .into_iter()
+        .map(|(worker_id, recorder)| {
+            recorder.snapshot_worker(format!("worker-{worker_id}"), "done", duration_s, 0)
+        })
+        .collect::<Vec<_>>();
+
+    // Final frame from the joined recorders, after the sampler stops.
+    if let Some(sampler) = sampler {
+        sampler.abort();
+        let _ = sampler.await;
+    }
+    if let Some(sender) = sender {
+        let _ = sender.send(RunSnapshot {
+            elapsed_s: duration_s,
+            final_sample: true,
+            aggregate: AggregateStats::from_recorder(&aggregate, duration_s, 0),
+            workers: workers.clone(),
+        });
     }
 
     Ok(LoadStats {
-        duration_s: start.elapsed().as_secs_f64(),
+        duration_s,
         recorder: aggregate,
+        workers,
         cancelled: cancel.is_cancelled(),
     })
 }
@@ -318,6 +496,7 @@ pub async fn run_load(config: LoadConfig, cancel: CancellationToken) -> Result<L
 pub struct LoadStats {
     pub duration_s: f64,
     pub recorder: LoadRecorder,
+    pub workers: Vec<WorkerStats>,
     pub cancelled: bool,
 }
 
@@ -336,7 +515,7 @@ impl LoadStats {
     /// the latter is the only honest measure of resolved traffic.
     pub fn noerror_qps(&self) -> f64 {
         if self.duration_s > 0.0 {
-            self.recorder.rcodes[0] as f64 / self.duration_s
+            self.recorder.noerror() as f64 / self.duration_s
         } else {
             0.0
         }
@@ -362,6 +541,7 @@ impl LoadStats {
                 "p99_ms": self.recorder.percentile_ms(0.99),
                 "max_ms": self.recorder.max_ms(),
             },
+            "workers": self.workers,
             "cancelled": self.cancelled,
         }))
     }
