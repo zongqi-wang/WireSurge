@@ -49,8 +49,8 @@ pub struct Prepared {
     authority: Authority,
     /// Decoded path of `base_uri` (no query), e.g. `/dns-query`.
     path: String,
-    /// Static template query (the auth token), without a leading `?`; empty when
-    /// unused.
+    /// Static template query appended to every request, without a leading `?`;
+    /// empty when unused.
     query: String,
     /// Request headers, fixed for the connection. Cloned (refcount bumps) per
     /// query into hyper's owned `HeaderMap`.
@@ -115,8 +115,7 @@ impl Transport for DohTransport {
 
 /// Build the variable per-query path-and-query string and the body. GET carries
 /// the message as a base64url (`?dns=`) parameter and an empty body; POST carries
-/// the raw wire bytes as the body. Any template query (the auth token) is joined
-/// ahead of `dns=`. The POST body shares the prebuilt wire buffer (no copy); GET
+/// the raw wire bytes as the body. Any template query is joined ahead of `dns=`. The POST body shares the prebuilt wire buffer (no copy); GET
 /// encodes straight into the path-and-query buffer. Only the path-and-query is
 /// rebuilt per query — the scheme/authority are connection-constant.
 fn build_path_and_query(prepared: &Prepared, wire: &Arc<[u8]>) -> (String, Bytes) {

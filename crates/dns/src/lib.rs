@@ -188,18 +188,19 @@ mod tests {
 
     #[test]
     fn encodes_configurable_edns0_option_code() {
-        // The option code must be caller-supplied, not hardcoded.
+        // The option code must be caller-supplied, not hardcoded. NSID (3) is a
+        // registered EDNS0 option code (RFC 5001).
         let payload = b"option-value".to_vec();
         let option = EdnsOption {
-            code: 65184,
+            code: 3,
             payload: payload.clone(),
         };
         let packet = build_query(0x1234, "example.com", 1, Some(&option)).unwrap();
         assert!(
             packet
                 .windows(2)
-                .any(|window| window == 65184_u16.to_be_bytes()),
-            "option code 65184 must appear in the OPT record"
+                .any(|window| window == 3_u16.to_be_bytes()),
+            "option code 3 must appear in the OPT record"
         );
         assert!(
             !packet

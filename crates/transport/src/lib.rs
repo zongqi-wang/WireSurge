@@ -58,7 +58,7 @@ pub struct HttpTemplate {
     /// Absolute origin form: `https://authority/path` (no query).
     pub base_uri: String,
     /// Pre-encoded query string appended to every request (without a leading
-    /// `?`), e.g. `token=...`; empty when unused.
+    /// `?`), e.g. `key=value`; empty when unused.
     pub query: String,
 }
 

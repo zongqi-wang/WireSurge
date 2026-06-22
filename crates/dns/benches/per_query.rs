@@ -77,7 +77,7 @@ fn bench_doh_assembly(method: HttpMethod, label: &str, n: usize) {
     let template = HttpTemplate {
         method,
         base_uri: "https://dns.example.net/dns-query".to_string(),
-        query: "token=abcdef0123456789".to_string(),
+        query: "key=abcdef0123456789".to_string(),
     };
     let prepared = doh::Prepared::from_template(&template).unwrap();
     let wire = wire();
