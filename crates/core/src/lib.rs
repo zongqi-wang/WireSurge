@@ -3,6 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+pub mod scenario;
+
 pub type Result<T> = std::result::Result<T, WireSurgeError>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -130,15 +132,22 @@ impl RequestSpec {
     }
 
     pub fn to_json(&self) -> Result<String> {
-        serialize_json(&self.redacted_output())
+        serialize_json(&self.redacted_output(&[]))
     }
 
     pub fn to_json_value(&self) -> Result<serde_json::Value> {
-        serde_json::to_value(self.redacted_output())
+        self.to_json_value_with(&[])
+    }
+
+    /// Like [`RequestSpec::to_json_value`], but also masks the given secret
+    /// values. A request built from a `--secret`-fed template inlines those
+    /// values into its fields, where the marker heuristic cannot spot them.
+    pub fn to_json_value_with(&self, secret_values: &[String]) -> Result<serde_json::Value> {
+        serde_json::to_value(self.redacted_output(secret_values))
             .map_err(|error| WireSurgeError::new("json_encode_failed", error.to_string()))
     }
 
-    fn redacted_output(&self) -> RedactedRequestSpec<'_> {
+    fn redacted_output(&self, secret_values: &[String]) -> RedactedRequestSpec<'_> {
         let headers = self
             .headers
             .iter()
@@ -146,7 +155,7 @@ impl RequestSpec {
                 let value = if contains_sensitive_marker(key) {
                     "[redacted]".to_string()
                 } else {
-                    redact_sensitive(value)
+                    redact_value(value, secret_values)
                 };
                 (key.clone(), value)
             })
@@ -155,9 +164,12 @@ impl RequestSpec {
             id: &self.id,
             name: &self.name,
             method: &self.method,
-            url: redact_sensitive(&self.url),
+            url: redact_value(&self.url, secret_values),
             headers,
-            body: self.body.as_deref().map(redact_sensitive),
+            body: self
+                .body
+                .as_deref()
+                .map(|body| redact_value(body, secret_values)),
         }
     }
 
@@ -168,19 +180,19 @@ impl RequestSpec {
 }
 
 #[derive(Deserialize)]
-struct RequestSpecInput {
+pub(crate) struct RequestSpecInput {
     #[serde(default)]
-    id: Option<String>,
+    pub(crate) id: Option<String>,
     #[serde(default)]
-    name: Option<String>,
+    pub(crate) name: Option<String>,
     #[serde(default)]
-    method: Option<String>,
+    pub(crate) method: Option<String>,
     #[serde(default)]
-    url: Option<String>,
+    pub(crate) url: Option<String>,
     #[serde(default)]
-    headers: BTreeMap<String, String>,
+    pub(crate) headers: BTreeMap<String, String>,
     #[serde(default)]
-    body: Option<String>,
+    pub(crate) body: Option<String>,
 }
 
 impl RequestSpecInput {
@@ -246,7 +258,7 @@ struct RedactedRequestSpec<'a> {
     body: Option<String>,
 }
 
-fn deserialization_error<E>(
+pub(crate) fn deserialization_error<E>(
     code: &'static str,
     error: serde_path_to_error::Error<E>,
 ) -> WireSurgeError
@@ -292,11 +304,25 @@ where
 }
 
 pub fn redact_sensitive(input: &str) -> String {
+    redact_value(input, &[])
+}
+
+/// Redact `input` for display: a marker-bearing string (`token`, `secret`, …) is
+/// replaced wholesale, and every occurrence of a known secret value is masked in
+/// place. The marker heuristic cannot recognize an arbitrary credential, so
+/// callers that hold the secret values (e.g. a templated request built from
+/// `--secret`) pass them here to scrub what the marker would miss.
+pub fn redact_value(input: &str, secret_values: &[String]) -> String {
     if contains_sensitive_marker(input) {
-        "[redacted]".to_string()
-    } else {
-        input.to_string()
+        return "[redacted]".to_string();
     }
+    let mut out = input.to_string();
+    for secret in secret_values {
+        if !secret.is_empty() && out.contains(secret.as_str()) {
+            out = out.replace(secret.as_str(), "[redacted]");
+        }
+    }
+    out
 }
 
 fn contains_sensitive_marker(input: &str) -> bool {
@@ -334,6 +360,11 @@ pub fn schema_for(resource: &str) -> Result<String> {
             "type": "object",
             "description": "YAML workflow with profiles, variables, secrets, flows, assertions, experiments, and safety limits"
         }),
+        "scenario" => serde_json::json!({
+            "type": "object",
+            "description": "Chained API scenario: profiles, secrets, and an ordered list of protocol-tagged steps with templated requests, response assertions, value extraction, and poll-until-condition loops",
+            "required": ["name", "steps"]
+        }),
         "run" => serde_json::json!({
             "type": "object",
             "description": "Execution result with request/response metrics and warnings"
@@ -350,7 +381,9 @@ pub fn schema_for(resource: &str) -> Result<String> {
             "unknown_schema",
             format!("unknown schema resource '{other}'"),
         )
-        .with_hint("Use one of: workspace, request, environment, workflow, run, report, runner"))?,
+        .with_hint(
+            "Use one of: workspace, request, environment, workflow, scenario, run, report, runner",
+        ))?,
     };
     serialize_json(&schema)
 }
