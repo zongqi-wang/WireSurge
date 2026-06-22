@@ -166,7 +166,10 @@ impl RequestSpec {
             method: &self.method,
             url: redact_value(&self.url, secret_values),
             headers,
-            body: self.body.as_deref().map(|body| redact_value(body, secret_values)),
+            body: self
+                .body
+                .as_deref()
+                .map(|body| redact_value(body, secret_values)),
         }
     }
 
@@ -378,7 +381,9 @@ pub fn schema_for(resource: &str) -> Result<String> {
             "unknown_schema",
             format!("unknown schema resource '{other}'"),
         )
-        .with_hint("Use one of: workspace, request, environment, workflow, scenario, run, report, runner"))?,
+        .with_hint(
+            "Use one of: workspace, request, environment, workflow, scenario, run, report, runner",
+        ))?,
     };
     serialize_json(&schema)
 }

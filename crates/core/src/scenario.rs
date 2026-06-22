@@ -252,19 +252,21 @@ impl Selector {
                 .headers
                 .get(name)
                 .map(|value| serde_json::Value::String(value.clone())),
-            Selector::BodyPointer(pointer) => serde_json::from_str::<serde_json::Value>(
-                &response.body,
-            )
-            .ok()
-            .and_then(|value| value.pointer(pointer).cloned()),
+            Selector::BodyPointer(pointer) => {
+                serde_json::from_str::<serde_json::Value>(&response.body)
+                    .ok()
+                    .and_then(|value| value.pointer(pointer).cloned())
+            }
         }
     }
 }
 
 fn invalid_selector(spec: &str, why: &str) -> WireSurgeError {
-    WireSurgeError::new("invalid_selector", format!("invalid selector '{spec}': {why}")).at(
-        spec.to_string(),
+    WireSurgeError::new(
+        "invalid_selector",
+        format!("invalid selector '{spec}': {why}"),
     )
+    .at(spec.to_string())
 }
 
 /// Lower a `body:` path to an RFC 6901 JSON pointer. A path already starting
@@ -396,8 +398,11 @@ impl RunSpec {
         let parsed: RunSpecInput = serde_path_to_error::deserialize(&mut deserializer)
             .map_err(|error| deserialization_error("invalid_json", error))?;
         deserializer.end().map_err(|error| {
-            WireSurgeError::new("invalid_json", error.to_string())
-                .at(format!("line {}, column {}", error.line(), error.column()))
+            WireSurgeError::new("invalid_json", error.to_string()).at(format!(
+                "line {}, column {}",
+                error.line(),
+                error.column()
+            ))
         })?;
         parsed.into_run_spec()
     }
@@ -447,11 +452,10 @@ struct RunSpecInput {
 impl RunSpecInput {
     fn into_run_spec(self) -> Result<RunSpec> {
         if let Some(field) = self.unknown.keys().next() {
-            return Err(WireSurgeError::new(
-                "invalid_request",
-                format!("unknown field '{field}'"),
-            )
-            .at(field.to_string()));
+            return Err(
+                WireSurgeError::new("invalid_request", format!("unknown field '{field}'"))
+                    .at(field.to_string()),
+            );
         }
         // A run file carries an explicit id (it is a saved request), so require
         // id/name/url here rather than synthesizing one. Defer scheme/method
@@ -686,10 +690,9 @@ mod tests {
     #[test]
     fn run_spec_parses_flat_request_unchanged() {
         // A plain request file (no vars/expect) still parses — backward compatible.
-        let spec = RunSpec::from_yaml(
-            "id: req-a\nname: A\nmethod: get\nurl: http://localhost/health\n",
-        )
-        .unwrap();
+        let spec =
+            RunSpec::from_yaml("id: req-a\nname: A\nmethod: get\nurl: http://localhost/health\n")
+                .unwrap();
         assert_eq!(spec.id, "req-a");
         assert!(spec.vars.is_empty());
         assert!(spec.expect.is_none());
@@ -743,8 +746,8 @@ expect:
 
     #[test]
     fn expect_rejects_unknown_field() {
-        let error =
-            RunSpec::from_yaml("id: r\nname: r\nurl: http://x\nexpect:\n  stat: 200\n").unwrap_err();
+        let error = RunSpec::from_yaml("id: r\nname: r\nurl: http://x\nexpect:\n  stat: 200\n")
+            .unwrap_err();
         assert_eq!(error.code, "invalid_yaml");
     }
 
@@ -752,10 +755,8 @@ expect:
     fn run_spec_rejects_unknown_top_level_field() {
         // A mistyped `expct:` must not be silently dropped (which would skip the
         // assertion and exit 0) — `flatten` would otherwise swallow it.
-        let error = RunSpec::from_yaml(
-            "id: r\nname: r\nurl: http://x\nexpct:\n  status: 200\n",
-        )
-        .unwrap_err();
+        let error = RunSpec::from_yaml("id: r\nname: r\nurl: http://x\nexpct:\n  status: 200\n")
+            .unwrap_err();
         assert_eq!(error.code, "invalid_request");
         assert_eq!(error.path.as_deref(), Some("expct"));
     }

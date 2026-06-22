@@ -99,9 +99,10 @@ pub fn build_query(
                 )
                 .at("edns_payload"));
             }
-            extension
-                .options_mut()
-                .insert(HickoryEdnsOption::Unknown(option.code, option.payload.clone()));
+            extension.options_mut().insert(HickoryEdnsOption::Unknown(
+                option.code,
+                option.payload.clone(),
+            ));
         }
         message.set_edns(extension);
     }

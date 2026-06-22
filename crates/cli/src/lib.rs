@@ -1050,7 +1050,10 @@ async fn run_command(
 
 /// Parse repeated `NAME=VALUE` CLI pairs into a map, rejecting a missing `=` or
 /// empty name with a structured error keyed on the flag.
-fn parse_kv_pairs(pairs: &[String], flag: &str) -> Result<std::collections::BTreeMap<String, String>> {
+fn parse_kv_pairs(
+    pairs: &[String],
+    flag: &str,
+) -> Result<std::collections::BTreeMap<String, String>> {
     let mut map = std::collections::BTreeMap::new();
     for pair in pairs {
         let (name, value) = pair.split_once('=').ok_or_else(|| {

@@ -257,10 +257,9 @@ async fn doh_query_param_rides_in_url_query() {
     let addr = spawn_doh_echo(ServerMode::RequireQueryParam).await;
 
     // With the query param present the responder echoes a DNS answer.
-    let with_param =
-        DohTransport::connect(doh_target(addr, HttpMethod::Post, QUERY_PARAM))
-            .await
-            .unwrap();
+    let with_param = DohTransport::connect(doh_target(addr, HttpMethod::Post, QUERY_PARAM))
+        .await
+        .unwrap();
     let response = with_param
         .exchange(request_with_id(1), Duration::from_secs(5))
         .await

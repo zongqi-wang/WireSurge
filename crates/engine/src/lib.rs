@@ -2,13 +2,13 @@ use std::path::PathBuf;
 
 pub mod load;
 
+use std::collections::BTreeMap;
 use tokio_util::sync::CancellationToken;
 use wiresurge_core::scenario::{Expect, RunSpec, Scope, evaluate};
 use wiresurge_core::{RequestSpec, Result, WireSurgeError, generate_id, serialize_json};
 use wiresurge_http::{HttpResponse, send_http_request};
 use wiresurge_metrics::{ReportSummary, RunnerStats};
 use wiresurge_storage::WorkspaceStore;
-use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunOptions {
@@ -248,12 +248,14 @@ fn evaluate_expect(
 ) -> Option<std::result::Result<(), WireSurgeError>> {
     let expect = expect?;
     let response = result.response.as_ref()?;
-    Some(evaluate(expect, &response.to_call_response()).map_err(|mut error| {
-        for secret in &result.secret_values {
-            if !secret.is_empty() {
-                error.message = error.message.replace(secret.as_str(), "[redacted]");
+    Some(
+        evaluate(expect, &response.to_call_response()).map_err(|mut error| {
+            for secret in &result.secret_values {
+                if !secret.is_empty() {
+                    error.message = error.message.replace(secret.as_str(), "[redacted]");
+                }
             }
-        }
-        error
-    }))
+            error
+        }),
+    )
 }
