@@ -3,6 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+pub mod scenario;
+
 pub type Result<T> = std::result::Result<T, WireSurgeError>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -168,19 +170,19 @@ impl RequestSpec {
 }
 
 #[derive(Deserialize)]
-struct RequestSpecInput {
+pub(crate) struct RequestSpecInput {
     #[serde(default)]
-    id: Option<String>,
+    pub(crate) id: Option<String>,
     #[serde(default)]
-    name: Option<String>,
+    pub(crate) name: Option<String>,
     #[serde(default)]
-    method: Option<String>,
+    pub(crate) method: Option<String>,
     #[serde(default)]
-    url: Option<String>,
+    pub(crate) url: Option<String>,
     #[serde(default)]
-    headers: BTreeMap<String, String>,
+    pub(crate) headers: BTreeMap<String, String>,
     #[serde(default)]
-    body: Option<String>,
+    pub(crate) body: Option<String>,
 }
 
 impl RequestSpecInput {
@@ -246,7 +248,7 @@ struct RedactedRequestSpec<'a> {
     body: Option<String>,
 }
 
-fn deserialization_error<E>(
+pub(crate) fn deserialization_error<E>(
     code: &'static str,
     error: serde_path_to_error::Error<E>,
 ) -> WireSurgeError
@@ -334,6 +336,11 @@ pub fn schema_for(resource: &str) -> Result<String> {
             "type": "object",
             "description": "YAML workflow with profiles, variables, secrets, flows, assertions, experiments, and safety limits"
         }),
+        "scenario" => serde_json::json!({
+            "type": "object",
+            "description": "Chained API scenario: profiles, secrets, and an ordered list of protocol-tagged steps with templated requests, response assertions, value extraction, and poll-until-condition loops",
+            "required": ["name", "steps"]
+        }),
         "run" => serde_json::json!({
             "type": "object",
             "description": "Execution result with request/response metrics and warnings"
@@ -350,7 +357,7 @@ pub fn schema_for(resource: &str) -> Result<String> {
             "unknown_schema",
             format!("unknown schema resource '{other}'"),
         )
-        .with_hint("Use one of: workspace, request, environment, workflow, run, report, runner"))?,
+        .with_hint("Use one of: workspace, request, environment, workflow, scenario, run, report, runner"))?,
     };
     serialize_json(&schema)
 }

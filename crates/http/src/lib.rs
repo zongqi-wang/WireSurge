@@ -14,6 +14,7 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use serde::Serialize;
 use url::Url;
+use wiresurge_core::scenario::CallResponse;
 use wiresurge_core::{RequestSpec, Result, WireSurgeError, redact_sensitive, serialize_json};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -169,6 +170,20 @@ pub struct HttpResponse {
 impl HttpResponse {
     pub fn to_json(&self) -> Result<String> {
         serialize_json(&self.redacted_output())
+    }
+
+    /// Normalize into the protocol-blind [`CallResponse`] that templating,
+    /// extraction, and assertions operate on. HTTP has a status but no separate
+    /// protocol code, so `code` is `None`.
+    pub fn to_call_response(&self) -> CallResponse {
+        CallResponse {
+            status: Some(self.status_code),
+            code: None,
+            headers: self.headers.clone(),
+            body: self.body.clone(),
+            duration_ms: self.duration_ms,
+            warnings: self.warnings.clone(),
+        }
     }
 
     pub fn to_json_value(&self) -> Result<serde_json::Value> {

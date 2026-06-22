@@ -3,10 +3,12 @@ use std::path::PathBuf;
 pub mod load;
 
 use tokio_util::sync::CancellationToken;
+use wiresurge_core::scenario::{Expect, RunSpec, Scope, evaluate};
 use wiresurge_core::{RequestSpec, Result, WireSurgeError, generate_id, serialize_json};
 use wiresurge_http::{HttpResponse, send_http_request};
 use wiresurge_metrics::{ReportSummary, RunnerStats};
 use wiresurge_storage::WorkspaceStore;
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunOptions {
@@ -38,9 +40,19 @@ pub struct RunResult {
     pub report: Option<ReportSummary>,
     pub warnings: Vec<String>,
     pub dry_run: bool,
+    /// Result of an optional `expect:` assertion. `None` when the run carried no
+    /// assertion; `Some(Ok(()))` when it passed; `Some(Err(_))` when it failed.
+    /// A failed assertion drives a nonzero CLI exit without being a transport
+    /// error (the request itself succeeded).
+    pub assertion: Option<std::result::Result<(), WireSurgeError>>,
 }
 
 impl RunResult {
+    /// True when an assertion was evaluated and failed.
+    pub fn assertion_failed(&self) -> bool {
+        matches!(self.assertion, Some(Err(_)))
+    }
+
     pub fn to_json(&self) -> Result<String> {
         let response = self
             .response
@@ -52,6 +64,11 @@ impl RunResult {
             .as_ref()
             .map(ReportSummary::to_json_value)
             .transpose()?;
+        let assertion = match &self.assertion {
+            None => serde_json::Value::Null,
+            Some(Ok(())) => serde_json::json!({ "passed": true }),
+            Some(Err(error)) => serde_json::json!({ "passed": false, "error": error }),
+        };
         serialize_json(&serde_json::json!({
             "id": self.id,
             "dry_run": self.dry_run,
@@ -59,6 +76,7 @@ impl RunResult {
             "response": response,
             "runner": self.runner,
             "report": report,
+            "assertion": assertion,
             "warnings": self.warnings,
         }))
     }
@@ -111,6 +129,7 @@ pub async fn run_request_with_cancellation(
             report: None,
             warnings,
             dry_run: true,
+            assertion: None,
         };
         return Ok(result);
     }
@@ -166,5 +185,44 @@ pub async fn run_request_with_cancellation(
         report,
         warnings,
         dry_run: false,
+        assertion: None,
     })
+}
+
+/// Run a templated request file (a [`RunSpec`]: request fields plus optional
+/// `vars`/`expect`), expanding `{{ }}` templates against `cli_vars`/`cli_secrets`
+/// merged over the file's own `vars`, then evaluating any `expect:` assertion
+/// against the response. The request itself succeeding and its assertion passing
+/// are reported separately: a failed assertion lands in `RunResult.assertion`
+/// (not as a transport error), so the CLI can exit nonzero while still emitting
+/// the response.
+pub async fn run_run_spec_with_cancellation(
+    store: &WorkspaceStore,
+    spec: RunSpec,
+    cli_vars: BTreeMap<String, String>,
+    cli_secrets: BTreeMap<String, String>,
+    options: RunOptions,
+    cancellation: CancellationToken,
+) -> Result<RunResult> {
+    // CLI-supplied vars override the file's own vars of the same name.
+    let mut vars = spec.vars.clone();
+    vars.extend(cli_vars);
+    let scope = Scope::new(vars, cli_secrets, 0, 0);
+    let request = spec.expand(&scope)?;
+    let expect = spec.expect.clone();
+
+    let mut result = run_request_with_cancellation(store, request, options, cancellation).await?;
+    result.assertion = evaluate_expect(expect.as_ref(), &result);
+    Ok(result)
+}
+
+/// Evaluate an optional assertion against a completed run. Returns `None` when
+/// there is no assertion or no response to assert on (e.g. a dry run).
+fn evaluate_expect(
+    expect: Option<&Expect>,
+    result: &RunResult,
+) -> Option<std::result::Result<(), WireSurgeError>> {
+    let expect = expect?;
+    let response = result.response.as_ref()?;
+    Some(evaluate(expect, &response.to_call_response()))
 }

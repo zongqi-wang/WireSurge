@@ -11,15 +11,14 @@ use comfy_table::{Cell, ContentArrangement, Table, presets::UTF8_FULL};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use url::{Position, Url};
+use wiresurge_core::scenario::RunSpec;
 use wiresurge_core::{RequestSpec, Result, WireSurgeError, schema_for, serialize_json};
 use wiresurge_corpus::Corpus;
 use wiresurge_dns::{EdnsOption, parse_qtype};
 use wiresurge_engine::load::{
     LoadConfig, LoadProto, LoadStats, ProgressConfig, run_load, run_load_with_progress,
 };
-use wiresurge_engine::{
-    RunOptions, run_request_with_cancellation, run_stored_request_with_cancellation,
-};
+use wiresurge_engine::{RunOptions, run_run_spec_with_cancellation};
 use wiresurge_metrics::RunSnapshot;
 use wiresurge_plugins::PluginManifestDraft;
 use wiresurge_storage::WorkspaceStore;
@@ -174,6 +173,14 @@ struct RunArgs {
     verbose: bool,
     #[arg(long)]
     report: Option<PathBuf>,
+    /// Template variable as NAME=VALUE (repeatable); overrides a file `vars`
+    /// entry of the same name. Available to request fields as `{{vars.NAME}}`.
+    #[arg(long = "var", value_name = "NAME=VALUE")]
+    vars: Vec<String>,
+    /// Secret as NAME=VALUE (repeatable); available as `{{secrets.NAME}}` and
+    /// redacted in all output. Never store secret values in the request file.
+    #[arg(long = "secret", value_name = "NAME=VALUE")]
+    secrets: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -977,28 +984,43 @@ async fn run_command(
         verbose: args.verbose,
         report_dir: args.report,
     };
+    // --var/--secret are CLI-supplied template inputs, parsed before any I/O so
+    // a malformed pair fails fast with a structured error.
+    let cli_vars = parse_kv_pairs(&args.vars, "var")?;
+    let cli_secrets = parse_kv_pairs(&args.secrets, "secret")?;
+
     let cancellation = CancellationToken::new();
     let execution_cancellation = cancellation.clone();
     let execution = async {
-        if PathBuf::from(&args.target).exists() {
+        // A file target may carry `vars`/`expect` (a RunSpec); a stored request
+        // is lifted into a RunSpec with neither, so both paths share templating.
+        let spec = if PathBuf::from(&args.target).exists() {
             let input = fs::read_to_string(&args.target)?;
-            let request = RequestSpec::from_yaml(&input)?;
-            run_request_with_cancellation(store, request, options, execution_cancellation).await
+            RunSpec::from_yaml(&input)?
         } else {
-            run_stored_request_with_cancellation(
-                store,
-                &args.target,
-                options,
-                execution_cancellation,
-            )
-            .await
-        }
+            run_spec_from_request(store.load_request(&args.target)?)
+        };
+        run_run_spec_with_cancellation(
+            store,
+            spec,
+            cli_vars,
+            cli_secrets,
+            options,
+            execution_cancellation,
+        )
+        .await
     };
     tokio::pin!(execution);
     let signal = shutdown_signal();
     tokio::pin!(signal);
     tokio::select! {
-        result = &mut execution => Ok((result?.to_json()?, 0)),
+        result = &mut execution => {
+            let result = result?;
+            // A failed `expect:` assertion exits 1 — the request succeeded but the
+            // contract did not hold — distinct from a transport error or a signal.
+            let code = if result.assertion_failed() { 1 } else { 0 };
+            Ok((result.to_json()?, code))
+        }
         signal_code = &mut signal => {
             let signal_code = signal_code?;
             cancellation.cancel();
@@ -1013,6 +1035,46 @@ async fn run_command(
             };
             Ok((output, signal_code))
         }
+    }
+}
+
+/// Parse repeated `NAME=VALUE` CLI pairs into a map, rejecting a missing `=` or
+/// empty name with a structured error keyed on the flag.
+fn parse_kv_pairs(pairs: &[String], flag: &str) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut map = std::collections::BTreeMap::new();
+    for pair in pairs {
+        let (name, value) = pair.split_once('=').ok_or_else(|| {
+            WireSurgeError::new(
+                format!("invalid_{flag}"),
+                format!("--{flag} must be NAME=VALUE, got {pair}"),
+            )
+            .at(flag.to_string())
+        })?;
+        if name.is_empty() {
+            return Err(WireSurgeError::new(
+                format!("invalid_{flag}"),
+                format!("--{flag} name must not be empty"),
+            )
+            .at(flag.to_string()));
+        }
+        map.insert(name.to_string(), value.to_string());
+    }
+    Ok(map)
+}
+
+/// Lift a stored [`RequestSpec`] into a [`RunSpec`] with no `vars`/`expect`, so a
+/// stored request runs through the same templating path as a file (and can still
+/// reference `{{vars.*}}`/`{{secrets.*}}` supplied on the command line).
+fn run_spec_from_request(request: RequestSpec) -> RunSpec {
+    RunSpec {
+        id: request.id,
+        name: request.name,
+        method: request.method,
+        url: request.url,
+        headers: request.headers,
+        body: request.body,
+        vars: std::collections::BTreeMap::new(),
+        expect: None,
     }
 }
 
@@ -1505,5 +1567,102 @@ mod tests {
         );
         assert_eq!(outcome.code, 1);
         assert!(outcome.stdout.contains("\"code\":\"workspace_not_found\""));
+    }
+
+    /// Write a request/scenario YAML file under a fresh, initialized workspace
+    /// and return both the workspace root and the file path. The run path writes
+    /// a runner snapshot, so the workspace must exist first.
+    fn write_run_file(contents: &str) -> (PathBuf, PathBuf) {
+        let root = temp_dir();
+        std::fs::create_dir_all(&root).unwrap();
+        let init = dispatch(&["workspace".into(), "init".into()], root.clone());
+        assert_eq!(init.code, 0, "{}", init.stderr);
+        let file = root.join("req.yaml");
+        std::fs::write(&file, contents).unwrap();
+        (root, file)
+    }
+
+    #[test]
+    fn run_rejects_malformed_var() {
+        let (root, file) = write_run_file("id: r\nname: r\nurl: http://127.0.0.1:1/x\n");
+        let outcome = dispatch(
+            &[
+                "run".into(),
+                file.to_string_lossy().into_owned(),
+                "--var".into(),
+                "noequals".into(),
+                "--output".into(),
+                "json".into(),
+            ],
+            root.clone(),
+        );
+        assert_eq!(outcome.code, 1);
+        assert!(outcome.stdout.contains("invalid_var"), "{}", outcome.stdout);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_rejects_unknown_var_in_template() {
+        // --dry-run still expands templates, so an undefined var fails fast
+        // without sending traffic.
+        let (root, file) = write_run_file("id: r\nname: r\nurl: \"{{vars.missing}}/x\"\n");
+        let outcome = dispatch(
+            &[
+                "run".into(),
+                file.to_string_lossy().into_owned(),
+                "--dry-run".into(),
+                "--output".into(),
+                "json".into(),
+            ],
+            root.clone(),
+        );
+        assert_eq!(outcome.code, 1);
+        assert!(outcome.stdout.contains("unknown_var"), "{}", outcome.stdout);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_expands_cli_var_on_dry_run() {
+        // A CLI --var feeds the template; --dry-run reports the expanded request
+        // without sending, and exits 0 (no assertion to fail).
+        let (root, file) = write_run_file("id: r\nname: r\nurl: \"{{vars.base}}/health\"\n");
+        let outcome = dispatch(
+            &[
+                "run".into(),
+                file.to_string_lossy().into_owned(),
+                "--var".into(),
+                "base=http://127.0.0.1:9".into(),
+                "--dry-run".into(),
+                "--output".into(),
+                "json".into(),
+            ],
+            root.clone(),
+        );
+        assert_eq!(outcome.code, 0, "{}", outcome.stdout);
+        assert!(
+            outcome.stdout.contains("http://127.0.0.1:9/health"),
+            "{}",
+            outcome.stdout
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_accepts_flat_request_file_unchanged() {
+        // A plain request file (no vars/expect) still runs as before.
+        let (root, file) = write_run_file("id: r\nname: r\nurl: http://127.0.0.1:9/x\n");
+        let outcome = dispatch(
+            &[
+                "run".into(),
+                file.to_string_lossy().into_owned(),
+                "--dry-run".into(),
+                "--output".into(),
+                "json".into(),
+            ],
+            root.clone(),
+        );
+        assert_eq!(outcome.code, 0, "{}", outcome.stdout);
+        assert!(outcome.stdout.contains("\"dry_run\":true"));
+        let _ = std::fs::remove_dir_all(root);
     }
 }
