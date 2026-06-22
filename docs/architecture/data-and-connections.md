@@ -1,6 +1,6 @@
 # Data and Connections
 
-> **Target architecture.** The current scaffold has a memory-mapped query-name corpus but no HTTP connection pool yet. Its DNS load engine already gives each connection actor its own socket — one connected UDP socket, or one TCP/TLS stream multiplexing many in-flight queries — which is consistent with the ownership model below.
+> **Mixed status.** The current implementation has a memory-mapped query-name corpus, a shared Hyper HTTP pool, and a DNS load engine that gives each connection actor its own socket. HTTP execution still sends only one request per run, so multi-request pool behavior and the broader connection policies below remain target work.
 
 ## Corpus Memory and Randomization
 
@@ -36,7 +36,7 @@ memory = corpus bytes
 memory != workers * entire corpus
 ```
 
-The run records its seed and selection mode for reproducibility.
+The corpus crate implements sequential selection, random sampling with replacement, and seeded visit-each-once permutation. The current `load` command exposes sequential mode and `--randomize` sampling with replacement; it accepts a seed but does not yet emit the seed or selection mode in results.
 
 ## Connection Ownership
 

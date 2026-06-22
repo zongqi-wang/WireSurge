@@ -19,7 +19,8 @@
 # Delivery
 
 - [Implementation Plan](implementation-plan.md)
-- [Load Engine Plan](load-engine-plan.md)
+- [Desktop UI Plan](ui-plan.md)
+- [Load Engine](load-engine.md)
 
 # Reference
 

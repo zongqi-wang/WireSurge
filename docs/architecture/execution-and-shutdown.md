@@ -1,6 +1,6 @@
 # Execution and Shutdown
 
-> **Mixed status.** HTTP and DNS now run on Tokio, use cancellation tokens, and share async signal handling. The HTTP engine remains single-request, and the supervisor, bounded queues, drain deadlines, and hierarchical task ownership below are target architecture.
+> **Mixed status.** HTTP and DNS run on Tokio, use cancellation tokens, and share async signal handling. The load engine owns one task per connection, bounds in-flight work, and can publish process-local snapshots. The HTTP engine remains single-request, and the supervisor, configurable drain deadlines, and hierarchical task ownership below are target architecture.
 
 ## Tasks, Threads, and Ownership
 
@@ -81,3 +81,5 @@ Shutdown order:
 6. The desktop escalates from IPC cancellation to process termination and then process kill when deadlines are missed.
 
 `std::process::exit` is not the normal shutdown path because it skips destructors. Forced process termination is a fallback, not a cleanup mechanism.
+
+The current `load` path stops admission on Ctrl-C or SIGTERM, allows each actor up to 250 ms to collect in-flight results, calls the connection drain hook, emits final metrics, and returns the signal-derived exit code. It does not yet implement the full state machine, repeated-signal escalation, configurable grace periods, or reconnect during a run.
