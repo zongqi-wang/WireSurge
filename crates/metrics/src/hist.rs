@@ -1,8 +1,11 @@
 use hdrhistogram::Histogram;
 
+use crate::WorkerStats;
+
 /// Per-connection load recorder. One lives inside each connection actor and is
 /// merged into an aggregate off the hot path, so the high-rate send/receive
 /// loop never contends on a shared lock.
+#[derive(Clone)]
 pub struct LoadRecorder {
     pub sent: u64,
     pub received: u64,
@@ -88,6 +91,43 @@ impl LoadRecorder {
 
     pub fn percentile_ms(&self, quantile: f64) -> f64 {
         self.hist.value_at_quantile(quantile) as f64 / 1000.0
+    }
+
+    pub fn noerror(&self) -> u64 {
+        self.rcodes[0]
+    }
+
+    /// Per-worker view for a snapshot. Each actor holds one socket, so
+    /// `open_connections` is 1 while connected (0 if the connect failed) and
+    /// `in_flight` is the live query-queue depth.
+    pub fn snapshot_worker(
+        &self,
+        id: impl Into<String>,
+        status: &str,
+        elapsed_s: f64,
+        in_flight: u64,
+    ) -> WorkerStats {
+        let rate = |count: u64| {
+            if elapsed_s > 0.0 {
+                count as f64 / elapsed_s
+            } else {
+                0.0
+            }
+        };
+        let open_connections = u64::from(status != "failed");
+        WorkerStats {
+            id: id.into(),
+            status: status.to_string(),
+            qps: rate(self.sent),
+            rps: rate(self.received),
+            p50_ms: self.percentile_ms(0.50),
+            p95_ms: self.percentile_ms(0.95),
+            p99_ms: self.percentile_ms(0.99),
+            error_rate: rate(self.errors + self.conn_errors),
+            timeout_rate: rate(self.timeouts),
+            open_connections,
+            in_flight,
+        }
     }
 
     /// Non-zero rcode counts keyed by name (unknown rcodes as `rcodeN`).

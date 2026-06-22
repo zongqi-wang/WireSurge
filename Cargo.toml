@@ -25,6 +25,7 @@ rust-version = "1.94"
 # (color, suggestions, wrap_help) and clap drops ANSI on non-TTY so the
 # --output json path stays clean. TLS uses rustls with the ring provider.
 clap = { version = "*", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "color", "suggestions", "wrap_help"] }
+comfy-table = { version = "*", default-features = false }
 data-encoding = { version = "*", default-features = false, features = ["std"] }
 futures-util = { version = "*", default-features = false, features = ["std", "async-await"] }
 hdrhistogram = { version = "*", default-features = false }
@@ -33,6 +34,7 @@ http-body-util = { version = "*", default-features = false }
 hyper = { version = "*", default-features = false, features = ["client", "http1", "http2"] }
 hyper-rustls = { version = "*", default-features = false, features = ["http1", "http2", "native-tokio", "ring", "tls12"] }
 hyper-util = { version = "*", default-features = false, features = ["client", "client-legacy", "http1", "http2", "tokio"] }
+indicatif = { version = "*", default-features = false }
 memmap2 = { version = "*" }
 rustls = { version = "*", default-features = false, features = ["std", "ring", "tls12"] }
 rustls-native-certs = { version = "*" }
