@@ -78,14 +78,14 @@ enum Command {
 
 #[derive(Args)]
 struct LoadArgs {
-    /// Server address; pod IP:port the socket actually opens.
+    /// Server address; host IP:port the socket actually opens.
     server: String,
     #[arg(long, value_name = "udp|tcp|dot|doh", default_value = "udp")]
     protocol: String,
     #[arg(long, default_value_t = 53)]
     port: u16,
     /// DoH endpoint URL (required for --protocol doh), e.g.
-    /// https://resolver.example/dns-query. The socket still opens to <server>;
+    /// https://dns.example/dns-query. The socket still opens to <server>;
     /// the URL host becomes the default SNI and the HTTP :authority.
     #[arg(long)]
     url: Option<String>,
@@ -126,12 +126,13 @@ struct LoadArgs {
     /// Extra DoH URL query parameter as KEY=VALUE; repeatable. DoH only.
     #[arg(long = "http-param", value_name = "KEY=VALUE")]
     http_params: Vec<String>,
-    /// PROXY protocol v2 source (mocked customer) as IP:PORT, e.g.
+    /// PROXY protocol v2 source (the spoofed client address) as IP:PORT, e.g.
     /// 192.0.2.10:50000. Requires --proxy-dst. Stream transports send a
     /// connection preamble; UDP prefixes every datagram.
     #[arg(long = "proxy-src", value_name = "IP:PORT")]
     proxy_src: Option<String>,
-    /// PROXY protocol v2 destination (NLB VIP) as IP:PORT. Requires --proxy-src.
+    /// PROXY protocol v2 destination (the advertised server address) as IP:PORT.
+    /// Requires --proxy-src.
     #[arg(long = "proxy-dst", value_name = "IP:PORT")]
     proxy_dst: Option<String>,
     /// TLS SNI for DoT/DoH; defaults to the DoH URL host, else the server IP.
@@ -448,7 +449,7 @@ fn build_doh_target(args: &LoadArgs, addr: SocketAddr) -> Result<ConnectTarget> 
     let raw = args.url.as_deref().ok_or_else(|| {
         WireSurgeError::new(
             "doh_url_required",
-            "--protocol doh requires --url, e.g. https://resolver.example/dns-query",
+            "--protocol doh requires --url, e.g. https://dns.example/dns-query",
         )
         .at("url")
     })?;
@@ -535,8 +536,8 @@ fn build_doh_target(args: &LoadArgs, addr: SocketAddr) -> Result<ConnectTarget> 
 }
 
 /// Parse the optional PROXY v2 source/destination pair. Both endpoints are
-/// required together. The header carries a mocked customer source and the
-/// resolver's NLB VIP destination, independent of the socket peer the run
+/// required together. The header carries a spoofed client source and the
+/// advertised server destination, independent of the socket peer the run
 /// actually opens to. It rides every protocol: a stream connection
 /// (TCP/DoT/DoH) writes it as the connection preamble, a UDP transport prepends
 /// it to each datagram.

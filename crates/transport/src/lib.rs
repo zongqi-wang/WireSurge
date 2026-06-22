@@ -63,10 +63,10 @@ pub struct HttpTemplate {
 }
 
 /// Where a connection is established and how it is framed before the carried
-/// protocol begins. The `tcp_addr` is always the real socket peer (e.g. the
-/// pod), independent of any PROXY-protocol source/destination addresses added
-/// in a later stage. When `tls` is set, the stream is wrapped with TLS using
-/// `sni` for the server name and `proto` for ALPN.
+/// protocol begins. The `tcp_addr` is always the real socket peer (the host
+/// under test), independent of any PROXY-protocol source/destination addresses
+/// added in a later stage. When `tls` is set, the stream is wrapped with TLS
+/// using `sni` for the server name and `proto` for ALPN.
 #[derive(Clone)]
 pub struct ConnectTarget {
     pub tcp_addr: SocketAddr,
