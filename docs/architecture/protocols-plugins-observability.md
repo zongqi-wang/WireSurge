@@ -1,6 +1,6 @@
 # Protocols, Plugins, and Observability
 
-> **Mixed status.** A many-in-flight DNS load engine over Do53 UDP/TCP, DoT, and DoH, configurable EDNS0 options, filesystem reports, basic redaction, and runner snapshots exist. The composable stage engine, broader protocol set, sandboxed plugins, and live observability pipeline are target features.
+> **Mixed status.** A many-in-flight DNS load engine over Do53 UDP/TCP, DoT, and DoH, configurable EDNS0 options, PROXY v2 framing, live load snapshots, filesystem reports, basic redaction, and runner snapshots exist. The composable stage engine, broader protocol set, sandboxed plugins, and IPC observability pipeline are target features.
 
 ## Protocol Stages
 
@@ -16,7 +16,7 @@ Best-in-class packet rate and arbitrary stack composition pull in different dire
 
 ### Current DNS boundary
 
-`hickory-proto` owns DNS names, record types, complete message construction/parsing, and EDNS0 encoding. WireSurge owns Tokio socket choice, the per-connection actor and its many-in-flight multiplexer, pacing, deadlines, cancellation, and run metrics. The `load` engine runs over a protocol-agnostic `Transport`/`Connection` seam with Do53 UDP/TCP, DoT, and DoH implementations; replies are correlated by transaction id on Do53/DoT and by HTTP/2 stream on DoH, and a response is counted once its header validates (rcode, response bit, opcode). An EDNS option is a caller-selected `u16` code plus raw bytes; the `--token` auth credential rides EDNS option 65184 on DoT and the `?token=` URL query on DoH. DNS-over-QUIC is reserved for a later transport phase.
+`hickory-proto` owns DNS names, record types, complete message construction/parsing, and EDNS0 encoding. WireSurge owns Tokio socket choice, the per-connection actor and its many-in-flight multiplexer, pacing, deadlines, cancellation, and run metrics. The `load` engine runs over a protocol-agnostic `Transport`/`Connection` seam with Do53 UDP/TCP, DoT, and DoH implementations; replies are correlated by transaction id on Do53/DoT and by HTTP/2 stream on DoH, and a response is counted once its header validates (rcode, response bit, opcode). An EDNS option is a caller-selected `u16` code plus raw bytes; the `--token` credential rides EDNS option 65184 on DoT and the `?token=` URL query on DoH. PROXY v2 is a connection preamble for TCP/DoT/DoH and a per-datagram prefix for UDP. DNS-over-QUIC is reserved for a later transport phase.
 
 ## Plugin Model
 
@@ -57,7 +57,7 @@ Logging rules:
 - Redaction before display or persistence.
 - Sensitive debug capture only through an explicit warning and local-only storage.
 
-The current runner writes JSON snapshots and optional JSON/HTML reports. DNS workers record bounded HDR histograms and merge them after the run; samples outside the configured range are reported as overflows.
+The current runner writes JSON snapshots and optional JSON/HTML reports. DNS connection actors record bounded HDR histograms. Human TTY mode clones and merges those recorders for periodic aggregate/worker snapshots, while batch and JSON modes avoid that sampling path and merge once at the end. The stream is an in-process Tokio watch channel, not yet IPC, persistence, NDJSON, or a general runner aggregation service.
 
 ## Git and Reports
 
