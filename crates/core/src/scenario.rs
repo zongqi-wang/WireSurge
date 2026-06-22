@@ -19,7 +19,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 
-use crate::{RequestSpec, RequestSpecInput, Result, WireSurgeError, deserialization_error};
+use crate::{
+    RequestSpec, RequestSpecInput, Result, WireSurgeError, deserialization_error, redact_value,
+};
 
 /// A normalized, protocol-blind response. Every protocol adapter (HTTP, DNS,
 /// gRPC, …) maps its native result into this one shape, so templating,
@@ -319,11 +321,16 @@ pub fn evaluate(expect: &Expect, response: &CallResponse) -> Result<()> {
     }
     if let Some(body_eq) = &expect.body_eq {
         match body_eq.selector.resolve_value(response) {
-            Some(actual) if actual == body_eq.value => {}
+            Some(actual) if values_match(&actual, &body_eq.value) => {}
             Some(actual) => {
+                // `actual` comes straight from the response body, which is
+                // redacted elsewhere; redact it here too so a failure message
+                // does not echo a credential the body view masks.
                 return Err(assertion_failed(format!(
-                    "expected {} to equal {}, got {actual}",
-                    body_eq.raw, body_eq.value
+                    "expected {} to equal {}, got {}",
+                    body_eq.raw,
+                    body_eq.value,
+                    redact_value(&actual.to_string(), &[])
                 )));
             }
             None => {
@@ -339,6 +346,24 @@ pub fn evaluate(expect: &Expect, response: &CallResponse) -> Result<()> {
 
 fn assertion_failed(message: String) -> WireSurgeError {
     WireSurgeError::new("assertion_failed", message)
+}
+
+/// Compare an expected value against one resolved from a response. JSON numbers
+/// compare by numeric value, so a body that serializes an integer as `5.0`
+/// still matches an expected `5`; integers compare losslessly (an `f64` bridge
+/// would alias distinct values above 2^53). Every other type compares
+/// structurally.
+fn values_match(actual: &serde_json::Value, expected: &serde_json::Value) -> bool {
+    if let (Some(a), Some(b)) = (actual.as_i64(), expected.as_i64()) {
+        return a == b;
+    }
+    if let (Some(a), Some(b)) = (actual.as_u64(), expected.as_u64()) {
+        return a == b;
+    }
+    if let (Some(a), Some(b)) = (actual.as_f64(), expected.as_f64()) {
+        return a == b;
+    }
+    actual == expected
 }
 
 /// A single request to run, with optional templating variables and an optional
@@ -412,10 +437,22 @@ struct RunSpecInput {
     vars: BTreeMap<String, String>,
     #[serde(default)]
     expect: Option<ExpectInput>,
+    // `flatten` forbids `deny_unknown_fields`, so a mistyped top-level key (e.g.
+    // `expct:`) would otherwise be silently dropped — a false-green assertion.
+    // Catch the leftovers here and reject them in `into_run_spec`.
+    #[serde(flatten)]
+    unknown: BTreeMap<String, serde_json::Value>,
 }
 
 impl RunSpecInput {
     fn into_run_spec(self) -> Result<RunSpec> {
+        if let Some(field) = self.unknown.keys().next() {
+            return Err(WireSurgeError::new(
+                "invalid_request",
+                format!("unknown field '{field}'"),
+            )
+            .at(field.to_string()));
+        }
         // A run file carries an explicit id (it is a saved request), so require
         // id/name/url here rather than synthesizing one. Defer scheme/method
         // validation to post-expansion (the raw fields may be templates).
@@ -709,5 +746,65 @@ expect:
         let error =
             RunSpec::from_yaml("id: r\nname: r\nurl: http://x\nexpect:\n  stat: 200\n").unwrap_err();
         assert_eq!(error.code, "invalid_yaml");
+    }
+
+    #[test]
+    fn run_spec_rejects_unknown_top_level_field() {
+        // A mistyped `expct:` must not be silently dropped (which would skip the
+        // assertion and exit 0) — `flatten` would otherwise swallow it.
+        let error = RunSpec::from_yaml(
+            "id: r\nname: r\nurl: http://x\nexpct:\n  status: 200\n",
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "invalid_request");
+        assert_eq!(error.path.as_deref(), Some("expct"));
+    }
+
+    #[test]
+    fn evaluate_body_eq_matches_int_and_float() {
+        let response = CallResponse::with_status(200, r#"{"count":5.0}"#);
+        let expect = Expect {
+            status: None,
+            body_eq: Some(BodyEq {
+                selector: Selector::parse("body:/count").unwrap(),
+                value: serde_json::json!(5),
+                raw: "body:/count".to_string(),
+            }),
+        };
+        assert!(evaluate(&expect, &response).is_ok());
+    }
+
+    #[test]
+    fn evaluate_body_eq_distinguishes_large_integers() {
+        // Two distinct u64 values above 2^53 must not alias through an f64.
+        let response = CallResponse::with_status(200, r#"{"id":9007199254740993}"#);
+        let expect = Expect {
+            status: None,
+            body_eq: Some(BodyEq {
+                selector: Selector::parse("body:/id").unwrap(),
+                value: serde_json::json!(9007199254740992u64),
+                raw: "body:/id".to_string(),
+            }),
+        };
+        assert_eq!(
+            evaluate(&expect, &response).unwrap_err().code,
+            "assertion_failed"
+        );
+    }
+
+    #[test]
+    fn evaluate_body_eq_redacts_marker_value_in_failure() {
+        let response = CallResponse::with_status(200, r#"{"token":"live-secret"}"#);
+        let expect = Expect {
+            status: None,
+            body_eq: Some(BodyEq {
+                selector: Selector::parse("body:/token").unwrap(),
+                value: serde_json::json!("x"),
+                raw: "body:/token".to_string(),
+            }),
+        };
+        let error = evaluate(&expect, &response).unwrap_err();
+        assert_eq!(error.code, "assertion_failed");
+        assert!(!error.message.contains("live-secret"), "{}", error.message);
     }
 }

@@ -68,7 +68,7 @@ fn report(label: &str, before: Counts, after: Counts, elapsed: Duration, n: usiz
 }
 
 fn wire() -> Arc<[u8]> {
-    build_query(0, "example.com", 1, None).unwrap().into()
+    build_query(0, "example.com", 1, &[]).unwrap().into()
 }
 
 /// Scenario 1: DoH per-query request assembly (URI parse + body + headers), no

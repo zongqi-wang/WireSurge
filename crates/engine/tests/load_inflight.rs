@@ -53,7 +53,7 @@ async fn many_in_flight_beats_one_in_flight() {
         count: Some(count),
         randomize: false,
         seed: 0,
-        edns_option: None,
+        edns_options: Vec::new(),
     };
 
     let started = std::time::Instant::now();
@@ -88,7 +88,7 @@ async fn duration_mode_stops_and_counts() {
         count: None,
         randomize: false,
         seed: 7,
-        edns_option: None,
+        edns_options: Vec::new(),
     };
     let stats = run_load(config, CancellationToken::new()).await.unwrap();
     assert!(stats.recorder.received > 0);

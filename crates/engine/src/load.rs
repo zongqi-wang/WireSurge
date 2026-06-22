@@ -66,8 +66,8 @@ pub struct LoadConfig {
     pub count: Option<u64>,
     pub randomize: bool,
     pub seed: u64,
-    /// EDNS0 OPT option attached to every query (all transports), or `None`.
-    pub edns_option: Option<EdnsOption>,
+    /// EDNS0 OPT options attached to every query (all transports); empty for none.
+    pub edns_options: Vec<EdnsOption>,
 }
 
 impl LoadConfig {
@@ -359,7 +359,7 @@ pub async fn run_load_with_progress(
 ) -> Result<LoadStats> {
     config.validate()?;
 
-    let edns_option = config.edns_option.as_ref();
+    let edns_options = config.edns_options.as_slice();
 
     // Encode every corpus row's wire message once, before the run clock starts,
     // so the hot path only clones a prebuilt buffer and a large corpus cannot
@@ -369,7 +369,7 @@ pub async fn run_load_with_progress(
         .corpus
         .iter_rows()
         .map(|name| {
-            wiresurge_dns::build_query(0, name, config.qtype, edns_option).map(Arc::<[u8]>::from)
+            wiresurge_dns::build_query(0, name, config.qtype, edns_options).map(Arc::<[u8]>::from)
         })
         .collect::<Result<Vec<_>>>()?;
 

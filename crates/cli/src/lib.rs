@@ -120,9 +120,9 @@ struct LoadArgs {
     #[arg(long, default_value_t = 0)]
     seed: u64,
     /// EDNS0 OPT option attached to every query, as CODE:VALUE (decimal code,
-    /// UTF-8 value), e.g. 65001:hello.
+    /// UTF-8 value), e.g. 65001:hello; repeatable.
     #[arg(long = "edns-option", value_name = "CODE:VALUE")]
-    edns_option: Option<String>,
+    edns_options: Vec<String>,
     /// Extra DoH URL query parameter as KEY=VALUE; repeatable. DoH only.
     #[arg(long = "http-param", value_name = "KEY=VALUE")]
     http_params: Vec<String>,
@@ -369,7 +369,7 @@ fn build_load_config(args: &LoadArgs) -> Result<LoadConfig> {
         )
         .at("http-param"));
     }
-    let edns_option = parse_edns_option(args.edns_option.as_deref())?;
+    let edns_options = parse_edns_options(&args.edns_options)?;
     let proxy = build_proxy_header(args)?;
     let mut target = if is_dot {
         let config = build_client_config(&TlsParams {
@@ -407,36 +407,38 @@ fn build_load_config(args: &LoadArgs) -> Result<LoadConfig> {
         count: args.count,
         randomize: args.randomize,
         seed: args.seed,
-        edns_option,
+        edns_options,
     };
     config.validate()?;
     Ok(config)
 }
 
-/// Parse `--edns-option CODE:VALUE` into an `EdnsOption` (decimal code, UTF-8
-/// value bytes). `None` in, `None` out.
-fn parse_edns_option(spec: Option<&str>) -> Result<Option<EdnsOption>> {
-    let Some(spec) = spec else {
-        return Ok(None);
-    };
-    let (code, value) = spec.split_once(':').ok_or_else(|| {
-        WireSurgeError::new(
-            "invalid_edns_option",
-            format!("--edns-option must be CODE:VALUE, got {spec}"),
-        )
-        .at("edns-option")
-    })?;
-    let code = code.parse::<u16>().map_err(|_| {
-        WireSurgeError::new(
-            "invalid_edns_option",
-            format!("--edns-option code must be 0-65535, got {code}"),
-        )
-        .at("edns-option")
-    })?;
-    Ok(Some(EdnsOption {
-        code,
-        payload: value.as_bytes().to_vec(),
-    }))
+/// Parse each `--edns-option CODE:VALUE` into an `EdnsOption` (decimal code,
+/// UTF-8 value bytes).
+fn parse_edns_options(specs: &[String]) -> Result<Vec<EdnsOption>> {
+    specs
+        .iter()
+        .map(|spec| {
+            let (code, value) = spec.split_once(':').ok_or_else(|| {
+                WireSurgeError::new(
+                    "invalid_edns_option",
+                    format!("--edns-option must be CODE:VALUE, got {spec}"),
+                )
+                .at("edns-option")
+            })?;
+            let code = code.parse::<u16>().map_err(|_| {
+                WireSurgeError::new(
+                    "invalid_edns_option",
+                    format!("--edns-option code must be 0-65535, got {code}"),
+                )
+                .at("edns-option")
+            })?;
+            Ok(EdnsOption {
+                code,
+                payload: value.as_bytes().to_vec(),
+            })
+        })
+        .collect()
 }
 
 /// Build a DoH connect target from the load args. The socket opens to `addr`,
@@ -507,6 +509,13 @@ fn build_doh_target(args: &LoadArgs, addr: SocketAddr) -> Result<ConnectTarget> 
             )
             .at("http-param")
         })?;
+        if key.is_empty() {
+            return Err(WireSurgeError::new(
+                "invalid_http_param",
+                "--http-param key must not be empty",
+            )
+            .at("http-param"));
+        }
         query_url.query_pairs_mut().append_pair(key, value);
     }
     let query = query_url.query().unwrap_or("").to_string();
@@ -983,6 +992,7 @@ async fn run_command(
         dry_run: args.dry_run,
         verbose: args.verbose,
         report_dir: args.report,
+        secret_values: Vec::new(),
     };
     // --var/--secret are CLI-supplied template inputs, parsed before any I/O so
     // a malformed pair fails fast with a structured error.
@@ -1663,6 +1673,34 @@ mod tests {
         );
         assert_eq!(outcome.code, 0, "{}", outcome.stdout);
         assert!(outcome.stdout.contains("\"dry_run\":true"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_redacts_secret_value_in_output() {
+        // A secret value carries no redaction marker, so it must be masked by
+        // value: it must never appear verbatim in the emitted request.
+        let (root, file) =
+            write_run_file("id: r\nname: r\nurl: \"http://127.0.0.1:9/x?k={{secrets.k}}\"\n");
+        let outcome = dispatch(
+            &[
+                "run".into(),
+                file.to_string_lossy().into_owned(),
+                "--secret".into(),
+                "k=aGVsbG8xMjM0NQ".into(),
+                "--dry-run".into(),
+                "--output".into(),
+                "json".into(),
+            ],
+            root.clone(),
+        );
+        assert_eq!(outcome.code, 0, "{}", outcome.stdout);
+        assert!(
+            !outcome.stdout.contains("aGVsbG8xMjM0NQ"),
+            "secret value leaked into output: {}",
+            outcome.stdout
+        );
+        assert!(outcome.stdout.contains("[redacted]"), "{}", outcome.stdout);
         let _ = std::fs::remove_dir_all(root);
     }
 }
