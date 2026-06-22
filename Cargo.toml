@@ -34,7 +34,6 @@ http-body-util = { version = "*", default-features = false }
 hyper = { version = "*", default-features = false, features = ["client", "http1", "http2"] }
 hyper-rustls = { version = "*", default-features = false, features = ["http1", "http2", "native-tokio", "ring", "tls12"] }
 hyper-util = { version = "*", default-features = false, features = ["client", "client-legacy", "http1", "http2", "tokio"] }
-indicatif = { version = "*", default-features = false }
 memmap2 = { version = "*" }
 rustls = { version = "*", default-features = false, features = ["std", "ring", "tls12"] }
 rustls-native-certs = { version = "*" }

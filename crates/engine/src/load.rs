@@ -190,8 +190,7 @@ async fn run_actor<T: Transport>(
     let conn_ref = &conn;
     let mut inflight = FuturesUnordered::new();
 
-    // No slot means no interval, so the tick arm never fires: zero cost on the
-    // measurement path.
+    // No slot -> no interval -> no tick: zero cost on the measurement path.
     let mut ticker = slot.as_ref().map(|(_, interval)| {
         let mut ticker = tokio::time::interval(*interval);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
