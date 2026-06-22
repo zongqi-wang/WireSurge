@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -5,6 +6,74 @@ use wiresurge_core::{Result, serialize_json};
 
 mod hist;
 pub use hist::LoadRecorder;
+
+/// Point-in-time sample of a `load` run: aggregate plus one `WorkerStats` per
+/// connection actor. `final_sample` marks the end-of-run frame.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct RunSnapshot {
+    pub elapsed_s: f64,
+    pub final_sample: bool,
+    pub aggregate: AggregateStats,
+    pub workers: Vec<WorkerStats>,
+}
+
+impl RunSnapshot {
+    pub fn to_json(&self) -> Result<String> {
+        serialize_json(self)
+    }
+}
+
+/// Run-wide totals at a point in time. Rates are cumulative (counts over
+/// `elapsed_s`); an instantaneous rate is derived by differencing two samples.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct AggregateStats {
+    pub sent: u64,
+    pub received: u64,
+    pub timeouts: u64,
+    pub errors: u64,
+    pub conn_errors: u64,
+    pub truncated: u64,
+    pub bytes_in: u64,
+    pub in_flight: u64,
+    pub noerror: u64,
+    pub recv_qps: f64,
+    pub noerror_qps: f64,
+    pub rcodes: BTreeMap<String, u64>,
+    pub p50_ms: f64,
+    pub p95_ms: f64,
+    pub p99_ms: f64,
+    pub max_ms: f64,
+}
+
+impl AggregateStats {
+    pub fn from_recorder(recorder: &LoadRecorder, elapsed_s: f64, in_flight: u64) -> Self {
+        let rate = |count: u64| {
+            if elapsed_s > 0.0 {
+                count as f64 / elapsed_s
+            } else {
+                0.0
+            }
+        };
+        Self {
+            sent: recorder.sent,
+            received: recorder.received,
+            timeouts: recorder.timeouts,
+            errors: recorder.errors,
+            conn_errors: recorder.conn_errors,
+            truncated: recorder.truncated,
+            bytes_in: recorder.bytes_in,
+            in_flight,
+            noerror: recorder.noerror(),
+            recv_qps: rate(recorder.received),
+            noerror_qps: rate(recorder.noerror()),
+            rcodes: recorder.rcode_breakdown(),
+            p50_ms: recorder.percentile_ms(0.50),
+            p95_ms: recorder.percentile_ms(0.95),
+            p99_ms: recorder.percentile_ms(0.99),
+            max_ms: recorder.max_ms(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WorkerStats {
@@ -18,6 +87,7 @@ pub struct WorkerStats {
     pub error_rate: f64,
     pub timeout_rate: f64,
     pub open_connections: u64,
+    pub in_flight: u64,
 }
 
 impl WorkerStats {
@@ -33,6 +103,7 @@ impl WorkerStats {
             error_rate: 0.0,
             timeout_rate: 0.0,
             open_connections: 0,
+            in_flight: 0,
         }
     }
 
@@ -234,5 +305,30 @@ mod tests {
         let json = stats.to_json().unwrap();
         assert!(json.contains("\"active_run_id\":\"run-1\""));
         assert!(json.contains("worker-1"));
+    }
+
+    #[test]
+    fn run_snapshot_serializes_aggregate_and_workers() {
+        let mut recorder = LoadRecorder::default();
+        recorder.on_sent();
+        recorder.on_response(0, false, 64, 1_000);
+        let worker = recorder.snapshot_worker("worker-0", "done", 2.0, 0);
+        let snapshot = RunSnapshot {
+            elapsed_s: 2.0,
+            final_sample: true,
+            aggregate: AggregateStats::from_recorder(&recorder, 2.0, 0),
+            workers: vec![worker],
+        };
+
+        let json = snapshot.to_json().unwrap();
+        assert!(json.contains("\"elapsed_s\":2.0"));
+        assert!(json.contains("\"final_sample\":true"));
+        assert!(json.contains("\"aggregate\""));
+        assert!(json.contains("\"workers\""));
+        assert!(json.contains("worker-0"));
+        assert!(json.contains("\"p99_ms\""));
+        assert_eq!(snapshot.aggregate.received, 1);
+        assert_eq!(snapshot.aggregate.recv_qps, 0.5);
+        assert_eq!(snapshot.aggregate.noerror_qps, 0.5);
     }
 }

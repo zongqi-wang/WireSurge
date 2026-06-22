@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -6,15 +7,21 @@ use std::net::{SocketAddr, ToSocketAddrs};
 
 use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{Args, Parser, Subcommand};
+use comfy_table::{Cell, ContentArrangement, Table, presets::UTF8_FULL};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use url::{Position, Url};
 use wiresurge_core::{RequestSpec, Result, WireSurgeError, schema_for, serialize_json};
 use wiresurge_corpus::Corpus;
 use wiresurge_dns::parse_qtype;
-use wiresurge_engine::load::{LoadConfig, LoadProto, LoadStats, run_load};
+use wiresurge_engine::load::{
+    LoadConfig, LoadProto, LoadStats, ProgressConfig, run_load, run_load_with_progress,
+};
 use wiresurge_engine::{
     RunOptions, run_request_with_cancellation, run_stored_request_with_cancellation,
 };
+use wiresurge_metrics::RunSnapshot;
 use wiresurge_plugins::PluginManifestDraft;
 use wiresurge_storage::WorkspaceStore;
 use wiresurge_transport::{
@@ -133,6 +140,13 @@ struct LoadArgs {
     /// Skip TLS certificate verification (self-signed test targets only).
     #[arg(long)]
     insecure: bool,
+    /// Suppress the live progress line even on a TTY (banner and final summary
+    /// still print). Progress is always off under --output json or non-TTY.
+    #[arg(long = "no-progress")]
+    no_progress: bool,
+    /// Live progress refresh interval in milliseconds.
+    #[arg(long = "progress-interval", value_name = "MS", default_value_t = 1000)]
+    progress_interval_ms: u64,
 }
 
 #[derive(Args)]
@@ -526,19 +540,34 @@ fn parse_proxy_addr(value: &str, field: &str) -> Result<SocketAddr> {
 
 async fn load_command(args: LoadArgs, output_json: bool) -> Result<(String, i32)> {
     let config = build_load_config(&args)?;
+
+    let progress_enabled = !output_json && !args.no_progress && std::io::stderr().is_terminal();
+    if !output_json {
+        eprintln!("{}", format_load_banner(&args, &config));
+    }
+
     let cancellation = CancellationToken::new();
-    let execution = run_load(config, cancellation.clone());
-    tokio::pin!(execution);
-    let signal = shutdown_signal();
-    tokio::pin!(signal);
-    let (mut stats, exit_code) = tokio::select! {
-        result = &mut execution => (result?, 0),
-        signal_code = &mut signal => {
-            let signal_code = signal_code?;
-            cancellation.cancel();
-            (execution.await?, signal_code)
-        }
+    let (mut stats, exit_code) = if progress_enabled {
+        // Floor the interval: each tick clones every actor's histogram under its
+        // slot lock, so a sub-50ms cadence at high -c would perturb the very
+        // throughput it measures.
+        let interval = Duration::from_millis(args.progress_interval_ms.max(50));
+        let (tx, rx) = watch::channel(RunSnapshot::default());
+        let renderer = tokio::spawn(render_progress(rx));
+        let execution = run_load_with_progress(
+            config,
+            cancellation.clone(),
+            Some((ProgressConfig { interval }, tx)),
+        );
+        let result = drive_with_signal(execution, &cancellation).await;
+        renderer.abort();
+        let _ = renderer.await;
+        result?
+    } else {
+        let execution = run_load(config, cancellation.clone());
+        drive_with_signal(execution, &cancellation).await?
     };
+
     stats.cancelled |= exit_code != 0;
     let output = if output_json {
         stats.to_json()?
@@ -546,6 +575,106 @@ async fn load_command(args: LoadArgs, output_json: bool) -> Result<(String, i32)
         format_load_text(&stats)
     };
     Ok((output, exit_code))
+}
+
+async fn drive_with_signal<F>(
+    execution: F,
+    cancellation: &CancellationToken,
+) -> Result<(LoadStats, i32)>
+where
+    F: std::future::Future<Output = Result<LoadStats>>,
+{
+    tokio::pin!(execution);
+    let signal = shutdown_signal();
+    tokio::pin!(signal);
+    tokio::select! {
+        result = &mut execution => Ok((result?, 0)),
+        signal_code = &mut signal => {
+            let signal_code = signal_code?;
+            cancellation.cancel();
+            Ok((execution.await?, signal_code))
+        }
+    }
+}
+
+fn format_load_banner(args: &LoadArgs, config: &LoadConfig) -> String {
+    let query = match &args.corpus {
+        Some(path) => format!("corpus {}", path.display()),
+        None => format!("{} {}", args.name, args.qtype),
+    };
+    let stop = match (args.duration_s, args.count) {
+        (Some(secs), _) => format!("{secs}s"),
+        (_, Some(count)) => format!("{count} queries"),
+        _ => "until stopped".to_string(),
+    };
+    let proxy = match config.target.proxy.is_some() {
+        true => "on",
+        false => "off",
+    };
+    let token = match config.token.is_some() {
+        true => "set",
+        false => "none",
+    };
+    let mut line = format!(
+        "wiresurge load -> {} | {} | -c {} -q {} (in-flight {}) | query {} | stop {} | proxy {} | token {}",
+        config.target.tcp_addr,
+        args.protocol,
+        config.concurrency,
+        config.in_flight,
+        config.concurrency * config.in_flight,
+        query,
+        stop,
+        proxy,
+        token,
+    );
+    if let Some(qps) = args.qps {
+        line.push_str(&format!(" | qps-cap {qps:.0}"));
+    }
+    line
+}
+
+async fn render_progress(mut rx: watch::Receiver<RunSnapshot>) {
+    let bar = ProgressBar::new_spinner();
+    bar.set_draw_target(ProgressDrawTarget::stderr());
+    bar.set_style(
+        ProgressStyle::with_template("{spinner} {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    let mut prev: Option<RunSnapshot> = None;
+    while rx.changed().await.is_ok() {
+        let snap = rx.borrow().clone();
+        // Final frame is rendered as the summary table, not here; the empty t=0
+        // seed has nothing to show.
+        if snap.final_sample || snap.elapsed_s == 0.0 {
+            continue;
+        }
+        // Both rates use the same delta window so the (inst) label is honest;
+        // the first frame has no prior, so fall back to the cumulative rate.
+        let (recv_qps, noerror_qps) = match &prev {
+            Some(p) if snap.elapsed_s > p.elapsed_s => {
+                let dt = snap.elapsed_s - p.elapsed_s;
+                let delta = |now: u64, was: u64| now.saturating_sub(was) as f64 / dt;
+                (
+                    delta(snap.aggregate.received, p.aggregate.received),
+                    delta(snap.aggregate.noerror, p.aggregate.noerror),
+                )
+            }
+            _ => (snap.aggregate.recv_qps, snap.aggregate.noerror_qps),
+        };
+        bar.set_message(format!(
+            "{:>5.1}s | recv {:>7.0}/s noerr {:>7.0}/s (inst) | infl {:>5} | p50 {:>5.1} p99 {:>5.1} | to {} err {}",
+            snap.elapsed_s,
+            recv_qps,
+            noerror_qps,
+            snap.aggregate.in_flight,
+            snap.aggregate.p50_ms,
+            snap.aggregate.p99_ms,
+            snap.aggregate.timeouts,
+            snap.aggregate.errors + snap.aggregate.conn_errors,
+        ));
+        prev = Some(snap);
+    }
+    bar.finish_and_clear();
 }
 
 fn format_load_text(stats: &LoadStats) -> String {
@@ -556,7 +685,7 @@ fn format_load_text(stats: &LoadStats) -> String {
         .map(|(name, count)| format!("{name} {count}"))
         .collect::<Vec<_>>()
         .join("  ");
-    format!(
+    let summary = format!(
         "duration {:.2}s  sent {}  received {}  recv_qps {:.0}  noerror_qps {:.0}\n\
          timeouts {}  errors {}  conn_errors {}  truncated {}\n\
          rcodes  {}\n\
@@ -580,7 +709,34 @@ fn format_load_text(stats: &LoadStats) -> String {
         } else {
             ""
         },
-    )
+    );
+    if stats.workers.is_empty() {
+        return summary;
+    }
+    format!("{summary}\n{}", format_worker_table(&stats.workers))
+}
+
+fn format_worker_table(workers: &[wiresurge_metrics::WorkerStats]) -> String {
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec![
+            "worker", "qps", "rps", "p50 ms", "p95 ms", "p99 ms", "err/s", "to/s",
+        ]);
+    for worker in workers {
+        table.add_row(vec![
+            Cell::new(&worker.id),
+            Cell::new(format!("{:.0}", worker.qps)),
+            Cell::new(format!("{:.0}", worker.rps)),
+            Cell::new(format!("{:.2}", worker.p50_ms)),
+            Cell::new(format!("{:.2}", worker.p95_ms)),
+            Cell::new(format!("{:.2}", worker.p99_ms)),
+            Cell::new(format!("{:.1}", worker.error_rate)),
+            Cell::new(format!("{:.1}", worker.timeout_rate)),
+        ]);
+    }
+    table.to_string()
 }
 
 #[cfg(unix)]
@@ -888,6 +1044,36 @@ mod tests {
         );
         assert_eq!(outcome.code, 1);
         assert!(outcome.stdout.contains("unknown_argument"));
+    }
+
+    #[test]
+    fn load_json_output_carries_workers() {
+        // --count 0 sends no queries, so the run completes without a server. The
+        // returned payload (stdout) must be one JSON value with the workers array;
+        // real fd-level stream cleanliness is checked in tests/load_streams.rs.
+        let outcome = dispatch(
+            &[
+                "load".into(),
+                "127.0.0.1".into(),
+                "--protocol".into(),
+                "udp".into(),
+                "--count".into(),
+                "0".into(),
+                "--output".into(),
+                "json".into(),
+            ],
+            temp_dir(),
+        );
+        assert_eq!(outcome.code, 0);
+        let value: serde_json::Value =
+            serde_json::from_str(&outcome.stdout).expect("stdout is a single JSON value");
+        assert!(
+            value.get("workers").is_some(),
+            "json carries workers: {}",
+            outcome.stdout
+        );
+        assert!(value.get("noerror_qps").is_some());
+        assert!(value["workers"].is_array());
     }
 
     #[test]
