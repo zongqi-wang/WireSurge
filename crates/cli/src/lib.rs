@@ -8,7 +8,6 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{Args, Parser, Subcommand};
 use comfy_table::{Cell, ContentArrangement, Table, presets::UTF8_FULL};
-use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use url::{Position, Url};
@@ -548,9 +547,8 @@ async fn load_command(args: LoadArgs, output_json: bool) -> Result<(String, i32)
 
     let cancellation = CancellationToken::new();
     let (mut stats, exit_code) = if progress_enabled {
-        // Floor the interval: each tick clones every actor's histogram under its
-        // slot lock, so a sub-50ms cadence at high -c would perturb the very
-        // throughput it measures.
+        // Floored: each tick clones every actor's histogram, so a sub-50ms
+        // cadence at high -c would perturb the throughput being measured.
         let interval = Duration::from_millis(args.progress_interval_ms.max(50));
         let (tx, rx) = watch::channel(RunSnapshot::default());
         let renderer = tokio::spawn(render_progress(rx));
@@ -634,22 +632,14 @@ fn format_load_banner(args: &LoadArgs, config: &LoadConfig) -> String {
 }
 
 async fn render_progress(mut rx: watch::Receiver<RunSnapshot>) {
-    let bar = ProgressBar::new_spinner();
-    bar.set_draw_target(ProgressDrawTarget::stderr());
-    bar.set_style(
-        ProgressStyle::with_template("{spinner} {msg}")
-            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
-    );
     let mut prev: Option<RunSnapshot> = None;
     while rx.changed().await.is_ok() {
         let snap = rx.borrow().clone();
-        // Final frame is rendered as the summary table, not here; the empty t=0
-        // seed has nothing to show.
+        // Final frame is shown as the summary table; the t=0 seed has nothing.
         if snap.final_sample || snap.elapsed_s == 0.0 {
             continue;
         }
-        // Both rates use the same delta window so the (inst) label is honest;
-        // the first frame has no prior, so fall back to the cumulative rate.
+        // First frame has no prior; fall back to the cumulative rate.
         let (recv_qps, noerror_qps) = match &prev {
             Some(p) if snap.elapsed_s > p.elapsed_s => {
                 let dt = snap.elapsed_s - p.elapsed_s;
@@ -661,7 +651,8 @@ async fn render_progress(mut rx: watch::Receiver<RunSnapshot>) {
             }
             _ => (snap.aggregate.recv_qps, snap.aggregate.noerror_qps),
         };
-        bar.set_message(format!(
+        // One persistent line per tick: a scrolling log, not an in-place redraw.
+        eprintln!(
             "{:>5.1}s | recv {:>7.0}/s noerr {:>7.0}/s (inst) | infl {:>5} | p50 {:>5.1} p99 {:>5.1} | to {} err {}",
             snap.elapsed_s,
             recv_qps,
@@ -671,10 +662,9 @@ async fn render_progress(mut rx: watch::Receiver<RunSnapshot>) {
             snap.aggregate.p99_ms,
             snap.aggregate.timeouts,
             snap.aggregate.errors + snap.aggregate.conn_errors,
-        ));
+        );
         prev = Some(snap);
     }
-    bar.finish_and_clear();
 }
 
 fn format_load_text(stats: &LoadStats) -> String {
@@ -1048,9 +1038,8 @@ mod tests {
 
     #[test]
     fn load_json_output_carries_workers() {
-        // --count 0 sends no queries, so the run completes without a server. The
-        // returned payload (stdout) must be one JSON value with the workers array;
-        // real fd-level stream cleanliness is checked in tests/load_streams.rs.
+        // --count 0 completes without a server; fd-level stream cleanliness is
+        // covered in tests/load_streams.rs.
         let outcome = dispatch(
             &[
                 "load".into(),
