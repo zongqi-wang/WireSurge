@@ -87,9 +87,12 @@ fn make_cfg(addr: SocketAddr, corpus: Arc<Corpus>, concurrency: usize, count: u6
 }
 
 async fn run(addr: SocketAddr, corpus: Arc<Corpus>, threads: usize, count: u64) -> LoadStats {
-    run_load(make_cfg(addr, corpus, threads, count), CancellationToken::new())
-        .await
-        .unwrap()
+    run_load(
+        make_cfg(addr, corpus, threads, count),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap()
 }
 
 fn main() {

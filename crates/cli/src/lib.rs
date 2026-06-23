@@ -12,7 +12,9 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use url::{Position, Url};
 use wiresurge_core::scenario::RunSpec;
-use wiresurge_core::{RequestSpec, Result, WireSurgeError, schema_for, serialize_json};
+use wiresurge_core::{
+    RequestSpec, Result, WireSurgeError, mask_secret_values, schema_for, serialize_json,
+};
 use wiresurge_corpus::Corpus;
 use wiresurge_dns::{EdnsOption, parse_qtype};
 use wiresurge_engine::load::{
@@ -420,16 +422,10 @@ fn parse_edns_options(specs: &[String]) -> Result<Vec<EdnsOption>> {
     specs
         .iter()
         .map(|spec| {
-            let (code, value) = spec.split_once(':').ok_or_else(|| {
-                WireSurgeError::new(
-                    "invalid_edns_option",
-                    format!("--edns-option must be CODE:VALUE, got {spec}"),
-                )
-                .at("edns-option")
-            })?;
+            let (code, value) = split_kv(spec, ':', "edns-option")?;
             let code = code.parse::<u16>().map_err(|_| {
                 WireSurgeError::new(
-                    "invalid_edns_option",
+                    "invalid_edns-option",
                     format!("--edns-option code must be 0-65535, got {code}"),
                 )
                 .at("edns-option")
@@ -503,17 +499,23 @@ fn build_doh_target(args: &LoadArgs, addr: SocketAddr) -> Result<ConnectTarget> 
     // proper percent-encoding via the url crate rather than hand-splicing.
     let mut query_url = url.clone();
     for pair in &args.http_params {
-        let (key, value) = pair.split_once('=').ok_or_else(|| {
-            WireSurgeError::new(
-                "invalid_http_param",
-                format!("--http-param must be KEY=VALUE, got {pair}"),
-            )
-            .at("http-param")
-        })?;
+        let (key, value) = split_kv(pair, '=', "http-param")?;
         if key.is_empty() {
             return Err(WireSurgeError::new(
-                "invalid_http_param",
+                "invalid_http-param",
                 "--http-param key must not be empty",
+            )
+            .at("http-param"));
+        }
+        // `dns` is the reserved DoH query payload parameter the adapter appends
+        // per query (?dns=<base64url> on GET). Letting an operator set it via
+        // --http-param yields a duplicate dns= on GET or a wrong query on POST,
+        // so reject it up front (the wire key is lowercase, so match ignoring
+        // case to catch DNS=/Dns= too).
+        if key.eq_ignore_ascii_case("dns") {
+            return Err(WireSurgeError::new(
+                "invalid_http-param",
+                "--http-param key 'dns' is reserved for the DoH query payload",
             )
             .at("http-param"));
         }
@@ -656,6 +658,25 @@ fn format_load_banner(args: &LoadArgs, config: &LoadConfig) -> String {
         None => "as fast as the target allows".to_string(),
     };
 
+    // Operator-facing recap of the optional knobs in effect: the PROXY v2
+    // header on/off, plus whether any EDNS option or extra HTTP query parameter
+    // was supplied. These are generic options, not credentials.
+    let proxy = if config.target.proxy.is_some() {
+        "on"
+    } else {
+        "off"
+    };
+    let edns = if config.edns_options.is_empty() {
+        "none"
+    } else {
+        "set"
+    };
+    let http_params = if args.http_params.is_empty() {
+        "none"
+    } else {
+        "set"
+    };
+
     let mut lines = vec![
         format!(
             "Load test: sending {query} to {} over {}.",
@@ -666,7 +687,9 @@ fn format_load_banner(args: &LoadArgs, config: &LoadConfig) -> String {
             "Using {} connections (-c), each keeping {} queries in flight (-q) = {} concurrent queries total ({rate}).",
             config.concurrency, config.in_flight, total_in_flight,
         ),
-        format!("Running {stop}."),
+        format!(
+            "Options: PROXY header {proxy}, EDNS options {edns}, HTTP params {http_params}. Running {stop}."
+        ),
     ];
     lines.push(String::new());
     lines.push(
@@ -999,6 +1022,11 @@ async fn run_command(
     // a malformed pair fails fast with a structured error.
     let cli_vars = parse_kv_pairs(&args.vars, "var")?;
     let cli_secrets = parse_kv_pairs(&args.secrets, "secret")?;
+    // Keep a copy of the secret values for envelope redaction: an error that
+    // propagates out of the run may carry an expanded request that embedded a
+    // --secret value, and the top-level {"error":...} envelope is otherwise not
+    // redacted (unlike the success/assertion paths).
+    let secret_values: Vec<String> = cli_secrets.values().cloned().collect();
 
     let cancellation = CancellationToken::new();
     let execution_cancellation = cancellation.clone();
@@ -1009,7 +1037,7 @@ async fn run_command(
             let input = fs::read_to_string(&args.target)?;
             RunSpec::from_yaml(&input)?
         } else {
-            run_spec_from_request(store.load_request(&args.target)?)
+            RunSpec::from_request(store.load_request(&args.target)?)
         };
         run_run_spec_with_cancellation(
             store,
@@ -1026,7 +1054,10 @@ async fn run_command(
     tokio::pin!(signal);
     tokio::select! {
         result = &mut execution => {
-            let result = result?;
+            // Redact any secret echoed in a propagating error's message before it
+            // reaches the top-level envelope; the success/assertion paths already
+            // redact, so this closes the error path defensively.
+            let result = result.map_err(|error| redact_error(error, &secret_values))?;
             // A failed `expect:` assertion exits 1 — the request succeeded but the
             // contract did not hold — distinct from a transport error or a signal.
             let code = if result.assertion_failed() { 1 } else { 0 };
@@ -1036,7 +1067,7 @@ async fn run_command(
             let signal_code = signal_code?;
             cancellation.cancel();
             let cancellation_error = match execution.await {
-                Err(error) => error,
+                Err(error) => redact_error(error, &secret_values),
                 Ok(_) => WireSurgeError::new("run_cancelled", "HTTP run was cancelled"),
             };
             let output = if output_json {
@@ -1049,21 +1080,32 @@ async fn run_command(
     }
 }
 
+/// Split a CLI spec once on `sep`, erroring `invalid_<flag>` ("--<flag> must be
+/// ...") on a missing separator. Shared by the three near-identical KEY=VALUE /
+/// CODE:VALUE parsers so the spec/separator handling lives in one place.
+fn split_kv<'a>(spec: &'a str, sep: char, flag: &str) -> Result<(&'a str, &'a str)> {
+    spec.split_once(sep).ok_or_else(|| {
+        let upper = flag.to_ascii_uppercase();
+        WireSurgeError::new(
+            format!("invalid_{flag}"),
+            format!("--{flag} must be {upper}{sep}VALUE, got {spec}"),
+        )
+        .at(flag.to_string())
+    })
+}
+
 /// Parse repeated `NAME=VALUE` CLI pairs into a map, rejecting a missing `=` or
-/// empty name with a structured error keyed on the flag.
+/// empty name with a structured error keyed on the flag. A repeated NAME is an
+/// error rather than a silent last-wins overwrite; the `secret` flag also
+/// rejects an empty VALUE (which would inject an empty credential and a no-op
+/// mask), while an empty `--var` value stays legal.
 fn parse_kv_pairs(
     pairs: &[String],
     flag: &str,
 ) -> Result<std::collections::BTreeMap<String, String>> {
     let mut map = std::collections::BTreeMap::new();
     for pair in pairs {
-        let (name, value) = pair.split_once('=').ok_or_else(|| {
-            WireSurgeError::new(
-                format!("invalid_{flag}"),
-                format!("--{flag} must be NAME=VALUE, got {pair}"),
-            )
-            .at(flag.to_string())
-        })?;
+        let (name, value) = split_kv(pair, '=', flag)?;
         if name.is_empty() {
             return Err(WireSurgeError::new(
                 format!("invalid_{flag}"),
@@ -1071,25 +1113,32 @@ fn parse_kv_pairs(
             )
             .at(flag.to_string()));
         }
-        map.insert(name.to_string(), value.to_string());
+        if flag == "secret" && value.is_empty() {
+            return Err(WireSurgeError::new(
+                format!("invalid_{flag}"),
+                format!("--{flag} value must not be empty for '{name}'"),
+            )
+            .at(flag.to_string()));
+        }
+        if map.insert(name.to_string(), value.to_string()).is_some() {
+            return Err(WireSurgeError::new(
+                format!("invalid_{flag}"),
+                format!("duplicate --{flag} '{name}'"),
+            )
+            .at(flag.to_string()));
+        }
     }
     Ok(map)
 }
 
-/// Lift a stored [`RequestSpec`] into a [`RunSpec`] with no `vars`/`expect`, so a
-/// stored request runs through the same templating path as a file (and can still
-/// reference `{{vars.*}}`/`{{secrets.*}}` supplied on the command line).
-fn run_spec_from_request(request: RequestSpec) -> RunSpec {
-    RunSpec {
-        id: request.id,
-        name: request.name,
-        method: request.method,
-        url: request.url,
-        headers: request.headers,
-        body: request.body,
-        vars: std::collections::BTreeMap::new(),
-        expect: None,
+/// Mask any CLI secret value that leaked into a propagating error's message,
+/// using the shared core helper so behavior matches the success-path redaction.
+/// Scoped to the run path, where the secret values are known.
+fn redact_error(mut error: WireSurgeError, secret_values: &[String]) -> WireSurgeError {
+    if !secret_values.is_empty() {
+        error.message = mask_secret_values(&error.message, secret_values);
     }
+    error
 }
 
 fn runner_command(store: &WorkspaceStore, action: Option<&str>) -> Result<String> {
@@ -1325,7 +1374,7 @@ mod tests {
             temp_dir(),
         );
         assert_eq!(outcome.code, 1);
-        assert!(outcome.stdout.contains("invalid_edns_option"));
+        assert!(outcome.stdout.contains("invalid_edns-option"));
     }
 
     #[test]
@@ -1706,5 +1755,116 @@ mod tests {
         );
         assert!(outcome.stdout.contains("[redacted]"), "{}", outcome.stdout);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_rejects_http_param_dns_reserved() {
+        // `dns` is the DoH query payload parameter the adapter owns; setting it
+        // via --http-param would collide with the per-query ?dns=, so it must be
+        // rejected (case-insensitively).
+        let outcome = dispatch(
+            &[
+                "load".into(),
+                "127.0.0.1".into(),
+                "--protocol".into(),
+                "doh".into(),
+                "--url".into(),
+                "https://dns.example/dns-query".into(),
+                "--http-param".into(),
+                "DNS=evil".into(),
+                "--count".into(),
+                "1".into(),
+                "--output".into(),
+                "json".into(),
+            ],
+            temp_dir(),
+        );
+        assert_eq!(outcome.code, 1);
+        assert!(
+            outcome.stdout.contains("invalid_http-param"),
+            "{}",
+            outcome.stdout
+        );
+        assert!(outcome.stdout.contains("reserved"), "{}", outcome.stdout);
+    }
+
+    #[test]
+    fn run_rejects_duplicate_secret_name() {
+        // A repeated --secret NAME used to silently last-wins via the BTreeMap;
+        // it must now be a structured error.
+        let (root, file) = write_run_file("id: r\nname: r\nurl: http://127.0.0.1:9/x\n");
+        let outcome = dispatch(
+            &[
+                "run".into(),
+                file.to_string_lossy().into_owned(),
+                "--secret".into(),
+                "k=first".into(),
+                "--secret".into(),
+                "k=second".into(),
+                "--dry-run".into(),
+                "--output".into(),
+                "json".into(),
+            ],
+            root.clone(),
+        );
+        assert_eq!(outcome.code, 1);
+        assert!(
+            outcome.stdout.contains("invalid_secret"),
+            "{}",
+            outcome.stdout
+        );
+        assert!(outcome.stdout.contains("duplicate"), "{}", outcome.stdout);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_rejects_empty_secret_value() {
+        // `--secret k=` injects an empty credential and a no-op mask; reject it.
+        // An empty --var value stays legal (covered implicitly elsewhere).
+        let (root, file) = write_run_file("id: r\nname: r\nurl: http://127.0.0.1:9/x\n");
+        let outcome = dispatch(
+            &[
+                "run".into(),
+                file.to_string_lossy().into_owned(),
+                "--secret".into(),
+                "k=".into(),
+                "--dry-run".into(),
+                "--output".into(),
+                "json".into(),
+            ],
+            root.clone(),
+        );
+        assert_eq!(outcome.code, 1);
+        assert!(
+            outcome.stdout.contains("invalid_secret"),
+            "{}",
+            outcome.stdout
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn redact_error_masks_secret_in_message() {
+        // The error envelope is otherwise un-redacted, so a secret echoed into a
+        // propagating error's message (e.g. an expanded URL in a transport error)
+        // must be masked before it reaches CliOutcome::err.
+        let error = WireSurgeError::new(
+            "connection_failed",
+            "failed to connect to http://127.0.0.1:9/topsecretvalue123",
+        );
+        let redacted = redact_error(error, &["topsecretvalue123".to_string()]);
+        assert!(
+            !redacted.message.contains("topsecretvalue123"),
+            "secret leaked into error message: {}",
+            redacted.message
+        );
+    }
+
+    #[test]
+    fn redact_error_noop_without_secrets() {
+        // With no secrets known, the message is returned unchanged.
+        let error = WireSurgeError::new("connection_failed", "plain message");
+        let redacted = redact_error(error, &[]);
+        assert_eq!(redacted.message, "plain message");
     }
 }
