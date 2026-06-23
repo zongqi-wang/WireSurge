@@ -9,7 +9,6 @@
 //! it directly (no libtest/criterion).
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -67,8 +66,8 @@ fn report(label: &str, before: Counts, after: Counts, elapsed: Duration, n: usiz
     );
 }
 
-fn wire() -> Arc<[u8]> {
-    build_query(0, "example.com", 1, &[]).unwrap().into()
+fn wire() -> Vec<u8> {
+    build_query(0, "example.com", 1, &[]).unwrap()
 }
 
 /// Scenario 1: DoH per-query request assembly (URI parse + body + headers), no
@@ -131,9 +130,7 @@ async fn bench_framed_tcp(n: usize, in_flight: usize) {
         .await
         .unwrap();
     let wire = wire();
-    let req = || DnsRequest {
-        wire: Arc::clone(&wire),
-    };
+    let req = || DnsRequest { wire: wire.clone() };
 
     // Warm up the connection + reader buffer.
     conn.exchange(req(), Duration::from_secs(5)).await.unwrap();

@@ -58,22 +58,37 @@ impl Connection for UdpConn {
 
     async fn exchange(
         &self,
-        request: DnsRequest,
+        mut request: DnsRequest,
         timeout: Duration,
     ) -> Result<DnsResponse, TransportError> {
         if request.wire.len() < 2 {
             return Err(TransportError::Protocol("query shorter than header".into()));
         }
-        let prefix_len = self.proxy_prefix.len();
-        let mut datagram = Vec::with_capacity(prefix_len + request.wire.len());
-        datagram.extend_from_slice(&self.proxy_prefix);
-        datagram.extend_from_slice(&request.wire);
-        let (id, notify) = self.correlator.register(&mut datagram[prefix_len..]);
-        if let Err(error) = self.socket.send(&datagram).await {
-            self.correlator.cancel(id);
-            return Err(TransportError::Io(error.to_string()));
+        if self.proxy_prefix.is_empty() {
+            // Common case: no PROXY prefix. We own `request.wire` (a fresh Vec
+            // handed out by `WorkSource::next`), so patch the transaction id in
+            // place and send it directly — zero per-query datagram allocation,
+            // matching the pre-PR #8 hot path.
+            let (id, notify) = self.correlator.register(&mut request.wire);
+            if let Err(error) = self.socket.send(&request.wire).await {
+                self.correlator.cancel(id);
+                return Err(TransportError::Io(error.to_string()));
+            }
+            self.correlator.await_response(id, notify, timeout).await
+        } else {
+            // A PROXY prefix must precede the datagram, so build a fresh buffer
+            // and patch the id into its copy of the header.
+            let prefix_len = self.proxy_prefix.len();
+            let mut datagram = Vec::with_capacity(prefix_len + request.wire.len());
+            datagram.extend_from_slice(&self.proxy_prefix);
+            datagram.extend_from_slice(&request.wire);
+            let (id, notify) = self.correlator.register(&mut datagram[prefix_len..]);
+            if let Err(error) = self.socket.send(&datagram).await {
+                self.correlator.cancel(id);
+                return Err(TransportError::Io(error.to_string()));
+            }
+            self.correlator.await_response(id, notify, timeout).await
         }
-        self.correlator.await_response(id, notify, timeout).await
     }
 
     async fn drain(&self, grace: Duration) {

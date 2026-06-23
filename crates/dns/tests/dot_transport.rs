@@ -109,7 +109,7 @@ fn target(addr: SocketAddr, relaxed: bool) -> ConnectTarget {
 
 fn request() -> DnsRequest {
     DnsRequest {
-        wire: build_query(0, "example.com", 1, &[]).unwrap().into(),
+        wire: build_query(0, "example.com", 1, &[]).unwrap(),
     }
 }
 

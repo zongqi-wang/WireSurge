@@ -1,12 +1,4 @@
 //! PROXY protocol v2 header encoding.
-//!
-//! The header attributes a connection or datagram to a carried `src`/`dst`
-//! rather than the real socket peer, so the Global Resolver applies its customer
-//! ACL to the carried source; an unspoofed query is REFUSED. A stream transport
-//! (TCP/DoT/DoH) writes it as the connection preamble; a datagram transport
-//! (Do53-UDP) prefixes every datagram. The carried transport selects byte-14's
-//! low nibble (STREAM vs DGRAM); only the v2 PROXY command over
-//! AF_INET/AF_INET6 is emitted.
 
 use std::net::SocketAddr;
 

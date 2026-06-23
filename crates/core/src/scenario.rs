@@ -35,6 +35,10 @@ use crate::{
 pub struct CallResponse {
     pub status: Option<u16>,
     pub code: Option<i32>,
+    /// Response headers. Keys MUST be stored lowercase: [`Selector::Header`]
+    /// lowercases the lookup name, so every protocol adapter's
+    /// `to_call_response` is responsible for normalizing header keys to
+    /// lowercase on ingest (a mixed-case key would be unreachable).
     pub headers: BTreeMap<String, String>,
     pub body: String,
     pub duration_ms: f64,
@@ -76,6 +80,8 @@ pub struct Scope {
     worker_id: usize,
     iteration: u64,
     extracts: BTreeMap<String, String>,
+    /// Wall-clock millis captured once at construction; the `{{uuid}}` prefix.
+    created_millis: u128,
     uuid_counter: AtomicU64,
 }
 
@@ -92,6 +98,10 @@ impl Scope {
             worker_id,
             iteration,
             extracts: BTreeMap::new(),
+            created_millis: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_millis())
+                .unwrap_or_default(),
             uuid_counter: AtomicU64::new(0),
         }
     }
@@ -137,18 +147,18 @@ impl Scope {
         }
     }
 
-    /// A fresh value, unique across workers and iterations: the run start time
-    /// plus this worker/iteration and a per-scope counter, so two workers in the
-    /// same millisecond never collide (millisecond-resolution alone would).
+    /// A fresh value for each `{{uuid}}`. Uniqueness holds WITHIN a scope (the
+    /// per-scope counter advances every call) and ACROSS workers/iterations of a
+    /// run (the `worker_id`/`iteration` fields differ). It does NOT guarantee
+    /// cross-process uniqueness: two separate processes constructing a scope in
+    /// the same millisecond with worker 0 / iteration 0 produce the same prefix
+    /// and would collide. The millis are captured once at [`Scope::new`] rather
+    /// than per call, so the value is cheap and stable within the scope.
     fn next_uuid(&self) -> String {
         let counter = self.uuid_counter.fetch_add(1, Ordering::Relaxed);
-        let millis = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis())
-            .unwrap_or_default();
         format!(
-            "{millis:x}-{:x}-{:x}-{counter:x}",
-            self.worker_id, self.iteration
+            "{:x}-{:x}-{:x}-{counter:x}",
+            self.created_millis, self.worker_id, self.iteration
         )
     }
 }
@@ -171,19 +181,45 @@ fn missing_secret(key: &str) -> WireSurgeError {
     .with_hint("Pass it with --secret NAME=VALUE; never store secret values in the file.")
 }
 
-/// Expand `{{ key }}` placeholders in `input` against `scope`. A literal `{{`
-/// is written as `\{{`. An unterminated `{{` is an error. No regex, no
-/// allocation beyond the output string.
+/// Expand `{{ key }}` placeholders in `input` against `scope`. Two escapes let a
+/// template emit characters that would otherwise be special:
+/// - `\{{` emits a literal `{{` (the template opener, expansion suppressed).
+/// - `\\{{` emits a single literal `\` immediately followed by the EXPANDED
+///   value of the template, so a literal backslash can sit directly before a
+///   template (without this, `\{{k}}` would be read as the escaped opener).
+///
+/// A `\\` (or `\`) in ANY other position is NOT an escape: every backslash is
+/// emitted verbatim. This keeps a templated JSON string like `"C:\\Users"`, a
+/// Windows path, or a regex escape (`\d`) intact rather than silently
+/// collapsing its backslashes.
+///
+/// An unterminated `{{` is an error. No regex, no allocation beyond the output
+/// string.
 pub fn expand(input: &str, scope: &Scope) -> Result<String> {
     let mut out = String::with_capacity(input.len());
     let bytes = input.as_bytes();
     let mut index = 0;
     while index < bytes.len() {
-        // Escaped opener: `\{{` emits a literal `{{`.
-        if bytes[index] == b'\\' && input[index + 1..].starts_with("{{") {
-            out.push_str("{{");
-            index += 3;
-            continue;
+        if bytes[index] == b'\\' {
+            // Escaped opener: `\{{` emits a literal `{{` (suppresses expansion).
+            if input[index + 1..].starts_with("{{") {
+                out.push_str("{{");
+                index += 3;
+                continue;
+            }
+            // `\\{{` emits one literal `\` and lets the following template
+            // expand. The escape is scoped to this case ONLY — a `\\` that is
+            // not the prefix of `\\{{` is two ordinary backslashes (see the doc
+            // comment), so we must not collapse it. Consume BOTH backslashes and
+            // leave `index` on the `{{`, which the template branch below expands.
+            if input[index + 1..].starts_with("\\{{") {
+                out.push('\\');
+                index += 2;
+                continue;
+            }
+            // Any other `\` (lone, trailing, or `\\` not before a template) is a
+            // literal backslash; fall through to the bulk literal copy below,
+            // which copies it verbatim as part of the run.
         }
         if input[index..].starts_with("{{") {
             let rest = &input[index + 2..];
@@ -198,13 +234,20 @@ pub fn expand(input: &str, scope: &Scope) -> Result<String> {
             index += 2 + end + 2;
             continue;
         }
-        // Otherwise copy one whole UTF-8 character.
-        let ch = input[index..]
-            .chars()
-            .next()
-            .expect("index points at a char boundary");
-        out.push(ch);
-        index += ch.len_utf8();
+        // Bulk-copy the literal run up to the next `{{` opener or `\` escape, so a
+        // long literal segment is one `push_str` rather than one push per char.
+        let literal = &input[index..];
+        let next = literal
+            .char_indices()
+            .skip(1)
+            .find(|(offset, _)| {
+                let tail = &literal[*offset..];
+                tail.starts_with("{{") || tail.starts_with('\\')
+            })
+            .map(|(offset, _)| offset)
+            .unwrap_or(literal.len());
+        out.push_str(&literal[..next]);
+        index += next;
     }
     Ok(out)
 }
@@ -304,8 +347,10 @@ pub struct BodyEq {
 }
 
 /// Evaluate an assertion against a response. Returns a structured
-/// `assertion_failed` error on the first mismatch (fail-fast).
-pub fn evaluate(expect: &Expect, response: &CallResponse) -> Result<()> {
+/// `assertion_failed` error on the first mismatch (fail-fast). `secret_values`
+/// holds the run's secret values so a marker-less injected secret echoed in the
+/// body cannot leak through a `body_eq` failure message.
+pub fn evaluate(expect: &Expect, response: &CallResponse, secret_values: &[String]) -> Result<()> {
     if let Some(codes) = &expect.status {
         match response.status {
             Some(status) if codes.contains(&status) => {}
@@ -332,7 +377,7 @@ pub fn evaluate(expect: &Expect, response: &CallResponse) -> Result<()> {
                     "expected {} to equal {}, got {}",
                     body_eq.raw,
                     body_eq.value,
-                    redact_value(&actual.to_string(), &[])
+                    redact_value(&actual.to_string(), secret_values)
                 )));
             }
             None => {
@@ -405,6 +450,22 @@ impl RunSpec {
             ))
         })?;
         parsed.into_run_spec()
+    }
+
+    /// Lift a stored [`RequestSpec`] into a [`RunSpec`] with no templating
+    /// variables and no assertion — the shape `wiresurge run` uses when running a
+    /// saved request as-is.
+    pub fn from_request(request: RequestSpec) -> RunSpec {
+        RunSpec {
+            id: request.id,
+            name: request.name,
+            method: request.method,
+            url: request.url,
+            headers: request.headers,
+            body: request.body,
+            vars: BTreeMap::new(),
+            expect: None,
+        }
     }
 
     /// Expand every templated field against `scope`, then build and validate a
@@ -484,12 +545,16 @@ fn missing_field(field: &'static str) -> WireSurgeError {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ExpectInput {
     #[serde(default)]
     status: Option<StatusInput>,
     #[serde(default)]
     body_eq: Option<BodyEqInput>,
+    // Match the top-level `RunSpecInput` taxonomy: capture (rather than
+    // `deny_unknown_fields`-reject) an unknown nested key so it surfaces as an
+    // `invalid_request` with a field path, not a raw `invalid_yaml` parse error.
+    #[serde(flatten)]
+    unknown: BTreeMap<String, serde_json::Value>,
 }
 
 /// `status:` accepts a single code or a list of accepted codes.
@@ -509,10 +574,30 @@ struct BodyEqInput {
 
 impl ExpectInput {
     fn into_expect(self) -> Result<Expect> {
-        let status = self.status.map(|status| match status {
-            StatusInput::One(code) => vec![code],
-            StatusInput::Many(codes) => codes,
-        });
+        if let Some(field) = self.unknown.keys().next() {
+            return Err(
+                WireSurgeError::new("invalid_request", format!("unknown field '{field}'"))
+                    .at(field.to_string()),
+            );
+        }
+        // An empty `status: []` accepts nothing — `[].contains(status)` would
+        // reject every response. Reject it at parse rather than silently
+        // dropping it (which would let a mistyped `status: []` alongside a
+        // `body_eq` pass unnoticed) or failing every run.
+        let status = match self.status {
+            Some(StatusInput::One(code)) => Some(vec![code]),
+            Some(StatusInput::Many(codes)) => {
+                if codes.is_empty() {
+                    return Err(WireSurgeError::new(
+                        "invalid_expect",
+                        "expect 'status' must list at least one accepted code",
+                    )
+                    .at("expect.status"));
+                }
+                Some(codes)
+            }
+            None => None,
+        };
         let body_eq = match self.body_eq {
             Some(input) => Some(BodyEq {
                 selector: Selector::parse(&input.path)?,
@@ -650,13 +735,13 @@ mod tests {
             status: Some(vec![200, 201]),
             body_eq: None,
         };
-        assert!(evaluate(&expect, &response).is_ok());
+        assert!(evaluate(&expect, &response, &[]).is_ok());
 
         let expect = Expect {
             status: Some(vec![200]),
             body_eq: None,
         };
-        let error = evaluate(&expect, &response).unwrap_err();
+        let error = evaluate(&expect, &response, &[]).unwrap_err();
         assert_eq!(error.code, "assertion_failed");
     }
 
@@ -671,7 +756,7 @@ mod tests {
                 raw: "body:status".to_string(),
             }),
         };
-        assert!(evaluate(&expect, &response).is_ok());
+        assert!(evaluate(&expect, &response, &[]).is_ok());
 
         let expect = Expect {
             status: None,
@@ -682,7 +767,7 @@ mod tests {
             }),
         };
         assert_eq!(
-            evaluate(&expect, &response).unwrap_err().code,
+            evaluate(&expect, &response, &[]).unwrap_err().code,
             "assertion_failed"
         );
     }
@@ -746,9 +831,12 @@ expect:
 
     #[test]
     fn expect_rejects_unknown_field() {
+        // An unknown nested key under `expect:` now matches the top-level
+        // taxonomy: `invalid_request` with a field path (not a raw parse error).
         let error = RunSpec::from_yaml("id: r\nname: r\nurl: http://x\nexpect:\n  stat: 200\n")
             .unwrap_err();
-        assert_eq!(error.code, "invalid_yaml");
+        assert_eq!(error.code, "invalid_request");
+        assert_eq!(error.path.as_deref(), Some("stat"));
     }
 
     #[test]
@@ -772,7 +860,7 @@ expect:
                 raw: "body:/count".to_string(),
             }),
         };
-        assert!(evaluate(&expect, &response).is_ok());
+        assert!(evaluate(&expect, &response, &[]).is_ok());
     }
 
     #[test]
@@ -788,7 +876,7 @@ expect:
             }),
         };
         assert_eq!(
-            evaluate(&expect, &response).unwrap_err().code,
+            evaluate(&expect, &response, &[]).unwrap_err().code,
             "assertion_failed"
         );
     }
@@ -804,8 +892,116 @@ expect:
                 raw: "body:/token".to_string(),
             }),
         };
-        let error = evaluate(&expect, &response).unwrap_err();
+        let error = evaluate(&expect, &response, &[]).unwrap_err();
         assert_eq!(error.code, "assertion_failed");
         assert!(!error.message.contains("live-secret"), "{}", error.message);
+    }
+
+    #[test]
+    fn evaluate_body_eq_redacts_marker_less_secret_when_supplied() {
+        // The secret value carries no marker word, so only the secret_values list
+        // can scrub it — proving the new parameter is wired through.
+        let response = CallResponse::with_status(200, r#"{"v":"hunter2zz"}"#);
+        let expect = Expect {
+            status: None,
+            body_eq: Some(BodyEq {
+                selector: Selector::parse("body:/v").unwrap(),
+                value: serde_json::json!("x"),
+                raw: "body:/v".to_string(),
+            }),
+        };
+        let secrets = vec!["hunter2zz".to_string()];
+        let masked = evaluate(&expect, &response, &secrets).unwrap_err();
+        assert!(!masked.message.contains("hunter2zz"), "{}", masked.message);
+        // With no secret list the marker-less value passes through (so the test
+        // really exercises the parameter, not some other redaction path).
+        let leaked = evaluate(&expect, &response, &[]).unwrap_err();
+        assert!(leaked.message.contains("hunter2zz"), "{}", leaked.message);
+    }
+
+    #[test]
+    fn expect_rejects_empty_status_list() {
+        // `status: []` accepts no codes; it must be rejected, not silently fail
+        // every response.
+        let error = RunSpec::from_yaml("id: r\nname: r\nurl: http://x\nexpect:\n  status: []\n")
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_expect");
+    }
+
+    #[test]
+    fn expect_rejects_empty_status_list_even_with_body_eq() {
+        // An empty `status: []` must be flagged even when another check is
+        // present, rather than being silently dropped.
+        let error = RunSpec::from_yaml(
+            "id: r\nname: r\nurl: http://x\nexpect:\n  status: []\n  body_eq:\n    path: \"body:/ok\"\n    value: true\n",
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "invalid_expect");
+        assert_eq!(error.path.as_deref(), Some("expect.status"));
+    }
+
+    #[test]
+    fn run_spec_from_request_lifts_fields() {
+        let request = RequestSpec::from_json(
+            r#"{"id":"req-x","name":"X","method":"post","url":"http://localhost/x","headers":{"x-a":"b"},"body":"hi"}"#,
+        )
+        .unwrap();
+        let spec = RunSpec::from_request(request);
+        assert_eq!(spec.id, "req-x");
+        assert_eq!(spec.name, "X");
+        assert_eq!(spec.method, "POST");
+        assert_eq!(spec.url, "http://localhost/x");
+        assert_eq!(spec.headers.get("x-a").map(String::as_str), Some("b"));
+        assert_eq!(spec.body.as_deref(), Some("hi"));
+        assert!(spec.vars.is_empty());
+        assert!(spec.expect.is_none());
+    }
+
+    #[test]
+    fn run_spec_from_json_round_trips_and_rejects_trailing_data() {
+        let spec = RunSpec::from_json(r#"{"id":"r","name":"r","url":"http://x"}"#).unwrap();
+        assert_eq!(spec.id, "r");
+        // Trailing junk after the JSON object is rejected by `deserializer.end()`.
+        let error =
+            RunSpec::from_json(r#"{"id":"r","name":"r","url":"http://x"} junk"#).unwrap_err();
+        assert_eq!(error.code, "invalid_json");
+    }
+
+    #[test]
+    fn expand_backslash_escapes() {
+        let scope = scope();
+        // `\{{x}}` is a literal `{{x}}` (no expansion).
+        assert_eq!(expand(r"\{{x}}", &scope).unwrap(), "{{x}}");
+        // `\\{{...}}` is a literal backslash followed by the EXPANDED value (the
+        // one case where `\\` is an escape).
+        assert_eq!(
+            expand(r"\\{{vars.base}}", &scope).unwrap(),
+            r"\http://localhost:8080"
+        );
+        // A lone trailing `\` is a literal backslash (must not panic).
+        assert_eq!(expand(r"a\", &scope).unwrap(), r"a\");
+    }
+
+    #[test]
+    fn expand_backslashes_not_before_template_are_verbatim() {
+        let scope = scope();
+        // A `\\` that is NOT the prefix of `\\{{` must NOT collapse to one `\`;
+        // both backslashes are emitted verbatim. Regression guard: a templated
+        // JSON body or Windows path must survive intact.
+        assert_eq!(expand(r"\\", &scope).unwrap(), r"\\");
+        assert_eq!(
+            expand(r#"{"path":"C:\\Users"}"#, &scope).unwrap(),
+            r#"{"path":"C:\\Users"}"#
+        );
+        // A regex escape with no following template is untouched.
+        assert_eq!(expand(r"\d+", &scope).unwrap(), r"\d+");
+        // `\\` followed by a NON-template `{` stays two backslashes (no escape).
+        assert_eq!(expand(r"\\{x}", &scope).unwrap(), r"\\{x}");
+        // The escape is only `\\{{`: backslashes before a template still expand
+        // it, and a `\\` elsewhere in the same string stays verbatim.
+        assert_eq!(
+            expand(r"a\\b \\{{vars.base}}", &scope).unwrap(),
+            r"a\\b \http://localhost:8080"
+        );
     }
 }

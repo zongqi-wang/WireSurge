@@ -175,11 +175,22 @@ impl HttpResponse {
     /// Normalize into the protocol-blind [`CallResponse`] that templating,
     /// extraction, and assertions operate on. HTTP has a status but no separate
     /// protocol code, so `code` is `None`.
+    ///
+    /// Header keys are lowercased here so the lowercase-key invariant CORE
+    /// documents on [`CallResponse::headers`] holds for the HTTP adapter no
+    /// matter what casing upstream produced. The `header:` selector lowercases
+    /// the requested name and does an exact `BTreeMap::get`, so it relies on
+    /// this normalization rather than the http crate's incidental canonicalization.
     pub fn to_call_response(&self) -> CallResponse {
+        let headers = self
+            .headers
+            .iter()
+            .map(|(key, value)| (key.to_ascii_lowercase(), value.clone()))
+            .collect();
         CallResponse {
             status: Some(self.status_code),
             code: None,
-            headers: self.headers.clone(),
+            headers,
             body: self.body.clone(),
             duration_ms: self.duration_ms,
             warnings: self.warnings.clone(),
@@ -294,6 +305,32 @@ mod tests {
         let body = value.get("body").and_then(|b| b.as_str()).unwrap();
         assert!(!body.contains("aGVsbG8xMjM0NQ"), "{body}");
         assert!(body.contains("[redacted]"), "{body}");
+    }
+
+    #[test]
+    fn to_call_response_lowercases_header_keys() {
+        // A mixed-case header key (e.g. "ETag") must be lowercased so the
+        // `header:` selector — which lowercases the requested name and does an
+        // exact BTreeMap::get — can resolve it.
+        let mut headers = BTreeMap::new();
+        headers.insert("ETag".to_string(), "\"abc\"".to_string());
+        let response = HttpResponse {
+            status_code: 200,
+            reason: "OK".to_string(),
+            headers,
+            body: String::new(),
+            duration_ms: 0.0,
+            warnings: Vec::new(),
+        };
+        let call = response.to_call_response();
+        assert!(call.headers.contains_key("etag"));
+        assert!(!call.headers.contains_key("ETag"));
+
+        let selector = wiresurge_core::scenario::Selector::parse("header:ETag").unwrap();
+        assert_eq!(
+            selector.resolve_value(&call),
+            Some(serde_json::Value::String("\"abc\"".to_string()))
+        );
     }
 
     #[tokio::test]
