@@ -341,11 +341,7 @@ pub struct BodyEq {
 /// `assertion_failed` error on the first mismatch (fail-fast). `secret_values`
 /// holds the run's secret values so a marker-less injected secret echoed in the
 /// body cannot leak through a `body_eq` failure message.
-pub fn evaluate(
-    expect: &Expect,
-    response: &CallResponse,
-    secret_values: &[String],
-) -> Result<()> {
+pub fn evaluate(expect: &Expect, response: &CallResponse, secret_values: &[String]) -> Result<()> {
     if let Some(codes) = &expect.status {
         match response.status {
             Some(status) if codes.contains(&status) => {}
@@ -957,7 +953,8 @@ expect:
         let spec = RunSpec::from_json(r#"{"id":"r","name":"r","url":"http://x"}"#).unwrap();
         assert_eq!(spec.id, "r");
         // Trailing junk after the JSON object is rejected by `deserializer.end()`.
-        let error = RunSpec::from_json(r#"{"id":"r","name":"r","url":"http://x"} junk"#).unwrap_err();
+        let error =
+            RunSpec::from_json(r#"{"id":"r","name":"r","url":"http://x"} junk"#).unwrap_err();
         assert_eq!(error.code, "invalid_json");
     }
 

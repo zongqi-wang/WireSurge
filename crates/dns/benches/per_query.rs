@@ -130,9 +130,7 @@ async fn bench_framed_tcp(n: usize, in_flight: usize) {
         .await
         .unwrap();
     let wire = wire();
-    let req = || DnsRequest {
-        wire: wire.clone(),
-    };
+    let req = || DnsRequest { wire: wire.clone() };
 
     // Warm up the connection + reader buffer.
     conn.exchange(req(), Duration::from_secs(5)).await.unwrap();
