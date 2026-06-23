@@ -120,9 +120,12 @@ impl RunResult {
 struct SendOutcome {
     run_id: String,
     response: HttpResponse,
-    /// Base runner stats reflecting only the HTTP status (`status < 400`); the
-    /// caller re-derives success once the assertion is known.
-    runner: RunnerStats,
+    /// The in-flight runner snapshot, NOT yet finalized: the caller calls
+    /// [`RunnerStats::finish_with_latency`] once the assertion verdict is known
+    /// so the aggregate AND per-worker stats are set together from the same
+    /// `success` (finalizing here with status-only success would leave the
+    /// worker `error_rate` disagreeing with an assertion-driven failure).
+    active_runner: RunnerStats,
     warnings: Vec<String>,
 }
 
@@ -146,8 +149,6 @@ async fn send_request_inner(
         }
         result = send_http_request(request) => result?,
     };
-    let transport_ok = response.status_code < 400;
-    let runner = active_runner.finish_with_latency(response.duration_ms, transport_ok);
 
     let mut warnings = response.warnings.clone();
     if options.parallel > 1 {
@@ -163,7 +164,7 @@ async fn send_request_inner(
     Ok(SendOutcome {
         run_id,
         response,
-        runner,
+        active_runner,
         warnings,
     })
 }
@@ -225,7 +226,7 @@ pub async fn run_run_spec_with_cancellation(
     let SendOutcome {
         run_id,
         response,
-        runner,
+        active_runner,
         warnings,
     } = send_request_inner(store, &request, &options, cancellation).await?;
 
@@ -234,15 +235,13 @@ pub async fn run_run_spec_with_cancellation(
     // details must carry the verdict.
     let assertion = evaluate_expect(expect.as_ref(), &response, &secret_values);
 
-    // Success now folds in the assertion: transport OK *and* the assertion did
-    // not fail. `finish_with_latency` already set base stats from the status; if
-    // a passing-status response failed its assertion, downgrade the error rate.
+    // Success folds in the assertion: transport OK (`status < 400`) *and* the
+    // assertion did not fail. Finalize the runner exactly once with this verdict
+    // so the aggregate AND per-worker `error_rate` agree — a 2xx that fails its
+    // assertion is unhealthy at both levels.
     let transport_ok = response.status_code < 400;
     let success = transport_ok && !matches!(assertion, AssertionOutcome::Failed(_));
-    let mut runner = runner;
-    if !success {
-        runner.error_rate = 1.0;
-    }
+    let runner = active_runner.finish_with_latency(response.duration_ms, success);
     store.write_runner_snapshot(&runner)?;
 
     // The report is the durable record; its body redaction is computed once
@@ -360,6 +359,19 @@ mod tests {
         assert!(
             !success,
             "a 2xx that fails its assertion must not be healthy"
+        );
+
+        // Finalizing the runner with the assertion-folded `success` must mark the
+        // run unhealthy at BOTH the aggregate AND the per-worker level — they
+        // must not disagree (regression: only the aggregate was patched, leaving
+        // worker error_rate at 0.0 so a watcher saw the failed run as healthy).
+        let runner = RunnerStats::local(Some("run-x".to_string()), 1)
+            .finish_with_latency(resp.duration_ms, success);
+        assert_eq!(runner.error_rate, 1.0);
+        assert_eq!(
+            runner.workers.first().map(|w| w.error_rate),
+            Some(1.0),
+            "per-worker error_rate must match the aggregate on a failed assertion"
         );
     }
 

@@ -183,10 +183,15 @@ fn missing_secret(key: &str) -> WireSurgeError {
 
 /// Expand `{{ key }}` placeholders in `input` against `scope`. Two escapes let a
 /// template emit characters that would otherwise be special:
-/// - `\{{` emits a literal `{{` (the template opener).
-/// - `\\` emits a single literal `\`, so `\\{{k}}` is a literal backslash
-///   followed by the EXPANDED value of `{{k}}` (without this, a literal
-///   backslash immediately before a template would be impossible).
+/// - `\{{` emits a literal `{{` (the template opener, expansion suppressed).
+/// - `\\{{` emits a single literal `\` immediately followed by the EXPANDED
+///   value of the template, so a literal backslash can sit directly before a
+///   template (without this, `\{{k}}` would be read as the escaped opener).
+///
+/// A `\\` (or `\`) in ANY other position is NOT an escape: every backslash is
+/// emitted verbatim. This keeps a templated JSON string like `"C:\\Users"`, a
+/// Windows path, or a regex escape (`\d`) intact rather than silently
+/// collapsing its backslashes.
 ///
 /// An unterminated `{{` is an error. No regex, no allocation beyond the output
 /// string.
@@ -196,21 +201,25 @@ pub fn expand(input: &str, scope: &Scope) -> Result<String> {
     let mut index = 0;
     while index < bytes.len() {
         if bytes[index] == b'\\' {
-            // Escaped opener: `\{{` emits a literal `{{`.
+            // Escaped opener: `\{{` emits a literal `{{` (suppresses expansion).
             if input[index + 1..].starts_with("{{") {
                 out.push_str("{{");
                 index += 3;
                 continue;
             }
-            // Escaped backslash: `\\` emits one literal `\`. This lets a literal
-            // backslash sit directly before a template (`\\{{k}}`).
-            if input[index + 1..].starts_with('\\') {
+            // `\\{{` emits one literal `\` and lets the following template
+            // expand. The escape is scoped to this case ONLY — a `\\` that is
+            // not the prefix of `\\{{` is two ordinary backslashes (see the doc
+            // comment), so we must not collapse it. Consume BOTH backslashes and
+            // leave `index` on the `{{`, which the template branch below expands.
+            if input[index + 1..].starts_with("\\{{") {
                 out.push('\\');
                 index += 2;
                 continue;
             }
-            // A lone trailing/other `\` is a literal backslash; fall through to
-            // the bulk literal copy below, which will include it in the run.
+            // Any other `\` (lone, trailing, or `\\` not before a template) is a
+            // literal backslash; fall through to the bulk literal copy below,
+            // which copies it verbatim as part of the run.
         }
         if input[index..].starts_with("{{") {
             let rest = &input[index + 2..];
@@ -963,14 +972,36 @@ expect:
         let scope = scope();
         // `\{{x}}` is a literal `{{x}}` (no expansion).
         assert_eq!(expand(r"\{{x}}", &scope).unwrap(), "{{x}}");
-        // `\\{{...}}` is a literal backslash followed by the EXPANDED value.
+        // `\\{{...}}` is a literal backslash followed by the EXPANDED value (the
+        // one case where `\\` is an escape).
         assert_eq!(
             expand(r"\\{{vars.base}}", &scope).unwrap(),
             r"\http://localhost:8080"
         );
-        // `\\` alone is a single literal backslash.
-        assert_eq!(expand(r"\\", &scope).unwrap(), r"\");
         // A lone trailing `\` is a literal backslash (must not panic).
         assert_eq!(expand(r"a\", &scope).unwrap(), r"a\");
+    }
+
+    #[test]
+    fn expand_backslashes_not_before_template_are_verbatim() {
+        let scope = scope();
+        // A `\\` that is NOT the prefix of `\\{{` must NOT collapse to one `\`;
+        // both backslashes are emitted verbatim. Regression guard: a templated
+        // JSON body or Windows path must survive intact.
+        assert_eq!(expand(r"\\", &scope).unwrap(), r"\\");
+        assert_eq!(
+            expand(r#"{"path":"C:\\Users"}"#, &scope).unwrap(),
+            r#"{"path":"C:\\Users"}"#
+        );
+        // A regex escape with no following template is untouched.
+        assert_eq!(expand(r"\d+", &scope).unwrap(), r"\d+");
+        // `\\` followed by a NON-template `{` stays two backslashes (no escape).
+        assert_eq!(expand(r"\\{x}", &scope).unwrap(), r"\\{x}");
+        // The escape is only `\\{{`: backslashes before a template still expand
+        // it, and a `\\` elsewhere in the same string stays verbatim.
+        assert_eq!(
+            expand(r"a\\b \\{{vars.base}}", &scope).unwrap(),
+            r"a\\b \http://localhost:8080"
+        );
     }
 }

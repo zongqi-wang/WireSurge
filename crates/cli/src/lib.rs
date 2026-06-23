@@ -425,7 +425,7 @@ fn parse_edns_options(specs: &[String]) -> Result<Vec<EdnsOption>> {
             let (code, value) = split_kv(spec, ':', "edns-option")?;
             let code = code.parse::<u16>().map_err(|_| {
                 WireSurgeError::new(
-                    "invalid_edns-option",
+                    invalid_flag_code("edns-option"),
                     format!("--edns-option code must be 0-65535, got {code}"),
                 )
                 .at("edns-option")
@@ -502,7 +502,7 @@ fn build_doh_target(args: &LoadArgs, addr: SocketAddr) -> Result<ConnectTarget> 
         let (key, value) = split_kv(pair, '=', "http-param")?;
         if key.is_empty() {
             return Err(WireSurgeError::new(
-                "invalid_http-param",
+                invalid_flag_code("http-param"),
                 "--http-param key must not be empty",
             )
             .at("http-param"));
@@ -514,7 +514,7 @@ fn build_doh_target(args: &LoadArgs, addr: SocketAddr) -> Result<ConnectTarget> 
         // case to catch DNS=/Dns= too).
         if key.eq_ignore_ascii_case("dns") {
             return Err(WireSurgeError::new(
-                "invalid_http-param",
+                invalid_flag_code("http-param"),
                 "--http-param key 'dns' is reserved for the DoH query payload",
             )
             .at("http-param"));
@@ -1080,6 +1080,17 @@ async fn run_command(
     }
 }
 
+/// The machine-readable error `code` for a flag-related error. Error codes are
+/// snake_case throughout the codebase (`invalid_request`, `invalid_http_header`,
+/// …), but CLI flag names are hyphenated (`http-param`, `edns-option`), so a flag
+/// name is normalized to underscores before interpolation — matching the
+/// `replace('-', "_")` rule [`parse_proxy_addr`] already applies. The
+/// human-facing `--flag` spelling and the `.at()` path keep the real hyphenated
+/// name.
+fn invalid_flag_code(flag: &str) -> String {
+    format!("invalid_{}", flag.replace('-', "_"))
+}
+
 /// Split a CLI spec once on `sep`, erroring `invalid_<flag>` ("--<flag> must be
 /// ...") on a missing separator. Shared by the three near-identical KEY=VALUE /
 /// CODE:VALUE parsers so the spec/separator handling lives in one place.
@@ -1087,7 +1098,7 @@ fn split_kv<'a>(spec: &'a str, sep: char, flag: &str) -> Result<(&'a str, &'a st
     spec.split_once(sep).ok_or_else(|| {
         let upper = flag.to_ascii_uppercase();
         WireSurgeError::new(
-            format!("invalid_{flag}"),
+            invalid_flag_code(flag),
             format!("--{flag} must be {upper}{sep}VALUE, got {spec}"),
         )
         .at(flag.to_string())
@@ -1108,21 +1119,21 @@ fn parse_kv_pairs(
         let (name, value) = split_kv(pair, '=', flag)?;
         if name.is_empty() {
             return Err(WireSurgeError::new(
-                format!("invalid_{flag}"),
+                invalid_flag_code(flag),
                 format!("--{flag} name must not be empty"),
             )
             .at(flag.to_string()));
         }
         if flag == "secret" && value.is_empty() {
             return Err(WireSurgeError::new(
-                format!("invalid_{flag}"),
+                invalid_flag_code(flag),
                 format!("--{flag} value must not be empty for '{name}'"),
             )
             .at(flag.to_string()));
         }
         if map.insert(name.to_string(), value.to_string()).is_some() {
             return Err(WireSurgeError::new(
-                format!("invalid_{flag}"),
+                invalid_flag_code(flag),
                 format!("duplicate --{flag} '{name}'"),
             )
             .at(flag.to_string()));
@@ -1374,7 +1385,9 @@ mod tests {
             temp_dir(),
         );
         assert_eq!(outcome.code, 1);
-        assert!(outcome.stdout.contains("invalid_edns-option"));
+        // Error codes are snake_case even though the flag name is hyphenated.
+        assert!(outcome.stdout.contains("invalid_edns_option"));
+        assert!(!outcome.stdout.contains("invalid_edns-option"));
     }
 
     #[test]
@@ -1780,8 +1793,14 @@ mod tests {
             temp_dir(),
         );
         assert_eq!(outcome.code, 1);
+        // Error codes are snake_case even though the flag name is hyphenated.
         assert!(
-            outcome.stdout.contains("invalid_http-param"),
+            outcome.stdout.contains("invalid_http_param"),
+            "{}",
+            outcome.stdout
+        );
+        assert!(
+            !outcome.stdout.contains("invalid_http-param"),
             "{}",
             outcome.stdout
         );
