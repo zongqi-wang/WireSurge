@@ -114,16 +114,17 @@ impl RateGate {
 /// Shared, lock-free source of work. Every actor pulls query indexes from one
 /// atomic counter, so a process-wide QPS cap and total count apply across all
 /// connections without a hot lock. Each corpus row's full wire message is
-/// encoded once before the run clock starts (`wires`); `next` only clones the
-/// matching prebuilt buffer (the transport patches in the transaction id at send
-/// time), so the hot path never re-runs the DNS encoder per query.
+/// encoded once before the run clock starts (`wires`); `next` clones the
+/// matching prebuilt buffer into an owned `Vec<u8>` (a thread-local
+/// malloc+memcpy, no shared atomic refcount), and the transport patches in the
+/// transaction id at send time, so the hot path never re-runs the DNS encoder.
 struct WorkSource {
     seq: AtomicU64,
     count: Option<u64>,
     deadline: Option<Instant>,
     gate: Option<RateGate>,
     corpus: Arc<Corpus>,
-    wires: Vec<Arc<[u8]>>,
+    wires: Vec<Vec<u8>>,
     seed: u64,
     mode: SelectMode,
 }
@@ -145,7 +146,7 @@ impl WorkSource {
         }
         let row = self.corpus.select_index(index, self.seed, self.mode);
         Some(DnsRequest {
-            wire: Arc::clone(&self.wires[row]),
+            wire: self.wires[row].clone(),
         })
     }
 
@@ -368,10 +369,8 @@ pub async fn run_load_with_progress(
     let wires = config
         .corpus
         .iter_rows()
-        .map(|name| {
-            wiresurge_dns::build_query(0, name, config.qtype, edns_options).map(Arc::<[u8]>::from)
-        })
-        .collect::<Result<Vec<_>>>()?;
+        .map(|name| wiresurge_dns::build_query(0, name, config.qtype, edns_options))
+        .collect::<Result<Vec<Vec<u8>>>>()?;
 
     let start = Instant::now();
     let work = Arc::new(WorkSource {

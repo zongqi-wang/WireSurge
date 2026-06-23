@@ -316,13 +316,63 @@ pub fn redact_value(input: &str, secret_values: &[String]) -> String {
     if contains_sensitive_marker(input) {
         return "[redacted]".to_string();
     }
+    mask_secret_values(input, secret_values)
+}
+
+/// Mask every occurrence of each known secret value in `input`, leaving the rest
+/// of the string intact. Unlike [`redact_value`] this never wholesale-redacts on
+/// a marker: it only scrubs the literal secret values it is handed.
+///
+/// Secrets are processed longest-first so a shorter secret that is a substring of
+/// a longer one cannot shadow it (which would leave the longer secret's tail
+/// exposed). For each secret both the raw value and its query-percent-encoded
+/// form are masked: a target that echoes a secret back as we put it on the wire
+/// (percent-encoded in a query component) would otherwise leak it. Other server
+/// re-encodings (base64, HTML entities) are out of scope by design — we only
+/// reverse the encoding WireSurge itself applies.
+pub fn mask_secret_values(input: &str, secret_values: &[String]) -> String {
+    // Longest-first: see the doc-comment — a shorter prefix must not mask before
+    // its superstring, or the superstring's tail leaks through.
+    let mut secrets: Vec<&String> = secret_values.iter().filter(|s| !s.is_empty()).collect();
+    secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
     let mut out = input.to_string();
-    for secret in secret_values {
-        if !secret.is_empty() && out.contains(secret.as_str()) {
-            out = out.replace(secret.as_str(), "[redacted]");
+    for secret in secrets {
+        // `String::replace` already scans the whole string, so a `contains`
+        // pre-check would only duplicate that work.
+        out = out.replace(secret.as_str(), "[redacted]");
+        let encoded = query_percent_encode(secret);
+        if encoded != *secret.as_str() {
+            out = out.replace(&encoded, "[redacted]");
         }
     }
     out
+}
+
+/// Percent-encode `input` the way the `url` crate encodes a query component:
+/// controls (`< 0x20`), space, `"`, `#`, `<`, `>`, and any non-ASCII byte
+/// (`>= 0x80`) become `%XX` (uppercase hex); everything else is copied verbatim.
+/// Hand-rolled to avoid a dependency.
+fn query_percent_encode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for &byte in input.as_bytes() {
+        let needs_encoding =
+            !(0x20..0x80).contains(&byte) || matches!(byte, b' ' | b'"' | b'#' | b'<' | b'>');
+        if needs_encoding {
+            out.push('%');
+            out.push(nibble_to_hex(byte >> 4));
+            out.push(nibble_to_hex(byte & 0x0f));
+        } else {
+            out.push(byte as char);
+        }
+    }
+    out
+}
+
+fn nibble_to_hex(nibble: u8) -> char {
+    match nibble {
+        0..=9 => (b'0' + nibble) as char,
+        _ => (b'A' + (nibble - 10)) as char,
+    }
 }
 
 fn contains_sensitive_marker(input: &str) -> bool {
@@ -434,5 +484,32 @@ mod tests {
         let error = RequestSpec::from_json(r#"{"url":"http://localhost"}"#).unwrap_err();
         assert_eq!(error.code, "invalid_request");
         assert_eq!(error.path.as_deref(), Some("name"));
+    }
+
+    #[test]
+    fn mask_secret_values_longest_first_no_tail_leak() {
+        // "abc" is a prefix of "abcdef"; without longest-first ordering, masking
+        // "abc" first would leave "def" exposed.
+        let secrets = vec!["abc".to_string(), "abcdef".to_string()];
+        let masked = mask_secret_values("value=abcdef", &secrets);
+        assert_eq!(masked, "value=[redacted]");
+        assert!(!masked.contains("def"), "{masked}");
+    }
+
+    #[test]
+    fn mask_secret_values_masks_percent_encoded_form() {
+        // A secret containing a space goes on the wire as %20 in a query; mask the
+        // encoded form when the target echoes it back that way.
+        let secrets = vec!["a b".to_string()];
+        let masked = mask_secret_values("echo=a%20b", &secrets);
+        assert_eq!(masked, "echo=[redacted]");
+        // The raw form is masked too.
+        assert_eq!(mask_secret_values("echo=a b", &secrets), "echo=[redacted]");
+    }
+
+    #[test]
+    fn mask_secret_values_empty_secret_is_noop() {
+        let secrets = vec![String::new()];
+        assert_eq!(mask_secret_values("unchanged", &secrets), "unchanged");
     }
 }

@@ -173,7 +173,7 @@ fn doh_target(addr: SocketAddr, method: HttpMethod, query: &str) -> ConnectTarge
 
 fn request_with_id(id: u16) -> DnsRequest {
     DnsRequest {
-        wire: build_query(id, "example.com", 1, &[]).unwrap().into(),
+        wire: build_query(id, "example.com", 1, &[]).unwrap(),
     }
 }
 
