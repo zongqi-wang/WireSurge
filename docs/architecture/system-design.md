@@ -26,7 +26,7 @@ SIGINT / SIGTERM / UI Stop ----------------> root cancellation token
 UI hard kill ------------------------------> child process termination
 ```
 
-HTTP/API workflows and DNS workflows are peers. Traffic is modeled as composable protocol stages. Runtime responsibilities are supervised actors and bounded task groups. Immutable corpora are shared once, connections have one explicit owner, and every long-running operation participates in a cancellation tree.
+HTTP/API and DNS steps are peers. Traffic is modeled as composable protocol stages. Runtime responsibilities are supervised actors and bounded task groups. Immutable corpora are shared once, connections have one explicit owner, and every long-running operation participates in a cancellation tree.
 
 ## Public Engine Contract
 
@@ -54,7 +54,7 @@ The same state machine and event model must serve direct CLI calls and IPC calls
 | Scheduler | Work admission, rate credits, ladder phase, and stop conditions. | Connections or persistent reports. |
 | Corpus service | Immutable mapped inputs, indexes, and deterministic selection. | Per-request mutable buffers. |
 | I/O runtime | Socket polling, timers, protocol futures, and bounded task queues. | Global experiment decisions. |
-| Connection managers | TCP/TLS streams, HTTP pools, correlation, and idle expiry. | Cross-run workflow state. |
+| Connection managers | TCP/TLS streams, HTTP pools, correlation, and idle expiry. | Cross-run scenario state. |
 | Metrics task | Counter deltas, histogram merging, and live snapshots. | Report filesystem ownership. |
 | Report writer | Atomic output, checkpoints, and final flush. | Live socket or scheduling control. |
 

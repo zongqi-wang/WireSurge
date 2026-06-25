@@ -8,7 +8,7 @@ Traffic is modeled as stages that compose into flows. HTTP/API remains first-cla
 
 | Phase | Protocol work | Reason |
 |---|---|---|
-| V1 | HTTP/1.1, HTTP/2, REST, JSON, GraphQL basics, DNS UDP/TCP/DoT, TLS SNI, EDNS0, and PROXY protocol v1/v2. | Delivers API and DNS workflows as peers. |
+| V1 | HTTP/1.1, HTTP/2, REST, JSON, GraphQL basics, DNS UDP/TCP/DoT, TLS SNI, EDNS0, and PROXY protocol v1/v2. | Delivers API and DNS steps as peers. |
 | V1.5 | DoH, WebSocket, SSE, gRPC unary, advanced HTTP auth, and imports from curl/OpenAPI/Postman. | Improves API-client usefulness and test realism. |
 | V2 | Custom TLS extensions, packet templates, raw UDP, pcap replay, and Geneve/VXLAN research backends. | Expands into a protocol lab after V1 is stable. |
 
@@ -16,7 +16,7 @@ Best-in-class packet rate and arbitrary stack composition pull in different dire
 
 ### Current DNS boundary
 
-`hickory-proto` owns DNS names, record types, complete message construction/parsing, and EDNS0 encoding. WireSurge owns Tokio socket choice, the per-connection actor and its many-in-flight multiplexer, pacing, deadlines, cancellation, and run metrics. The `load` engine runs over a protocol-agnostic `Transport`/`Connection` seam with Do53 UDP/TCP, DoT, and DoH implementations; replies are correlated by transaction id on Do53/DoT and by HTTP/2 stream on DoH, and a response is counted once its header validates (rcode, response bit, opcode). An EDNS option is a caller-selected `u16` code plus raw bytes; the `--token` credential rides EDNS option 65184 on DoT and the `?token=` URL query on DoH. PROXY v2 is a connection preamble for TCP/DoT/DoH and a per-datagram prefix for UDP. DNS-over-QUIC is reserved for a later transport phase.
+`hickory-proto` owns DNS names, record types, complete message construction/parsing, and EDNS0 encoding. WireSurge owns Tokio socket choice, the per-connection actor and its many-in-flight multiplexer, pacing, deadlines, cancellation, and run metrics. The `load` engine runs over a protocol-agnostic `Transport`/`Connection` seam with Do53 UDP/TCP, DoT, and DoH implementations; replies are correlated by transaction id on Do53/DoT and by HTTP/2 stream on DoH, and a response is counted once its header validates (rcode, response bit, opcode). An EDNS option is a caller-selected `u16` code plus raw bytes, supplied with the repeatable `--edns-option CODE:HEX` flag; DoH additionally accepts repeatable `--http-param KEY=VALUE` URL query parameters. Any caller-defined option rides whichever code or parameter the target expects. PROXY v2 is a connection preamble for TCP/DoT/DoH and a per-datagram prefix for UDP. DNS-over-QUIC is reserved for a later transport phase.
 
 ## Plugin Model
 
@@ -51,7 +51,7 @@ Metrics must be inexpensive in the hot path and useful after a run. The target u
 
 Logging rules:
 
-- Configurable levels per component: engine, protocol, plugin, workflow, metrics, and UI.
+- Configurable levels per component: engine, protocol, plugin, scenario, metrics, and UI.
 - Structured logs for machine mode and runner output.
 - Human-readable desktop log panel.
 - Redaction before display or persistence.
@@ -65,9 +65,9 @@ Git is the collaboration and history layer; WireSurge does not require proprieta
 
 | Area | Target behavior |
 |---|---|
-| Workflows | Readable files with stable formatting and schema validation. |
-| Reports | `reports/` with content-addressed assets and redacted workflow snapshots. |
-| Desktop Git UI | Changed workflows, report diffs, branch, commit, and dirty-state warnings. |
+| Scenarios | Readable files with stable formatting and schema validation. |
+| Reports | `reports/` with content-addressed assets and redacted scenario snapshots. |
+| Desktop Git UI | Changed scenarios, report diffs, branch, commit, and dirty-state warnings. |
 | CLI Git support | `--record-git`, `--require-clean`, `--report-commit`, and ignore helpers. |
 
-Current request files are readable YAML and current reports are local files, but stable full-workflow formatting, Git-aware commands, and content-addressed assets remain target work.
+Current request files are readable YAML and current reports are local files, but stable full-scenario formatting, Git-aware commands, and content-addressed assets remain target work.

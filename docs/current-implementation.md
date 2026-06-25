@@ -57,12 +57,12 @@ cargo run -p wiresurge-cli -- load 127.0.0.1 --name example.com --type A --count
 cargo run -p wiresurge-cli -- load 127.0.0.1 --protocol tcp \
   -c 8 -q 64 --count 1000 --qps 500 --output json
 cargo run -p wiresurge-cli -- load 127.0.0.1 --protocol dot \
-  --sni dns.example --token secret -l 10 --output json
+  --sni dns.example --edns-option 65001:cafe -l 10 --output json
 cargo run -p wiresurge-cli -- load 127.0.0.1 --protocol doh \
-  --url https://dns.example/dns-query -l 10 --output json
+  --url https://dns.example/dns-query --http-param key=value -l 10 --output json
 ```
 
-`-c` sets connections, `-q` the in-flight queries per connection; exactly one of `--count` and `-l`/`--duration-s` is required. `--token` rides EDNS option 65184 on DoT and the `?token=` URL query on DoH. It is rejected on cleartext UDP/TCP and cannot be combined with `--insecure`. `--proxy-src` and `--proxy-dst` enable PROXY v2 together: a stream preamble for TCP/DoT/DoH or a per-datagram prefix for UDP.
+`-c` sets connections, `-q` the in-flight queries per connection; exactly one of `--count` and `-l`/`--duration-s` is required. `--edns-option CODE:HEX` attaches a repeatable EDNS0 OPT option to every query (decimal code, hex payload, `dig +ednsopt` parity); `--http-param KEY=VALUE` appends repeatable DoH URL query parameters and is rejected on non-DoH protocols. `--proxy-src` and `--proxy-dst` enable PROXY v2 together: a stream preamble for TCP/DoT/DoH or a per-datagram prefix for UDP.
 
 See [Load Engine](load-engine.md) for transport ownership, scheduling, output fields, and current limitations.
 
