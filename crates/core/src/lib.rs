@@ -406,10 +406,6 @@ pub fn schema_for(resource: &str) -> Result<String> {
             "type": "object",
             "description": "Named variables and secret references"
         }),
-        "workflow" => serde_json::json!({
-            "type": "object",
-            "description": "YAML workflow with profiles, variables, secrets, flows, assertions, experiments, and safety limits"
-        }),
         "scenario" => serde_json::json!({
             "type": "object",
             "description": "Chained API scenario: profiles, secrets, and an ordered list of protocol-tagged steps with templated requests, response assertions, value extraction, and poll-until-condition loops",
@@ -431,9 +427,7 @@ pub fn schema_for(resource: &str) -> Result<String> {
             "unknown_schema",
             format!("unknown schema resource '{other}'"),
         )
-        .with_hint(
-            "Use one of: workspace, request, environment, workflow, scenario, run, report, runner",
-        ))?,
+        .with_hint("Use one of: workspace, request, environment, scenario, run, report, runner"))?,
     };
     serialize_json(&schema)
 }

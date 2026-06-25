@@ -65,7 +65,7 @@ The repository currently contains `core`, `engine`, `http`, `dns`, `corpus`, `tr
 ```text
 project-root/
   crates/
-    core/              domain model, workflow schema, validation, redaction
+    core/              domain model, scenario schema, validation, redaction
     control/           supervisor, IPC, cancellation, lifecycle       (target)
     engine/            scheduler, work queues, rate control, run state
     corpus/            mapped datasets and deterministic selection
@@ -81,7 +81,7 @@ project-root/
     web/               shared React UI and optional browser-only mode
     site/              public marketing shell
   examples/
-    workflows/
+    scenarios/
     plugins/
   docs/                this mdBook source
 ```

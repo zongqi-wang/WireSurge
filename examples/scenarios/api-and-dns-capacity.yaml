@@ -1,0 +1,36 @@
+# Target-shape scenario example. The current CLI runs the single-request
+# `vars`/`expect` form (see http-local.yaml); the multi-step `steps` schema
+# below is a steering contract, not yet compiled or run. See
+# docs/scenario-model.md.
+version: 1
+name: api-and-dns-capacity
+
+profiles:
+  local:
+    vars:
+      api_base: "http://127.0.0.1:8080"
+      resolver: "1.1.1.1:853"
+
+steps:
+  - name: fetch-health
+    http:
+      method: GET
+      url: "{{vars.api_base}}/health"
+    expect:
+      status: 200
+
+  - name: dot-query
+    dns:
+      target: "{{vars.resolver}}"
+      tls:
+        sni: "cloudflare-dns.com"
+        alpn: ["dot"]
+      qname: "example.com"
+      qtype: A
+      edns0:
+        udp_size: 1232
+        options:
+          - code: 65001
+            payload_hex: "cafe"
+    expect:
+      status: 200

@@ -41,7 +41,7 @@ Serde/`yaml_serde`, Hyper/rustls, Tokio signals, and `hdrhistogram` have removed
 ## Machine CLI Contract
 
 ```text
-wiresurge schema <workspace|request|environment|workflow|run|report|runner>
+wiresurge schema <workspace|request|environment|scenario|run|report|runner>
 wiresurge workspace init|list|show
 wiresurge request create|list|show|update|delete --json '{...}'
 wiresurge run <request-id|request.yaml> --output json --report <dir> --parallel <n> --fail-fast --verbose
@@ -55,7 +55,7 @@ Every structured error includes `code`, `message`, `path`, `hint`, and `retryabl
 ## Next Engineering Steps
 
 1. Introduce the supervisor, cancellation tree, bounded queues, and public engine handle before adding broad protocol surface.
-2. Compile the versioned workflow model into immutable run plans and integrate current HTTP and DNS execution behind stages.
+2. Compile the versioned scenario model into immutable run plans and integrate current HTTP and DNS execution behind steps.
 3. Use the shared Hyper client for multi-request runs, then make redirect policy and phase timings configurable.
 4. Expose the existing load snapshots through a stable engine event contract and add reconnect/backoff plus configurable drain deadlines.
 5. Replace report/runner writes with atomic durable storage while preserving the JSON CLI contract.
