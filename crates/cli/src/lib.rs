@@ -16,7 +16,7 @@ use wiresurge_core::{
     RequestSpec, Result, WireSurgeError, mask_secret_values, schema_for, serialize_json,
 };
 use wiresurge_corpus::Corpus;
-use wiresurge_dns::{EdnsOption, parse_qtype};
+use wiresurge_dns::{EdnsOption, decode_hex_payload, parse_qtype};
 use wiresurge_engine::load::{
     LoadConfig, LoadProto, LoadStats, ProgressConfig, run_load, run_load_with_progress,
 };
@@ -121,9 +121,11 @@ struct LoadArgs {
     randomize: bool,
     #[arg(long, default_value_t = 0)]
     seed: u64,
-    /// EDNS0 OPT option attached to every query, as CODE:VALUE (decimal code,
-    /// UTF-8 value), e.g. 65001:hello; repeatable.
-    #[arg(long = "edns-option", value_name = "CODE:VALUE")]
+    /// EDNS0 OPT option attached to every query, as CODE:HEX (decimal code,
+    /// hex-encoded payload bytes — `dig +ednsopt` parity, since OPT data is
+    /// opaque binary per RFC 6891 §6.1.2), e.g. 65001:cafe; repeatable, so a
+    /// query can carry several options (including repeats of one code).
+    #[arg(long = "edns-option", value_name = "CODE:HEX")]
     edns_options: Vec<String>,
     /// Extra DoH URL query parameter as KEY=VALUE; repeatable. DoH only.
     #[arg(long = "http-param", value_name = "KEY=VALUE")]
@@ -416,8 +418,12 @@ fn build_load_config(args: &LoadArgs) -> Result<LoadConfig> {
     Ok(config)
 }
 
-/// Parse each `--edns-option CODE:VALUE` into an `EdnsOption` (decimal code,
-/// UTF-8 value bytes).
+/// Parse each `--edns-option CODE:HEX` into an `EdnsOption` (decimal code,
+/// hex-decoded payload bytes). EDNS0 OPT data is opaque binary (RFC 6891
+/// §6.1.2) — NSID, ECS, Cookie, and Padding all carry non-text octets — so the
+/// payload is taken as hex, matching `dig +ednsopt=CODE:HEX`. Each spec yields
+/// one option and the result preserves input order, so repeating the flag
+/// attaches several options (a repeated code is legal and kept distinct).
 fn parse_edns_options(specs: &[String]) -> Result<Vec<EdnsOption>> {
     specs
         .iter()
@@ -432,7 +438,7 @@ fn parse_edns_options(specs: &[String]) -> Result<Vec<EdnsOption>> {
             })?;
             Ok(EdnsOption {
                 code,
-                payload: value.as_bytes().to_vec(),
+                payload: decode_hex_payload(value)?,
             })
         })
         .collect()
@@ -1391,6 +1397,43 @@ mod tests {
     }
 
     #[test]
+    fn parse_edns_options_decodes_hex_payload() {
+        // OPT data is opaque binary; the value is hex (dig +ednsopt parity), so
+        // "cafe" must become the two bytes 0xCA 0xFE — not the four ASCII bytes
+        // of the string "cafe", which the old UTF-8 path produced.
+        let options = parse_edns_options(&["65001:cafe".to_string()]).unwrap();
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].code, 65001);
+        assert_eq!(options[0].payload, vec![0xca, 0xfe]);
+    }
+
+    #[test]
+    fn parse_edns_options_rejects_non_hex_payload() {
+        // A value that is not valid hex (here, odd length) is a hard error
+        // rather than being silently taken as text.
+        let error = parse_edns_options(&["3:abc".to_string()]).unwrap_err();
+        assert_eq!(error.code, "invalid_hex_payload");
+    }
+
+    #[test]
+    fn parse_edns_options_preserves_multiple_options_in_order() {
+        // RFC 6891 allows several OPT options in one query, including repeats of
+        // a single code; the repeated flag must yield one EdnsOption per spec in
+        // input order, with no dedup or collapse.
+        let options =
+            parse_edns_options(&["3:00".to_string(), "8:0001".to_string(), "3:ff".to_string()])
+                .unwrap();
+        assert_eq!(options.len(), 3);
+        assert_eq!(options[0].code, 3);
+        assert_eq!(options[0].payload, vec![0x00]);
+        assert_eq!(options[1].code, 8);
+        assert_eq!(options[1].payload, vec![0x00, 0x01]);
+        // The second code-3 option is kept distinct from the first.
+        assert_eq!(options[2].code, 3);
+        assert_eq!(options[2].payload, vec![0xff]);
+    }
+
+    #[test]
     fn load_rejects_doh_method_on_non_doh() {
         let outcome = dispatch(
             &[
@@ -1430,6 +1473,38 @@ mod tests {
         );
         assert_eq!(outcome.code, 1);
         assert!(outcome.stdout.contains("invalid_url"));
+    }
+
+    #[test]
+    fn build_doh_target_folds_multiple_http_params_into_query() {
+        // Several --http-param pairs (including a repeated key, which a URL query
+        // permits) must all survive into the DoH request query, percent-encoded,
+        // in the order given.
+        let cli = Cli::try_parse_from([
+            "wiresurge",
+            "load",
+            "127.0.0.1",
+            "--protocol",
+            "doh",
+            "--url",
+            "https://dns.example/dns-query",
+            "--http-param",
+            "token=abc",
+            "--http-param",
+            " recs =x y",
+            "--http-param",
+            "token=def",
+        ])
+        .unwrap();
+        let Command::Load(args) = cli.command else {
+            panic!("expected load subcommand");
+        };
+        let addr: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let target = build_doh_target(&args, addr).unwrap();
+        let query = target.http.expect("doh target has an http template").query;
+        // Both repeats of `token` are kept distinct, and a key/value with spaces
+        // is percent-encoded rather than dropped or splicing raw spaces in.
+        assert_eq!(query, "token=abc&+recs+=x+y&token=def");
     }
 
     #[test]
