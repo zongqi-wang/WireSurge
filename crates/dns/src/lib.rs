@@ -271,6 +271,32 @@ mod tests {
     }
 
     #[test]
+    fn encodes_repeated_edns0_option_code() {
+        // RFC 6891 does not forbid two OPT options sharing a code; both must
+        // reach the wire with their own payloads rather than one overwriting the
+        // other. Distinct payloads make each option independently detectable.
+        let options = [
+            EdnsOption {
+                code: 65001,
+                payload: b"first".to_vec(),
+            },
+            EdnsOption {
+                code: 65001,
+                payload: b"second".to_vec(),
+            },
+        ];
+        let packet = build_query(0x1234, "example.com", 1, &options).unwrap();
+        assert!(
+            packet.windows(5).any(|w| w == b"first"),
+            "first payload must appear on the wire"
+        );
+        assert!(
+            packet.windows(6).any(|w| w == b"second"),
+            "second payload for the same code must not be dropped"
+        );
+    }
+
+    #[test]
     fn parses_named_and_numeric_qtypes() {
         assert_eq!(parse_qtype("AAAA").unwrap(), 28);
         assert_eq!(parse_qtype("65").unwrap(), 65);
