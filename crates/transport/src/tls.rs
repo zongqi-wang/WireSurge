@@ -61,6 +61,16 @@ pub(crate) fn server_name(target: &ConnectTarget) -> Result<ServerName<'static>>
         .sni
         .clone()
         .unwrap_or_else(|| target.tcp_addr.ip().to_string());
+    // rustls rejects a bracketed IPv6 ServerName (`[::1]`), so unbracket a
+    // user-supplied `--sni` IP literal and build the IP ServerName directly;
+    // DNS names fall through to the string parse unchanged.
+    let unbracketed = name
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(&name);
+    if let Ok(ip) = unbracketed.parse::<std::net::IpAddr>() {
+        return Ok(ServerName::from(ip));
+    }
     ServerName::try_from(name)
         .map_err(|error| WireSurgeError::new("invalid_sni", error.to_string()).at("sni"))
 }
@@ -135,5 +145,52 @@ impl ServerCertVerifier for NoVerification {
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    fn target_with_sni(addr: &str, sni: Option<&str>) -> ConnectTarget {
+        let mut target = ConnectTarget::new(addr.parse::<SocketAddr>().unwrap());
+        target.sni = sni.map(str::to_string);
+        target
+    }
+
+    #[test]
+    fn server_name_defaults_ipv6_peer_to_ip_address() {
+        let name = server_name(&target_with_sni("[2606:4700:4700::1111]:853", None)).unwrap();
+        assert!(matches!(name, ServerName::IpAddress(_)));
+    }
+
+    #[test]
+    fn server_name_accepts_bare_ipv6_sni() {
+        let name = server_name(&target_with_sni(
+            "[2606:4700:4700::1111]:853",
+            Some("2606:4700:4700::1111"),
+        ))
+        .unwrap();
+        assert!(matches!(name, ServerName::IpAddress(_)));
+    }
+
+    #[test]
+    fn server_name_accepts_bracketed_ipv6_sni() {
+        let name = server_name(&target_with_sni(
+            "[2606:4700:4700::1111]:853",
+            Some("[2606:4700:4700::1111]"),
+        ))
+        .unwrap();
+        assert!(matches!(name, ServerName::IpAddress(_)));
+
+        let loopback = server_name(&target_with_sni("[::1]:853", Some("[::1]"))).unwrap();
+        assert!(matches!(loopback, ServerName::IpAddress(_)));
+    }
+
+    #[test]
+    fn server_name_keeps_dns_name() {
+        let name = server_name(&target_with_sni("127.0.0.1:853", Some("dns.example"))).unwrap();
+        assert!(matches!(name, ServerName::DnsName(_)));
     }
 }

@@ -1,16 +1,16 @@
 # Current Implementation
 
-The repository implements a usable Rust CLI foundation: local request storage, single-request HTTP execution, and a many-in-flight DNS load engine with live terminal progress. It does **not** yet implement the desktop application, workflow compiler, or full supervised engine described in the architecture chapters.
+The repository implements a usable Rust CLI foundation: local request storage, single-request HTTP execution, and a many-in-flight DNS load engine with live terminal progress. It does **not** yet implement the desktop application, scenario compiler, or full supervised engine described in the architecture chapters.
 
 ## Workspace Status
 
 | Area | Current behavior | Important limits |
 |---|---|---|
-| `crates/core` | Serde-backed JSON/YAML request parsing, structured errors with field paths, ID generation, and output redaction. | The typed model still covers only the current flat request format, not the target workflow schema. JSONC comments are not accepted. |
+| `crates/core` | Serde-backed JSON/YAML request parsing, structured errors with field paths, ID generation, and output redaction. | The typed model still covers only the current flat request format, not the target scenario schema. JSONC comments are not accepted. |
 | `crates/cli` | `clap` derive parsing; human-oriented help, suggestions, and terminal color; `schema`, `workspace`, request CRUD, `run`, `load`, runner/report reads, structured JSON errors, and a plugin manifest example. Load runs have a human banner, live TTY samples, a labeled summary, and per-connection results. | Secrets return `not_implemented`; report export is reserved; there is no internal IPC engine mode. |
 | `crates/corpus` | Memory-mapped query-name corpus with sequential, random, and seeded-permutation selection for the load engine. | No directory watching, incremental loading, or streaming support. |
 | `crates/http` | Async pooled Hyper client for HTTP/1.1, HTTP/2, HTTP and rustls HTTPS; decoded bodies, response limits, timing, redirects-as-results, and redaction. | Redirect following remains intentionally disabled. Each current engine run sends one request, so the pool becomes useful when multi-request execution lands. |
-| `crates/dns` | DNS/EDNS0 messages via `hickory-proto` plus a protocol-agnostic `Transport`/`Connection` trait with many-in-flight Do53 UDP/TCP, DoT, and DoH connections (txid demux for Do53/DoT, HTTP/2 stream binding for DoH). | DNS-over-QUIC and workflow-stage integration are not implemented. The query corpus is DNS names only. |
+| `crates/dns` | DNS/EDNS0 messages via `hickory-proto` plus a protocol-agnostic `Transport`/`Connection` trait with many-in-flight Do53 UDP/TCP, DoT, and DoH connections (txid demux for Do53/DoT, HTTP/2 stream binding for DoH). | DNS-over-QUIC and scenario-step integration are not implemented. The query corpus is DNS names only. |
 | `crates/engine` | Async orchestration for one stored or file-based HTTP request, dry runs, runner snapshots, and optional reports. The `load` module drives the many-in-flight DNS load engine across all transports. | `--parallel` is accepted but does not send parallel HTTP requests. There is no supervisor, ladder, task tree, or durable connection manager. |
 | `crates/metrics` | Runner, worker, report, `RunSnapshot`, and aggregate models plus the `hdrhistogram`-backed `LoadRecorder`. Load progress merges per-connection histograms at a configured interval and emits a final snapshot. | The progress stream is process-local and opt-in; it is not persisted or exposed through IPC. Runner snapshots are still file snapshots rather than a continuously updated aggregation service. |
 | `crates/transport` | `ConnectTarget`, rustls/ring TLS client config (ALPN, SNI, relaxed-ALPN, resumption), TCP/UDP/TLS connect helpers, and PROXY protocol v2 stream/datagram framing. | Load connections are owned for one run and are not reconnected after failure or reused across runs. |
@@ -24,7 +24,7 @@ The repository implements a usable Rust CLI foundation: local request storage, s
 The current command surface is:
 
 ```text
-wiresurge schema <workspace|request|environment|workflow|run|report|runner>
+wiresurge schema <workspace|request|environment|scenario|run|report|runner>
 wiresurge load <server> [--protocol udp|tcp|dot|doh] [--name <domain>|--corpus <file>] [--type <qtype>] [-c <conns>] [-q <in-flight>] (--count <n>|-l <secs>)
 wiresurge workspace init|list|show [--output json]
 wiresurge request create --json '{...}'

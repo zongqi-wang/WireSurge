@@ -14,7 +14,7 @@
 
 # Specifications
 
-- [Workflow Model](workflow-model.md)
+- [Scenario Model](scenario-model.md)
 
 # Delivery
 

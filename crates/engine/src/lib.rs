@@ -155,7 +155,7 @@ async fn send_request_inner(
         warnings.push("parallel execution is accepted by the CLI, but the current scaffold executes one HTTP request per run".to_string());
     }
     if options.fail_fast {
-        warnings.push("fail-fast is enabled; multi-step workflows will stop on first failure once workflow execution is added".to_string());
+        warnings.push("fail-fast is enabled; multi-step scenarios will stop on first failure once scenario execution is added".to_string());
     }
     if options.verbose {
         warnings.push("verbose diagnostics enabled; sensitive values remain redacted".to_string());

@@ -1,7 +1,7 @@
 # Load Engine
 
 This chapter describes the DNS load engine implemented by `wiresurge load`.
-Future workflow compilation, auto-ladder scheduling, and desktop IPC are covered
+Future scenario compilation, auto-ladder scheduling, and desktop IPC are covered
 by the [Implementation Plan](implementation-plan.md) and are not part of this
 contract.
 

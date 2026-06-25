@@ -46,7 +46,7 @@ Metrics must be inexpensive in the hot path and useful after a run. The target u
 | Surface | Target data |
 |---|---|
 | Live metrics | QPS/RPS, latency percentiles, errors, timeouts, connections, bytes, and queue/worker saturation. |
-| Run report | Summary, capacity curve, thresholds, system information, workflow hash, Git commit, and redacted configuration. |
+| Run report | Summary, capacity curve, thresholds, system information, scenario hash, Git commit, and redacted configuration. |
 | Export | JSON, NDJSON, CSV, HTML, Prometheus text, and OpenTelemetry where appropriate. |
 
 Logging rules:

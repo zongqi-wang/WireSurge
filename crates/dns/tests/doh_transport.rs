@@ -83,7 +83,13 @@ fn dns_response(mut wire: Vec<u8>) -> Response<Full<Bytes>> {
 }
 
 async fn spawn_doh_echo(mode: ServerMode) -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    spawn_doh_echo_on(mode, "127.0.0.1:0").await.unwrap()
+}
+
+/// Bind the responder to a specific address. `None` when the bind is refused
+/// (e.g. no IPv6 in CI), so the caller can skip rather than hard-fail.
+async fn spawn_doh_echo_on(mode: ServerMode, bind: &str) -> Option<SocketAddr> {
+    let listener = TcpListener::bind(bind).await.ok()?;
     let addr = listener.local_addr().unwrap();
     let acceptor = TlsAcceptor::from(server_config());
     tokio::spawn(async move {
@@ -153,20 +159,36 @@ async fn spawn_doh_echo(mode: ServerMode) -> SocketAddr {
             });
         }
     });
-    addr
+    Some(addr)
 }
 
 fn doh_target(addr: SocketAddr, method: HttpMethod, query: &str) -> ConnectTarget {
+    doh_target_with(
+        addr,
+        method,
+        query,
+        "localhost",
+        "https://localhost/dns-query",
+    )
+}
+
+fn doh_target_with(
+    addr: SocketAddr,
+    method: HttpMethod,
+    query: &str,
+    sni: &str,
+    base_uri: &str,
+) -> ConnectTarget {
     let config = build_client_config(&TlsParams {
         proto: AppProto::Doh,
         insecure: true,
     })
     .unwrap();
     ConnectTarget::new(addr)
-        .with_tls(config, AppProto::Doh, Some("localhost".to_string()), false)
+        .with_tls(config, AppProto::Doh, Some(sni.to_string()), false)
         .with_http(HttpTemplate {
             method,
-            base_uri: "https://localhost/dns-query".to_string(),
+            base_uri: base_uri.to_string(),
             query: query.to_string(),
         })
 }
@@ -293,4 +315,31 @@ async fn doh_accepts_zero_id_and_2xx_non_200() {
         .await
         .expect("zero-id 202 response must be accepted, not rejected");
     assert_eq!(response.rcode, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn doh_over_ipv6_loopback() {
+    // Full IPv6 socket -> TLS (bracketed SNI exercises the unbracketing fix) ->
+    // HTTP/2 path. Skips if IPv6 loopback is unavailable in the sandbox.
+    let Some(addr) = spawn_doh_echo_on(ServerMode::Echo, "[::1]:0").await else {
+        eprintln!("skipping: IPv6 loopback bind unavailable");
+        return;
+    };
+    assert!(addr.is_ipv6(), "responder must be bound on IPv6");
+    let target = doh_target_with(
+        addr,
+        HttpMethod::Post,
+        "",
+        "[::1]",
+        "https://[::1]/dns-query",
+    );
+    let conn = DohTransport::connect(target)
+        .await
+        .expect("DoH connect over IPv6 loopback");
+    let response = conn
+        .exchange(request_with_id(11), Duration::from_secs(5))
+        .await
+        .expect("DoH exchange over IPv6 loopback");
+    assert_eq!(response.rcode, 0);
+    assert_eq!(response.correlation, 11);
 }

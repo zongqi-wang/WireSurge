@@ -200,3 +200,32 @@ pub async fn connect_tls(target: &ConnectTarget) -> Result<TlsStream<TcpStream>>
     tls::check_alpn(&stream, proto, target.alpn_relaxed)?;
     Ok(stream)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    /// connect_udp must bind the same family as the peer; a wrong-family bind only
+    /// surfaces as a runtime udp_connect_failed.
+    #[tokio::test]
+    async fn connect_udp_binds_matching_family() {
+        for (peer_ip, want_v6) in [
+            (std::net::IpAddr::V6(Ipv6Addr::LOCALHOST), true),
+            (std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), false),
+        ] {
+            let bind: SocketAddr = (peer_ip, 0).into();
+            // A bound responder gives a concrete peer; UDP cannot connect() to the
+            // unspecified address. Skip the family if loopback bind is denied.
+            let Ok(responder) = UdpSocket::bind(bind).await else {
+                continue;
+            };
+            let peer = responder.local_addr().unwrap();
+            let target = ConnectTarget::new(peer);
+            let socket = connect_udp(&target)
+                .await
+                .expect("connect_udp to a loopback responder");
+            assert_eq!(socket.local_addr().unwrap().is_ipv6(), want_v6);
+        }
+    }
+}
