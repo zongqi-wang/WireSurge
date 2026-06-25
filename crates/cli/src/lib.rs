@@ -80,7 +80,10 @@ enum Command {
 
 #[derive(Args)]
 struct LoadArgs {
-    /// Server address; host IP:port the socket actually opens.
+    /// Server address the socket opens to: a hostname, an IPv4/IPv6 literal, or
+    /// an address with a port. For an IPv6 literal, colocate a port only in the
+    /// bracketed form `[2001:db8::1]:8053`; a bare `2001:db8::1` takes its port
+    /// from --port (a trailing `:NN` would be read as a final hextet, not a port).
     server: String,
     #[arg(long, value_name = "udp|tcp|dot|doh", default_value = "udp")]
     protocol: String,
@@ -305,11 +308,22 @@ fn clap_error_to_wiresurge(error: &clap::Error) -> WireSurgeError {
 }
 
 fn resolve_addr(server: &str, port: u16) -> Result<SocketAddr> {
+    // Canonicalize an IPv4-mapped IPv6 literal (`::ffff:a.b.c.d`) back to IPv4, as
+    // parse_proxy_addr does, so the socket family and the IP-literal SNI match what
+    // the operator wrote rather than a surprising mapped-v6 form.
     if let Ok(addr) = server.parse::<SocketAddr>() {
-        return Ok(addr);
+        return Ok(SocketAddr::new(addr.ip().to_canonical(), addr.port()));
     }
     if let Ok(ip) = server.parse::<std::net::IpAddr>() {
-        return Ok(SocketAddr::new(ip, port));
+        return Ok(SocketAddr::new(ip.to_canonical(), port));
+    }
+    // A bracketed IPv6 literal with no port (`[::1]`) parses as neither SocketAddr
+    // nor IpAddr; accept it like the `[v6]:port` form. Gating on the inner IpAddr
+    // parse keeps malformed input falling through to hostname lookup.
+    if let Some(inner) = server.strip_prefix('[').and_then(|s| s.strip_suffix(']'))
+        && let Ok(ip) = inner.parse::<std::net::IpAddr>()
+    {
+        return Ok(SocketAddr::new(ip.to_canonical(), port));
     }
     (server, port)
         .to_socket_addrs()
@@ -1505,6 +1519,115 @@ mod tests {
         // Both repeats of `token` are kept distinct, and a key/value with spaces
         // is percent-encoded rather than dropped or splicing raw spaces in.
         assert_eq!(query, "token=abc&+recs+=x+y&token=def");
+    }
+
+    #[test]
+    fn resolve_addr_accepts_bare_ipv6_with_default_port() {
+        let addr = resolve_addr("2606:4700:4700::1111", 853).unwrap();
+        assert_eq!(addr, "[2606:4700:4700::1111]:853".parse().unwrap());
+    }
+
+    #[test]
+    fn resolve_addr_accepts_bracketed_ipv6_with_embedded_port() {
+        // Embedded port wins over the `port` arg.
+        let addr = resolve_addr("[2606:4700:4700::1111]:443", 853).unwrap();
+        assert_eq!(addr, "[2606:4700:4700::1111]:443".parse().unwrap());
+    }
+
+    #[test]
+    fn resolve_addr_accepts_bracketed_ipv6_without_port() {
+        // Regression: bracketed-no-port used to fail as a hostname lookup.
+        let addr = resolve_addr("[2606:4700:4700::1111]", 853).unwrap();
+        assert_eq!(addr, "[2606:4700:4700::1111]:853".parse().unwrap());
+        assert_eq!(addr, resolve_addr("2606:4700:4700::1111", 853).unwrap());
+    }
+
+    #[test]
+    fn resolve_addr_accepts_bracketed_ipv6_loopback_without_port() {
+        let addr = resolve_addr("[::1]", 5353).unwrap();
+        assert_eq!(addr, "[::1]:5353".parse().unwrap());
+    }
+
+    #[test]
+    fn resolve_addr_rejects_bracketed_non_ip() {
+        // Brackets around a non-IP fall through to hostname lookup, which fails.
+        let error = resolve_addr("[not-an-ip]", 53).unwrap_err();
+        assert_eq!(error.code, "invalid_server");
+    }
+
+    #[test]
+    fn resolve_addr_canonicalizes_ipv4_mapped_ipv6() {
+        // An IPv4-mapped IPv6 literal must collapse to IPv4 (as parse_proxy_addr
+        // does) so the socket family and IP SNI match the operator's intent.
+        for input in ["::ffff:127.0.0.1", "[::ffff:127.0.0.1]"] {
+            let addr = resolve_addr(input, 5353).unwrap();
+            assert!(addr.is_ipv4(), "{input} must canonicalize to IPv4");
+            assert_eq!(addr, "127.0.0.1:5353".parse().unwrap());
+        }
+        let with_port = resolve_addr("[::ffff:127.0.0.1]:8053", 53).unwrap();
+        assert_eq!(with_port, "127.0.0.1:8053".parse().unwrap());
+    }
+
+    #[test]
+    fn build_doh_target_ipv6_url_splits_sni_and_authority() {
+        // SNI is unbracketed (rustls needs a bare IP); base_uri keeps the brackets.
+        let cli = Cli::try_parse_from([
+            "wiresurge",
+            "load",
+            "2606:4700:4700::1111",
+            "--protocol",
+            "doh",
+            "--url",
+            "https://[2606:4700:4700::1111]/dns-query",
+        ])
+        .unwrap();
+        let Command::Load(args) = cli.command else {
+            panic!("expected load subcommand");
+        };
+        let addr: SocketAddr = "[2606:4700:4700::1111]:443".parse().unwrap();
+        let target = build_doh_target(&args, addr).unwrap();
+        assert_eq!(target.sni.as_deref(), Some("2606:4700:4700::1111"));
+        assert_eq!(
+            target
+                .http
+                .expect("doh target has an http template")
+                .base_uri,
+            "https://[2606:4700:4700::1111]/dns-query"
+        );
+    }
+
+    #[test]
+    fn load_accepts_ipv6_proxy_pair() {
+        // Parse + build the proxy header without opening any socket (dispatch would
+        // spawn connecting actors), and prove a matched all-IPv6 pair survives the
+        // family check and encodes as a TCPv6 (0x21) header.
+        let cli = Cli::try_parse_from([
+            "wiresurge",
+            "load",
+            "127.0.0.1",
+            "--protocol",
+            "tcp",
+            "--proxy-src",
+            "[2001:db8::1]:50000",
+            "--proxy-dst",
+            "[2001:db8::2]:443",
+        ])
+        .unwrap();
+        let Command::Load(args) = cli.command else {
+            panic!("expected load subcommand");
+        };
+        let header = build_proxy_header(&args)
+            .unwrap()
+            .expect("a matched IPv6 proxy pair yields a header");
+        let bytes = header
+            .encode(wiresurge_transport::ProxyTransport::Stream)
+            .unwrap();
+        assert_eq!(bytes[13], 0x21, "AF_INET6 | STREAM");
+        assert_eq!(
+            bytes.len(),
+            52,
+            "v6 header is 16-byte prefix + 36-byte block"
+        );
     }
 
     #[test]
