@@ -28,8 +28,8 @@ authority and default SNI while `<server>` remains the socket peer. POST is the
 default. `--doh-method get` sends the DNS message through the `dns` query
 parameter using unpadded base64url.
 
-Run `wiresurge load --help` for all TLS, token, corpus, PROXY, and progress
-options.
+Run `wiresurge load --help` for all TLS, EDNS, HTTP-parameter, corpus, PROXY,
+and progress options.
 
 ## Ownership And Scheduling
 
@@ -77,20 +77,23 @@ The default mode walks rows sequentially and wraps. `--randomize` samples with
 replacement using `--seed`. The corpus crate also implements an allocation-free
 seeded permutation, but the CLI does not expose that mode yet.
 
-## TLS, Tokens, And PROXY V2
+## TLS, EDNS Options, And PROXY V2
 
 DoT and DoH use rustls with the `ring` provider and native certificate roots.
 SNI is configurable, and `--alpn-relaxed` permits a peer that omits ALPN while
 still rejecting a conflicting protocol. `--insecure` disables certificate
 verification and is intended only for controlled self-signed targets.
 
-One logical `--token` is lowered by encrypted transport:
+`--edns-option CODE:HEX` attaches an EDNS0 OPT option to every query. `CODE` is
+a decimal `u16` and the payload is hex-encoded, matching `dig +ednsopt=CODE:HEX`
+(OPT data is opaque binary per RFC 6891 §6.1.2). The flag is repeatable, so one
+query can carry several options, including repeats of a single code. This is the
+mechanism for any caller-defined OPT option: place the payload bytes under
+whichever code the target expects.
 
-- DoT places its bytes in EDNS option 65184.
-- DoH appends it as a percent-encoded `token` URL query parameter.
-
-Tokens are rejected on cleartext UDP/TCP and cannot be combined with
-`--insecure`, which would send the credential to an unauthenticated peer.
+`--http-param KEY=VALUE` appends a percent-encoded query parameter to the DoH
+request URL; it is repeatable and rejected on any non-DoH protocol. The reserved
+`dns` key is refused because the adapter owns the per-query `?dns=` payload.
 
 `--proxy-src` and `--proxy-dst` must be supplied together, use the same IP
 family, and describe metadata independently of the socket peer. WireSurge emits

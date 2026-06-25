@@ -8,8 +8,8 @@ Shared React components are packaged in a Tauri desktop application. The desktop
 
 | Surface | Role |
 |---|---|
-| Desktop | Workflow editor, keychain access, reports, logs, Git state, sidecar lifecycle, and Runners view. |
-| Browser/WASM | Workflow editor, examples, report viewer, sanitized demos, and documentation playground. |
+| Desktop | Scenario editor, keychain access, reports, logs, Git state, sidecar lifecycle, and Runners view. |
+| Browser/WASM | Scenario editor, examples, report viewer, sanitized demos, and documentation playground. |
 
 Browser/WASM mode cannot generate arbitrary traffic because browser APIs do not expose raw TCP, UDP, TLS, or packet control. It remains an editor and report surface unless explicitly connected to a local engine.
 
@@ -51,7 +51,7 @@ The initial public documentation is this mdBook on GitHub Pages. A broader stati
 |---|---|
 | Home | Explain the local-first programmable traffic workbench. |
 | Download | Per-platform binaries, checksums, signatures, and release notes. |
-| Docs | Workflow, CLI, examples, plugin, and safety guidance. |
+| Docs | Scenario, CLI, examples, plugin, and safety guidance. |
 | Examples | HTTP ladders, connection policies, DoT, PROXY protocol, and EDNS0. |
 | Principles | No account, no cloud dependency, no telemetry, and protected secrets. |
 | Plugin registry | Optional curated manifests while retaining local and Git installation. |

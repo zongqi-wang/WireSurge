@@ -10,7 +10,7 @@ Every core feature works without sign-in, registration, license checks, or hoste
 
 ### No cloud dependency
 
-Workflow editing, execution, reports, secrets, plugins, and history work locally. Optional cloud sync may be considered later, but cannot become a prerequisite for core behavior.
+Scenario editing, execution, reports, secrets, plugins, and history work locally. Optional cloud sync may be considered later, but cannot become a prerequisite for core behavior.
 
 ### No telemetry
 
@@ -32,18 +32,18 @@ UI cancellation, Ctrl-C, and SIGTERM enter the same shutdown state machine. Pers
 
 Standards-heavy and security-sensitive behavior uses established first-party or third-party libraries instead of bespoke reimplementations. This includes TLS, HTTP/1.1 and HTTP/2, async runtime and signals, DNS and EDNS0 messages, JSON/YAML serialization, CLI parsing, and latency histograms.
 
-WireSurge owns the behavior that differentiates the product: scheduling, pacing, connection lifecycle, cancellation policy, workflow execution, and metrics semantics. Small, well-contained helpers can remain local. A custom parser, protocol codec, argument scanner, or cryptographic implementation is technical debt unless an architecture decision record documents why an established library cannot meet the requirement.
+WireSurge owns the behavior that differentiates the product: scheduling, pacing, connection lifecycle, cancellation policy, scenario execution, and metrics semantics. Small, well-contained helpers can remain local. A custom parser, protocol codec, argument scanner, or cryptographic implementation is technical debt unless an architecture decision record documents why an established library cannot meet the requirement.
 
-The current CLI uses `clap`, Serde, Tokio, Hyper/rustls, `hickory-proto`, and `hdrhistogram` for their respective standards-heavy concerns. WireSurge retains scheduling, pacing, connection ownership, cancellation policy, workflow semantics, metrics aggregation, and a small tested PROXY v2 encoder where a separate dependency was not justified.
+The current CLI uses `clap`, Serde, Tokio, Hyper/rustls, `hickory-proto`, and `hdrhistogram` for their respective standards-heavy concerns. WireSurge retains scheduling, pacing, connection ownership, cancellation policy, scenario semantics, metrics aggregation, and a small tested PROXY v2 encoder where a separate dependency was not justified.
 
 ## Product Shape
 
-The target product has two user-facing surfaces and one internal engine mode. They share workflow files, schemas, protocol modules, lifecycle rules, and report formats.
+The target product has two user-facing surfaces and one internal engine mode. They share scenario files, schemas, protocol modules, lifecycle rules, and report formats.
 
 | Surface | Purpose | Required capabilities |
 |---|---|---|
-| Desktop app | Explore APIs, compose workflows, run tests, inspect responses, and visualize load results. | Request editor, environments, live charts, logs, reports, and a Git-aware file browser. |
-| CLI | Human-first terminal tool for running workflows, validating configuration, and reading results; scripts and agents use an explicit machine mode. | Rich help, suggestions, color on terminals, `--output json`, and the planned `init`, `run`, `ladder`, `validate`, `report`, `secret`, and `plugin` surface. |
+| Desktop app | Explore APIs, compose scenarios, run tests, inspect responses, and visualize load results. | Request editor, environments, live charts, logs, reports, and a Git-aware file browser. |
+| CLI | Human-first terminal tool for running scenarios, validating configuration, and reading results; scripts and agents use an explicit machine mode. | Rich help, suggestions, color on terminals, `--output json`, and the planned `init`, `run`, `ladder`, `validate`, `report`, `secret`, and `plugin` surface. |
 | Engine sidecar | Run the core system as a desktop child process. | Local IPC, event streaming, cancellation, health snapshots, bounded shutdown, and no public daemon port. |
 
 The CLI invokes the engine library directly. The desktop app starts the same `wiresurge` executable in an internal `engine --ipc` mode. Keeping the engine in a child process gives the frontend both cooperative cancellation and a reliable process-level kill switch.
@@ -81,6 +81,6 @@ WireSurge can generate meaningful traffic, including from automation. Safety con
 - OS keychain storage.
 - Redaction by default in UI, logs, and reports.
 - Local secret-access audit records.
-- No secrets in workflow files unless intentionally marked unsafe.
+- No secrets in scenario files unless intentionally marked unsafe.
 
 The current implementation provides dry runs and basic output redaction. It does not yet implement target allowlists, keychain storage, or signed run profiles.

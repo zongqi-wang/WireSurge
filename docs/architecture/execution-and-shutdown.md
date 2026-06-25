@@ -19,7 +19,7 @@ Named responsibilities do not automatically receive dedicated operating-system t
 Runtime rules:
 
 - All queues are bounded and expose saturation metrics.
-- Workflow compilation, variable expansion, secret resolution, and corpus indexing finish before the hot path.
+- Scenario compilation, variable expansion, secret resolution, and corpus indexing finish before the hot path.
 - Workers update local counters and histograms; aggregation avoids one shared hot lock.
 - Work items carry indexes and immutable references rather than copied request or corpus objects.
 - Random seeds and scheduler decisions are recorded for reproducibility.
@@ -31,11 +31,11 @@ Runtime rules:
 |---|---|---|---|
 | Portable async sockets | macOS, Linux, Windows | Default desktop and CLI execution. | Prioritizes correctness and consistent cross-platform behavior. |
 | Linux batch sockets | Linux runners | High-rate UDP/TCP workloads. | Optional batching, socket sharding, and per-core ownership behind the same engine contract. |
-| Linux advanced I/O | Linux runners | Packet-rate experiments. | Evaluate `io_uring`, AF_XDP, netmap, or DPDK behind feature flags after the workflow model stabilizes. |
+| Linux advanced I/O | Linux runners | Packet-rate experiments. | Evaluate `io_uring`, AF_XDP, netmap, or DPDK behind feature flags after the scenario model stabilizes. |
 
 ## Auto-Ladder
 
-Auto-ladder is a configurable experiment, not a hardcoded algorithm. A workflow selects the climb dimension, interval, stabilization rules, stop rules, cool-down behavior, and retries.
+Auto-ladder is a configurable experiment, not a hardcoded algorithm. A scenario load run selects the climb dimension, interval, stabilization rules, stop rules, cool-down behavior, and retries.
 
 Climb dimensions can include:
 
