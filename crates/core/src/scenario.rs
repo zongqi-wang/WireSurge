@@ -21,6 +21,7 @@ use serde::Deserialize;
 
 use crate::{
     RequestSpec, RequestSpecInput, Result, WireSurgeError, deserialization_error, redact_value,
+    validate_id,
 };
 
 /// A normalized, protocol-blind response. Every protocol adapter (HTTP, DNS,
@@ -522,9 +523,7 @@ impl RunSpecInput {
         // id/name/url here rather than synthesizing one. Defer scheme/method
         // validation to post-expansion (the raw fields may be templates).
         let id = self.request.id.ok_or_else(|| missing_field("id"))?;
-        if id.trim().is_empty() {
-            return Err(WireSurgeError::new("invalid_request", "request id is required").at("id"));
-        }
+        validate_id(&id)?;
         let name = self.request.name.ok_or_else(|| missing_field("name"))?;
         let url = self.request.url.ok_or_else(|| missing_field("url"))?;
         Ok(RunSpec {

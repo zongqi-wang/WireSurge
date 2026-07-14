@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use wiresurge_core::{RequestSpec, Result, WireSurgeError, serialize_json};
+use wiresurge_core::{RequestSpec, Result, WireSurgeError, serialize_json, validate_id};
 use wiresurge_metrics::{ReportSummary, RunnerStats};
 
 #[derive(Debug, Clone)]
@@ -55,12 +55,14 @@ impl WorkspaceStore {
 
     pub fn create_request(&self, request: &RequestSpec) -> Result<()> {
         self.ensure_workspace()?;
+        validate_id(&request.id)?;
         fs::write(self.request_path(&request.id), request.to_yaml()?)?;
         Ok(())
     }
 
     pub fn update_request(&self, id: &str, request: &RequestSpec) -> Result<()> {
         self.ensure_workspace()?;
+        validate_id(id)?;
         let path = self.request_path(id);
         if !path.exists() {
             return Err(WireSurgeError::new(
@@ -77,6 +79,7 @@ impl WorkspaceStore {
 
     pub fn delete_request(&self, id: &str) -> Result<()> {
         self.ensure_workspace()?;
+        validate_id(id)?;
         let path = self.request_path(id);
         if !path.exists() {
             return Err(WireSurgeError::new(
@@ -91,6 +94,7 @@ impl WorkspaceStore {
 
     pub fn load_request(&self, id: &str) -> Result<RequestSpec> {
         self.ensure_workspace()?;
+        validate_id(id)?;
         let path = self.request_path(id);
         let input = fs::read_to_string(&path).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
@@ -207,6 +211,7 @@ impl WorkspaceStore {
 
     pub fn load_report_summary(&self, id: &str) -> Result<String> {
         self.ensure_workspace()?;
+        validate_id(id)?;
         let path = self.reports_dir().join(format!("{id}.json"));
         fs::read_to_string(&path).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
@@ -319,6 +324,35 @@ mod tests {
         let requests = store.list_requests().unwrap();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].id, "req-a");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_traversal_ids_without_touching_outside_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "wiresurge-storage-traversal-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = WorkspaceStore::new(&root);
+        store.init().unwrap();
+        let sentinel = store.metadata_dir().join("sentinel.txt");
+        fs::write(&sentinel, "keep").unwrap();
+
+        for bad in ["../../tmp/evil", "..", "a/b"] {
+            assert_eq!(
+                store.load_report_summary(bad).unwrap_err().code,
+                "invalid_request"
+            );
+            assert_eq!(store.load_request(bad).unwrap_err().code, "invalid_request");
+            assert_eq!(
+                store.delete_request(bad).unwrap_err().code,
+                "invalid_request"
+            );
+        }
+        assert!(sentinel.exists());
         let _ = fs::remove_dir_all(root);
     }
 }

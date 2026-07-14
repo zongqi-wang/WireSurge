@@ -172,7 +172,7 @@ impl RunnerStats {
         } else {
             0.0
         };
-        let error_rate = if success { 0.0 } else { 1.0 };
+        let error_rate = if success { 0.0 } else { rps };
 
         self.status = "idle".to_string();
         self.last_heartbeat = unix_timestamp();

@@ -44,6 +44,9 @@ impl Default for WorkerSlot {
 /// blocking up to the full per-request timeout on stalled queries.
 const CANCEL_GRACE: Duration = Duration::from_millis(250);
 
+const MAX_CONCURRENCY: usize = 1_000_000;
+const MAX_IN_FLIGHT: usize = 1_000_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadProto {
     Do53Udp,
@@ -79,12 +82,35 @@ impl LoadConfig {
             )
             .at("concurrency"));
         }
+        if self.concurrency > MAX_CONCURRENCY {
+            return Err(WireSurgeError::new(
+                "invalid_concurrency",
+                format!("concurrency must be at most {MAX_CONCURRENCY}"),
+            )
+            .at("concurrency"));
+        }
         if self.in_flight == 0 {
             return Err(WireSurgeError::new(
                 "invalid_in_flight",
                 "in-flight depth must be at least 1",
             )
             .at("in_flight"));
+        }
+        if self.in_flight > MAX_IN_FLIGHT {
+            return Err(WireSurgeError::new(
+                "invalid_in_flight",
+                format!("in-flight depth must be at most {MAX_IN_FLIGHT}"),
+            )
+            .at("in_flight"));
+        }
+        if let Some(qps) = self.qps_cap
+            && (qps <= 0.0 || !qps.is_finite())
+        {
+            return Err(WireSurgeError::new(
+                "invalid_qps",
+                "qps cap must be a positive, finite number",
+            )
+            .at("qps_cap"));
         }
         if self.duration.is_none() && self.count.is_none() {
             return Err(WireSurgeError::new(
@@ -166,14 +192,24 @@ async fn run_actor<T: Transport>(
     slot: Option<(Arc<Mutex<WorkerSlot>>, Duration)>,
 ) -> (usize, LoadRecorder) {
     let mut recorder = LoadRecorder::default();
-    let conn = match T::connect(target).await {
-        Ok(conn) => conn,
-        Err(_) => {
+    let conn = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
             recorder.on_conn_error();
             if let Some((slot, _)) = &slot {
                 publish_slot(slot, &recorder, 0, "failed");
             }
             return (worker_id, recorder);
+        }
+        result = tokio::time::timeout(timeout, T::connect(target)) => match result {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(_)) | Err(_) => {
+                recorder.on_conn_error();
+                if let Some((slot, _)) = &slot {
+                    publish_slot(slot, &recorder, 0, "failed");
+                }
+                return (worker_id, recorder);
+            }
         }
     };
     let cap = conn.caps().max_in_flight.min(in_flight);
@@ -347,6 +383,24 @@ fn record(
     }
 }
 
+fn merge_actor_result(
+    aggregate: &mut LoadRecorder,
+    recorders: &mut Vec<(usize, LoadRecorder)>,
+    index: usize,
+    result: std::result::Result<(usize, LoadRecorder), tokio::task::JoinError>,
+) {
+    let (worker_id, recorder) = match result {
+        Ok((worker_id, recorder)) => (worker_id, recorder),
+        Err(_) => {
+            let mut recorder = LoadRecorder::default();
+            recorder.on_conn_error();
+            (index, recorder)
+        }
+    };
+    aggregate.merge(&recorder);
+    recorders.push((worker_id, recorder));
+}
+
 pub async fn run_load(config: LoadConfig, cancel: CancellationToken) -> Result<LoadStats> {
     run_load_with_progress(config, cancel, None).await
 }
@@ -437,11 +491,8 @@ pub async fn run_load_with_progress(
 
     let mut aggregate = LoadRecorder::default();
     let mut recorders = Vec::with_capacity(config.concurrency);
-    for actor in actors {
-        if let Ok((worker_id, recorder)) = actor.await {
-            aggregate.merge(&recorder);
-            recorders.push((worker_id, recorder));
-        }
+    for (index, actor) in actors.into_iter().enumerate() {
+        merge_actor_result(&mut aggregate, &mut recorders, index, actor.await);
     }
     let duration_s = start.elapsed().as_secs_f64();
     let workers = recorders
@@ -524,5 +575,78 @@ impl LoadStats {
             "workers": self.workers,
             "cancelled": self.cancelled,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiresurge_corpus::Corpus;
+
+    fn base_config() -> LoadConfig {
+        LoadConfig {
+            proto: LoadProto::Do53Udp,
+            target: ConnectTarget::new("127.0.0.1:53".parse().unwrap()),
+            corpus: Corpus::single("example.com"),
+            qtype: 1,
+            concurrency: 1,
+            in_flight: 1,
+            timeout: Duration::from_millis(100),
+            qps_cap: None,
+            duration: None,
+            count: Some(1),
+            randomize: false,
+            seed: 0,
+            edns_options: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_bad_qps_cap() {
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let mut config = base_config();
+            config.qps_cap = Some(bad);
+            assert_eq!(config.validate().unwrap_err().code, "invalid_qps", "{bad}");
+        }
+        let mut good = base_config();
+        good.qps_cap = Some(100.0);
+        assert!(good.validate().is_ok());
+        assert!(base_config().validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_concurrency_and_in_flight() {
+        let mut too_many = base_config();
+        too_many.concurrency = MAX_CONCURRENCY + 1;
+        assert_eq!(too_many.validate().unwrap_err().code, "invalid_concurrency");
+        let mut too_deep = base_config();
+        too_deep.in_flight = MAX_IN_FLIGHT + 1;
+        assert_eq!(too_deep.validate().unwrap_err().code, "invalid_in_flight");
+    }
+
+    #[test]
+    fn merge_actor_result_records_join_error_as_conn_error() {
+        let mut aggregate = LoadRecorder::default();
+        let mut recorders = Vec::new();
+        let join_err = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(async { tokio::spawn(async { panic!("boom") }).await });
+        assert!(join_err.is_err());
+        merge_actor_result(
+            &mut aggregate,
+            &mut recorders,
+            7,
+            join_err.map(|_| unreachable!()),
+        );
+        assert_eq!(aggregate.conn_errors, 1);
+        assert_eq!(recorders.len(), 1);
+        assert_eq!(recorders[0].0, 7, "synthetic worker keyed by spawn index");
+
+        let mut recorder = LoadRecorder::default();
+        recorder.on_sent();
+        merge_actor_result(&mut aggregate, &mut recorders, 8, Ok((3, recorder)));
+        assert_eq!(aggregate.sent, 1);
+        assert_eq!(recorders[1].0, 3, "Ok result keeps its own worker id");
     }
 }

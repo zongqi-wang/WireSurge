@@ -15,7 +15,9 @@ use hyper_util::rt::TokioExecutor;
 use serde::Serialize;
 use url::Url;
 use wiresurge_core::scenario::CallResponse;
-use wiresurge_core::{RequestSpec, Result, WireSurgeError, redact_value, serialize_json};
+use wiresurge_core::{
+    RequestSpec, Result, WireSurgeError, is_sensitive_header_name, redact_value, serialize_json,
+};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
@@ -213,7 +215,7 @@ impl HttpResponse {
             .headers
             .iter()
             .map(|(key, value)| {
-                let value = if is_sensitive_header(key) {
+                let value = if is_sensitive_header_name(key) {
                     "[redacted]".to_string()
                 } else {
                     redact_value(value, secret_values)
@@ -266,13 +268,6 @@ fn parse_url(input: &str) -> Result<Url> {
     Ok(url)
 }
 
-fn is_sensitive_header(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "authorization" | "proxy-authorization" | "cookie" | "set-cookie" | "x-api-key"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
@@ -305,6 +300,24 @@ mod tests {
         let body = value.get("body").and_then(|b| b.as_str()).unwrap();
         assert!(!body.contains("aGVsbG8xMjM0NQ"), "{body}");
         assert!(body.contains("[redacted]"), "{body}");
+    }
+
+    #[test]
+    fn redacts_credential_response_headers_via_shared_predicate() {
+        let mut headers = BTreeMap::new();
+        headers.insert("set-cookie".to_string(), "session=abc123".to_string());
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        let response = HttpResponse {
+            status_code: 200,
+            reason: "OK".to_string(),
+            headers,
+            body: String::new(),
+            duration_ms: 0.0,
+            warnings: Vec::new(),
+        };
+        let value = response.to_json_value().unwrap();
+        assert_eq!(value["headers"]["set-cookie"], "[redacted]");
+        assert_eq!(value["headers"]["content-type"], "application/json");
     }
 
     #[test]

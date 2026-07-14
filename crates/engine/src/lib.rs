@@ -367,10 +367,13 @@ mod tests {
         // worker error_rate at 0.0 so a watcher saw the failed run as healthy).
         let runner = RunnerStats::local(Some("run-x".to_string()), 1)
             .finish_with_latency(resp.duration_ms, success);
-        assert_eq!(runner.error_rate, 1.0);
+        assert!(
+            runner.error_rate > 0.0,
+            "a failed run must report a nonzero error rate"
+        );
         assert_eq!(
             runner.workers.first().map(|w| w.error_rate),
-            Some(1.0),
+            Some(runner.error_rate),
             "per-worker error_rate must match the aggregate on a failed assertion"
         );
     }

@@ -103,8 +103,8 @@ mod tests {
     #[test]
     fn encodes_udp4_golden_bytes() {
         let header = ProxyHeader::new(
-            "52.5.87.206:40000".parse().unwrap(),
-            "10.216.17.23:5353".parse().unwrap(),
+            "198.51.100.23:40000".parse().unwrap(),
+            "203.0.113.99:5353".parse().unwrap(),
         );
         let bytes = header.encode(ProxyTransport::Dgram).unwrap();
         assert_eq!(bytes.len(), 28);
@@ -112,8 +112,8 @@ mod tests {
         assert_eq!(bytes[12], 0x21);
         assert_eq!(bytes[13], 0x12);
         assert_eq!(&bytes[14..16], &12u16.to_be_bytes());
-        assert_eq!(&bytes[16..20], &[52, 5, 87, 206]);
-        assert_eq!(&bytes[20..24], &[10, 216, 17, 23]);
+        assert_eq!(&bytes[16..20], &[198, 51, 100, 23]);
+        assert_eq!(&bytes[20..24], &[203, 0, 113, 99]);
         assert_eq!(&bytes[24..26], &40000u16.to_be_bytes());
         assert_eq!(&bytes[26..28], &5353u16.to_be_bytes());
     }

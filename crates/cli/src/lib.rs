@@ -381,6 +381,25 @@ fn build_load_config(args: &LoadArgs) -> Result<LoadConfig> {
         )
         .at("duration-s"));
     }
+    // Guard the float knobs before they reach `Duration::from_secs_f64`, which
+    // panics on a negative, non-finite, or overflowing value: --duration-s
+    // feeds the stop clock and --qps feeds the RateGate's `index / qps` gap.
+    if let Some(duration_s) = args.duration_s
+        && (duration_s <= 0.0 || !duration_s.is_finite())
+    {
+        return Err(WireSurgeError::new(
+            "invalid_duration",
+            "--duration-s must be a positive, finite number",
+        )
+        .at("duration-s"));
+    }
+    if let Some(qps) = args.qps
+        && (qps <= 0.0 || !qps.is_finite())
+    {
+        return Err(
+            WireSurgeError::new("invalid_qps", "--qps must be a positive, finite number").at("qps"),
+        );
+    }
     if !args.http_params.is_empty() && !is_doh {
         return Err(WireSurgeError::new(
             "http_param_requires_doh",
@@ -672,9 +691,9 @@ fn format_load_banner(args: &LoadArgs, config: &LoadConfig) -> String {
         (_, Some(count)) => format!("until {} queries are sent", group_u64(count)),
         _ => "until interrupted".to_string(),
     };
-    let total_in_flight = config.concurrency * config.in_flight;
+    let total_in_flight = config.concurrency.saturating_mul(config.in_flight);
     let rate = match args.qps {
-        Some(qps) => format!("capped at {} queries/sec", group_u64(qps as u64)),
+        Some(qps) => format!("capped at {qps:.2} queries/sec"),
         None => "as fast as the target allows".to_string(),
     };
 
