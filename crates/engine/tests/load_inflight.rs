@@ -94,3 +94,69 @@ async fn duration_mode_stops_and_counts() {
     assert!(stats.recorder.received > 0);
     assert!(stats.duration_s >= 0.3);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_before_connect_returns_promptly_as_conn_error() {
+    let config = LoadConfig {
+        proto: LoadProto::Do53Tcp,
+        target: ConnectTarget::new("10.255.255.1:53".parse().unwrap()),
+        corpus: Corpus::single("example.com"),
+        qtype: 1,
+        concurrency: 4,
+        in_flight: 8,
+        timeout: Duration::from_secs(30),
+        qps_cap: None,
+        duration: None,
+        count: Some(1000),
+        randomize: false,
+        seed: 0,
+        edns_options: Vec::new(),
+    };
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let started = std::time::Instant::now();
+    let stats = run_load(config, cancel).await.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "cancelled run must not block on connect"
+    );
+    assert_eq!(
+        stats.recorder.conn_errors, 4,
+        "each actor records a conn error"
+    );
+    assert!(stats.cancelled);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "depends on a black-hole address (SYN never answered); network-dependent timing"]
+async fn connect_timeout_bounds_a_black_hole_target() {
+    let config = LoadConfig {
+        proto: LoadProto::Do53Tcp,
+        target: ConnectTarget::new("10.255.255.1:53".parse().unwrap()),
+        corpus: Corpus::single("example.com"),
+        qtype: 1,
+        concurrency: 2,
+        in_flight: 4,
+        timeout: Duration::from_millis(200),
+        qps_cap: None,
+        duration: None,
+        count: Some(10),
+        randomize: false,
+        seed: 0,
+        edns_options: Vec::new(),
+    };
+    let started = std::time::Instant::now();
+    let stats = run_load(config, CancellationToken::new()).await.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "connect must be bounded by the timeout, not the OS SYN timeout"
+    );
+    assert_eq!(
+        stats.recorder.received, 0,
+        "no query can succeed to a dead target"
+    );
+    assert!(
+        stats.recorder.conn_errors > 0 || stats.recorder.errors > 0,
+        "a dead target must surface as connection/transport errors"
+    );
+}

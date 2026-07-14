@@ -102,9 +102,7 @@ impl RequestSpec {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.id.trim().is_empty() {
-            return Err(WireSurgeError::new("invalid_request", "request id is required").at("id"));
-        }
+        validate_id(&self.id)?;
         if self.name.trim().is_empty() {
             return Err(
                 WireSurgeError::new("invalid_request", "request name is required").at("name"),
@@ -121,6 +119,11 @@ impl RequestSpec {
                 "request url must start with http:// or https://",
             )
             .at("url"));
+        }
+        if self.method.trim().is_empty() {
+            return Err(
+                WireSurgeError::new("invalid_request", "request method is required").at("method"),
+            );
         }
         if !self.method.chars().all(|char| char.is_ascii_uppercase()) {
             return Err(
@@ -152,7 +155,7 @@ impl RequestSpec {
             .headers
             .iter()
             .map(|(key, value)| {
-                let value = if contains_sensitive_marker(key) {
+                let value = if is_sensitive_header_name(key) || contains_sensitive_marker(key) {
                     "[redacted]".to_string()
                 } else {
                     redact_value(value, secret_values)
@@ -283,6 +286,31 @@ pub fn generate_id(prefix: &str, name: &str) -> String {
     format!("{prefix}-{slug}-{suffix}")
 }
 
+pub fn validate_id(id: &str) -> Result<()> {
+    if id.trim().is_empty() {
+        return Err(WireSurgeError::new("invalid_request", "id is required").at("id"));
+    }
+    if id.contains("..") {
+        return Err(
+            WireSurgeError::new("invalid_request", "id must not contain '..'")
+                .at("id")
+                .with_hint("ids may contain only letters, digits, '.', '-', and '_'."),
+        );
+    }
+    if !id
+        .chars()
+        .all(|char| char.is_ascii_alphanumeric() || matches!(char, '.' | '-' | '_'))
+    {
+        return Err(WireSurgeError::new(
+            "invalid_request",
+            "id may contain only letters, digits, '.', '-', and '_'",
+        )
+        .at("id")
+        .with_hint("ids are used as workspace file names, so path separators are rejected."));
+    }
+    Ok(())
+}
+
 pub fn slugify(input: &str) -> String {
     let mut output = String::new();
     for char in input.chars() {
@@ -389,6 +417,13 @@ fn contains_sensitive_marker(input: &str) -> bool {
     .any(|marker| normalized.contains(marker))
 }
 
+pub fn is_sensitive_header_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization" | "proxy-authorization" | "cookie" | "set-cookie" | "x-api-key" | "api-key"
+    )
+}
+
 pub fn schema_for(resource: &str) -> Result<String> {
     let schema = match resource {
         "workspace" => serde_json::json!({
@@ -478,6 +513,75 @@ mod tests {
         let error = RequestSpec::from_json(r#"{"url":"http://localhost"}"#).unwrap_err();
         assert_eq!(error.code, "invalid_request");
         assert_eq!(error.path.as_deref(), Some("name"));
+    }
+
+    #[test]
+    fn redacts_hyphenated_credential_headers() {
+        for header in ["cookie", "set-cookie", "x-api-key", "api-key"] {
+            let mut headers = BTreeMap::new();
+            headers.insert(header.to_string(), "super-secret-value".to_string());
+            let request = RequestSpec {
+                id: "req-a".to_string(),
+                name: "A".to_string(),
+                method: "GET".to_string(),
+                url: "http://localhost".to_string(),
+                headers,
+                body: None,
+            };
+            let value = request.to_json_value().unwrap();
+            let redacted = value["headers"][header].as_str().unwrap();
+            assert_eq!(redacted, "[redacted]", "{header} value must be redacted");
+        }
+    }
+
+    #[test]
+    fn does_not_wholesale_redact_nonsensitive_header_value_containing_marker() {
+        let mut headers = BTreeMap::new();
+        headers.insert("x-note".to_string(), "prefers cookie dough".to_string());
+        let request = RequestSpec {
+            id: "req-a".to_string(),
+            name: "A".to_string(),
+            method: "GET".to_string(),
+            url: "http://localhost".to_string(),
+            headers,
+            body: None,
+        };
+        let value = request.to_json_value().unwrap();
+        assert_eq!(value["headers"]["x-note"], "prefers cookie dough");
+    }
+
+    #[test]
+    fn validate_rejects_traversal_ids() {
+        for bad in ["../../etc/evil", "..", "a/b", "a\\b", "", "   ", "a b"] {
+            let error = RequestSpec::from_json(&format!(
+                r#"{{"id":{},"name":"A","url":"http://localhost"}}"#,
+                serde_json::to_string(bad).unwrap()
+            ))
+            .unwrap_err();
+            assert_eq!(error.code, "invalid_request", "id {bad:?} must be rejected");
+            assert_eq!(error.path.as_deref(), Some("id"));
+        }
+    }
+
+    #[test]
+    fn validate_accepts_generated_id() {
+        assert!(validate_id(&generate_id("req", "My Request Name!")).is_ok());
+        assert!(validate_id("req-a.b_c-123").is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_empty_method() {
+        let request = RequestSpec {
+            id: "req-a".to_string(),
+            name: "A".to_string(),
+            method: String::new(),
+            url: "http://localhost".to_string(),
+            headers: BTreeMap::new(),
+            body: None,
+        };
+        let error = request.validate().unwrap_err();
+        assert_eq!(error.code, "invalid_request");
+        assert_eq!(error.path.as_deref(), Some("method"));
     }
 
     #[test]

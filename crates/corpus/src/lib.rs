@@ -46,6 +46,13 @@ impl Corpus {
         let map = unsafe { Mmap::map(&file) }.map_err(|error| {
             WireSurgeError::new("corpus_map_failed", error.to_string()).at("file")
         })?;
+        if map.len() > u32::MAX as usize {
+            return Err(WireSurgeError::new(
+                "corpus_too_large",
+                "corpus file exceeds the 4 GiB limit",
+            )
+            .at("file"));
+        }
         let rows = index_rows(&map);
         if rows.is_empty() {
             return Err(
@@ -121,7 +128,7 @@ fn push_row(rows: &mut Vec<(u32, u32)>, bytes: &[u8], start: usize, mut end: usi
     if end > start && bytes[end - 1] == b'\r' {
         end -= 1;
     }
-    if end > start {
+    if end > start && std::str::from_utf8(&bytes[start..end]).is_ok() {
         rows.push((start as u32, end as u32));
     }
 }
@@ -166,6 +173,26 @@ mod tests {
         assert_eq!(corpus.len(), 3);
         assert_eq!(corpus.row(0), "a.com");
         assert_eq!(corpus.row(2), "c.com");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn skips_non_utf8_rows() {
+        let path = std::env::temp_dir().join(format!(
+            "wiresurge-corpus-nonutf8-{}.txt",
+            std::process::id()
+        ));
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(b"good.com\n").unwrap();
+        file.write_all(&[0xff, 0xfe, b'\n']).unwrap();
+        file.write_all(b"also-good.com\n").unwrap();
+        drop(file);
+
+        let corpus = Corpus::load(&path).unwrap();
+        assert_eq!(corpus.len(), 2, "the non-UTF-8 row must be skipped");
+        assert_eq!(corpus.row(0), "good.com");
+        assert_eq!(corpus.row(1), "also-good.com");
+        assert!(corpus.iter_rows().all(|name| !name.is_empty()));
         let _ = std::fs::remove_file(path);
     }
 

@@ -46,7 +46,7 @@ impl LoadRecorder {
         // rcode is the DNS header low-nibble only (see parse_response_header);
         // index 16 is the catch-all for any code >= 16.
         self.rcodes[usize::from(rcode.min(16))] += 1;
-        let _ = self.hist.record(latency_us.max(1));
+        self.hist.saturating_record(latency_us.max(1));
     }
 
     pub fn on_timeout(&mut self) {
@@ -150,5 +150,23 @@ impl LoadRecorder {
                 (name, count)
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn over_ceiling_latency_is_clamped_not_dropped() {
+        let mut recorder = LoadRecorder::default();
+        recorder.on_response(0, false, 64, 70_000_000);
+        assert_eq!(recorder.received, 1);
+        assert!(
+            recorder.max_ms() >= 59_000.0,
+            "clamped latency should sit near the 60s ceiling, got {}",
+            recorder.max_ms()
+        );
+        assert!(recorder.percentile_ms(0.99) >= 59_000.0);
     }
 }

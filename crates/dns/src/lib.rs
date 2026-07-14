@@ -165,6 +165,13 @@ pub fn decode_hex_payload(value: &str) -> Result<Vec<u8>> {
         .chars()
         .filter(|character| !character.is_ascii_whitespace())
         .collect::<String>();
+    if !compact.is_ascii() {
+        return Err(WireSurgeError::new(
+            "invalid_hex_payload",
+            "hex payload must contain only ASCII hexadecimal digits",
+        )
+        .at("edns_payload"));
+    }
     if compact.len() % 2 != 0 {
         return Err(WireSurgeError::new(
             "invalid_hex_payload",
@@ -300,6 +307,15 @@ mod tests {
     fn parses_named_and_numeric_qtypes() {
         assert_eq!(parse_qtype("AAAA").unwrap(), 28);
         assert_eq!(parse_qtype("65").unwrap(), 65);
+    }
+
+    #[test]
+    fn decode_hex_payload_rejects_non_ascii_without_panicking() {
+        for bad in ["caé", "€1", "日本"] {
+            let error = decode_hex_payload(bad).unwrap_err();
+            assert_eq!(error.code, "invalid_hex_payload", "{bad:?}");
+        }
+        assert_eq!(decode_hex_payload("ca fe").unwrap(), vec![0xca, 0xfe]);
     }
 
     #[test]
