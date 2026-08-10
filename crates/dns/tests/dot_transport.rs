@@ -14,8 +14,9 @@ use wiresurge_dns::transport::dot::DotTransport;
 use wiresurge_dns::transport::{Connection, DnsRequest, Transport, TransportError};
 use wiresurge_transport::{AppProto, ConnectTarget, TlsParams, build_client_config};
 
-const CERT_DER: &[u8] = include_bytes!("fixtures/cert.der");
-const KEY_DER: &[u8] = include_bytes!("fixtures/key.der");
+use fixtures::{CERT_DER, KEY_DER};
+
+mod fixtures;
 
 /// Behaviour of the DoT echo server for a given test.
 #[derive(Clone, Copy)]
