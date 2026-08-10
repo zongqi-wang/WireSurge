@@ -18,7 +18,8 @@ use wiresurge_core::{
 use wiresurge_corpus::Corpus;
 use wiresurge_dns::{EdnsOption, decode_hex_payload, parse_qtype};
 use wiresurge_engine::load::{
-    LoadConfig, LoadProto, LoadStats, ProgressConfig, run_load, run_load_with_progress,
+    LoadConfig, LoadProto, LoadStats, MAX_RUN_SECS, ProgressConfig, ValidatedLoadPlan, run_load,
+    run_load_with_progress,
 };
 use wiresurge_engine::{RunOptions, run_run_spec_with_cancellation};
 use wiresurge_metrics::RunSnapshot;
@@ -208,16 +209,17 @@ impl CliOutcome {
     }
 
     fn err(error: WireSurgeError, output_json: bool) -> Self {
+        let code = if error.rejected { 2 } else { 1 };
         if output_json {
             Self {
-                code: 1,
+                code,
                 stdout: serde_json::to_string(&serde_json::json!({ "error": error }))
                     .unwrap_or_else(|_| error.to_json()),
                 stderr: String::new(),
             }
         } else {
             Self {
-                code: 1,
+                code,
                 stdout: String::new(),
                 stderr: error.to_string(),
             }
@@ -385,13 +387,14 @@ fn build_load_config(args: &LoadArgs) -> Result<LoadConfig> {
     // panics on a negative, non-finite, or overflowing value: --duration-s
     // feeds the stop clock and --qps feeds the RateGate's `index / qps` gap.
     if let Some(duration_s) = args.duration_s
-        && (duration_s <= 0.0 || !duration_s.is_finite())
+        && (duration_s <= 0.0 || !duration_s.is_finite() || duration_s > MAX_RUN_SECS)
     {
         return Err(WireSurgeError::new(
             "invalid_duration",
-            "--duration-s must be a positive, finite number",
+            "--duration-s must be a positive, finite number of seconds (at most 7 days)",
         )
-        .at("duration-s"));
+        .at("duration-s")
+        .rejected());
     }
     if let Some(qps) = args.qps
         && (qps <= 0.0 || !qps.is_finite())
@@ -625,10 +628,14 @@ fn parse_proxy_addr(value: &str, field: &str) -> Result<SocketAddr> {
 
 async fn load_command(args: LoadArgs, output_json: bool) -> Result<(String, i32)> {
     let config = build_load_config(&args)?;
+    // ADR 0005: the engine executes only admitted plans; a rejection here
+    // surfaces as a structured error with exit code 2.
+    let plan = ValidatedLoadPlan::new(config)?;
+    let config = plan.config();
 
     let progress_enabled = !output_json && !args.no_progress && std::io::stderr().is_terminal();
     if !output_json {
-        eprintln!("{}", format_load_banner(&args, &config));
+        eprintln!("{}", format_load_banner(&args, config));
     }
 
     let cancellation = CancellationToken::new();
@@ -639,7 +646,7 @@ async fn load_command(args: LoadArgs, output_json: bool) -> Result<(String, i32)
         let (tx, rx) = watch::channel(RunSnapshot::default());
         let renderer = tokio::spawn(render_progress(rx));
         let execution = run_load_with_progress(
-            config,
+            plan.clone(),
             cancellation.clone(),
             Some((ProgressConfig { interval }, tx)),
         );
@@ -648,7 +655,7 @@ async fn load_command(args: LoadArgs, output_json: bool) -> Result<(String, i32)
         let _ = renderer.await;
         result?
     } else {
-        let execution = run_load(config, cancellation.clone());
+        let execution = run_load(plan, cancellation.clone());
         drive_with_signal(execution, &cancellation).await?
     };
 
