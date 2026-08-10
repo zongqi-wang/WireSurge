@@ -25,3 +25,12 @@
 # Reference
 
 - [References](references.md)
+
+# Decisions
+
+- [Decision Records](architecture/decisions/README.md)
+- [ADR 0001 — License and Contribution Model](architecture/decisions/0001-license-and-contribution-model.md)
+- [ADR 0002 — Numeric Domains and Scheduling](architecture/decisions/0002-numeric-domains-and-scheduling.md)
+- [ADR 0003 — Terminal Outcome and Exit Policy](architecture/decisions/0003-terminal-outcome-and-exit-policy.md)
+- [ADR 0004 — DNS Goodput and Metric Units](architecture/decisions/0004-dns-goodput-and-metric-units.md)
+- [ADR 0005 — Resource Limits and Admission](architecture/decisions/0005-resource-limits-and-admission.md)
