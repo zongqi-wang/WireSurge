@@ -21,7 +21,7 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 use wiresurge_corpus::Corpus;
-use wiresurge_engine::load::{LoadConfig, LoadProto, LoadStats, run_load};
+use wiresurge_engine::load::{LoadConfig, LoadProto, LoadStats, ValidatedLoadPlan, run_load};
 use wiresurge_transport::ConnectTarget;
 
 /// Zero-delay UDP echo: flip the QR/RA bits and send straight back inline (no
@@ -88,7 +88,7 @@ fn make_cfg(addr: SocketAddr, corpus: Arc<Corpus>, concurrency: usize, count: u6
 
 async fn run(addr: SocketAddr, corpus: Arc<Corpus>, threads: usize, count: u64) -> LoadStats {
     run_load(
-        make_cfg(addr, corpus, threads, count),
+        ValidatedLoadPlan::new(make_cfg(addr, corpus, threads, count)).unwrap(),
         CancellationToken::new(),
     )
     .await

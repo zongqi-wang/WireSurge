@@ -29,8 +29,11 @@ Aggregate limits (conservative, documented, and enforced):
 | `connections × in-flight` | ≤ 4096 total in-flight queries |
 | in-flight bytes estimate | ≤ 256 MiB |
 | corpus rows | ≤ 10,000,000 |
-| encoded payload expansion (total wire bytes) | ≤ 512 MiB |
 | wall-clock run length | ≤ 7 days (ADR 0002) |
+
+Encoded payload expansion (the engine pre-encodes every corpus row) is a
+P0-B admission item per the data-and-connections chapter; the row-count cap
+bounds it for P0-A.
 
 The engine entry points accept only `ValidatedLoadPlan`; `LoadConfig` is a
 CLI-side transfer type and cannot be executed directly. A rejected plan

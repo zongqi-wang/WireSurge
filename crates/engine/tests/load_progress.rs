@@ -6,7 +6,7 @@ use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 use wiresurge_corpus::Corpus;
 use wiresurge_engine::load::{
-    LoadConfig, LoadProto, ProgressConfig, run_load, run_load_with_progress,
+    LoadConfig, LoadProto, ProgressConfig, ValidatedLoadPlan, run_load, run_load_with_progress,
 };
 use wiresurge_metrics::RunSnapshot;
 use wiresurge_transport::ConnectTarget;
@@ -56,9 +56,12 @@ fn config(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn retains_per_worker_stats() {
     let addr = spawn_echo().await;
-    let stats = run_load(config(addr, 3, Some(900), None), CancellationToken::new())
-        .await
-        .unwrap();
+    let stats = run_load(
+        ValidatedLoadPlan::new(config(addr, 3, Some(900), None)).unwrap(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(stats.workers.len(), 3);
     let worker_qps: f64 = stats.workers.iter().map(|w| w.qps).sum();
@@ -92,7 +95,7 @@ async fn emits_live_then_final_snapshot() {
     });
 
     let stats = run_load_with_progress(
-        config(addr, 2, None, Some(Duration::from_millis(350))),
+        ValidatedLoadPlan::new(config(addr, 2, None, Some(Duration::from_millis(350)))).unwrap(),
         cancel,
         Some((
             ProgressConfig {
@@ -120,13 +123,16 @@ async fn emits_live_then_final_snapshot() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn no_progress_matches_progress_counts() {
     let addr = spawn_echo().await;
-    let plain = run_load(config(addr, 2, Some(500), None), CancellationToken::new())
-        .await
-        .unwrap();
+    let plain = run_load(
+        ValidatedLoadPlan::new(config(addr, 2, Some(500), None)).unwrap(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
 
     let (tx, _rx) = tokio::sync::watch::channel(RunSnapshot::default());
     let withp = run_load_with_progress(
-        config(addr, 2, Some(500), None),
+        ValidatedLoadPlan::new(config(addr, 2, Some(500), None)).unwrap(),
         CancellationToken::new(),
         Some((
             ProgressConfig {

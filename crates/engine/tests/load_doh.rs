@@ -23,7 +23,7 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 use wiresurge_corpus::Corpus;
-use wiresurge_engine::load::{LoadConfig, LoadProto, run_load};
+use wiresurge_engine::load::{LoadConfig, LoadProto, ValidatedLoadPlan, run_load};
 use wiresurge_transport::{
     AppProto, ConnectTarget, HttpMethod, HttpTemplate, TlsParams, build_client_config,
 };
@@ -161,9 +161,12 @@ async fn doh_many_in_flight_beats_one_in_flight() {
 
     let count = 1000u64;
     let started = std::time::Instant::now();
-    let stats = run_load(doh_config(addr, count), CancellationToken::new())
-        .await
-        .unwrap();
+    let stats = run_load(
+        ValidatedLoadPlan::new(doh_config(addr, count)).unwrap(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     let elapsed = started.elapsed();
 
     assert_eq!(stats.recorder.sent, count);
@@ -193,9 +196,12 @@ async fn doh_dead_connection_does_not_busy_spin() {
     let count = 50_000_000u64;
 
     let started = std::time::Instant::now();
-    let stats = run_load(doh_config(addr, count), CancellationToken::new())
-        .await
-        .unwrap();
+    let stats = run_load(
+        ValidatedLoadPlan::new(doh_config(addr, count)).unwrap(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     let elapsed = started.elapsed();
 
     assert!(
