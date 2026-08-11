@@ -42,8 +42,11 @@ Scheduling semantics:
 2. All duration arithmetic uses checked operations (`checked_add`, saturating
    conversions); an overflowing computation yields a structured error, never a
    panic.
-3. `Duration::from_secs_f64` is replaced by integer-based computation
-   (microsecond ticks) so the QPS schedule cannot panic.
+3. `RateGate::wait` retains `Duration::from_secs_f64` for the QPS schedule; it
+   cannot panic because the slot pre-check (rule 1) refuses any index whose
+   scheduled instant is at or past the deadline — or past `MAX_RUN_SECS` when
+   there is no deadline — so every computed duration is bounded below
+   `MAX_RUN_SECS`.
 4. Missed-slot policy: if the runtime falls behind, later slots are **not**
    compressed — the rate gate sleeps to the scheduled instant, so the run
    duration truthfully reflects the requested rate.

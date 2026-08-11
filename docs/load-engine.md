@@ -104,8 +104,8 @@ on every UDP datagram. Stream headers precede the TLS ClientHello.
 
 Each connection records sent and received counts, timeouts, query errors,
 connection errors, truncated responses, received bytes, rcodes, and latency in
-an HDR histogram. A NOERROR rate is reported separately from total receive rate
-so fast error responses do not look like successful resolution throughput.
+an HDR histogram. Goodput (matching-valid responses with rcode 0, including
+EDNS extended RCODE) is reported separately from the total receive rate.
 
 Human mode uses three output layers:
 
@@ -123,7 +123,7 @@ one JSON value and stderr is empty. The result includes:
 
 ```text
 duration_s, sent, received, timeouts, errors, conn_errors, truncated,
-recv_qps, noerror_qps, rcodes, latency_ms, workers, cancelled
+recv_qps, goodput_qps, rcodes, latency_ms, workers, cancelled
 ```
 
 The library's opt-in `run_load_with_progress` API publishes `RunSnapshot`
@@ -134,10 +134,12 @@ an NDJSON stream, persistent history, or sidecar IPC protocol.
 
 ## Cancellation And Limits
 
-Ctrl-C and SIGTERM cancel the shared token. Actors stop requesting work, collect
-completed in-flight exchanges for up to 250 ms, invoke the transport drain hook,
-and return final metrics. The CLI marks the run cancelled and returns the
-signal-derived exit code.
+Ctrl-C and SIGTERM cancel the shared token. Actors attempt to stop requesting work,
+collect completed in-flight exchanges for up to 250 ms, invoke the transport drain
+hook, and return a summary; the run exits with the signal-derived code (130/143)
+and every runner record reaches a terminal state (ADR 0003). An actor task that
+panics is still merged as a connection error rather than a distinct `Failed`
+outcome (ADR 0003 row deferred to a later P0-A slice).
 
 Current limitations:
 

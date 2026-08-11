@@ -16,7 +16,7 @@ check, and there is no shared concept of "how much may this run consume".
 One internal admission module (engine crate) owns the only constructors:
 
 - `ValidatedLoadPlan` — private fields, constructed only by
-  `ValidatedLoadPlan::new(LoadConfig) -> Result<ValidatedLoadPlan, LoadError>`
+  `ValidatedLoadPlan::new(LoadConfig) -> Result<ValidatedLoadPlan, WireSurgeError>`
   after domain checks (ADR 0002) and aggregate checks below.
 - `ResourceBudget` — computed from the plan: estimated in-flight bytes
   (connections × in-flight × max wire message length), corpus size, and
@@ -37,7 +37,7 @@ bounds it for P0-A.
 
 The engine entry points accept only `ValidatedLoadPlan`; `LoadConfig` is a
 CLI-side transfer type and cannot be executed directly. A rejected plan
-produces a structured `LoadError` with field paths, never a panic, and the
+produces a structured `WireSurgeError` with field paths, never a panic, and the
 CLI maps it to exit code 2 (ADR 0003).
 
 ## Consequences

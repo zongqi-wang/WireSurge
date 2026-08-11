@@ -175,6 +175,7 @@ impl RunnerStats {
         let error_rate = if success { 0.0 } else { rps };
 
         self.status = "idle".to_string();
+        self.active_run_id = None;
         self.last_heartbeat = unix_timestamp();
         self.rps = rps;
         self.qps = rps;
