@@ -29,12 +29,13 @@ pub struct ResponseHeader {
 /// response to its own stream and RFC 8484 §4.1 treats the DNS id as 0 — a
 /// resolver, forwarder, or HTTP cache may legitimately return any id, so an
 /// equality check there would reject valid answers.
+///
+/// The RCODE is the full 12-bit value: the header nibble plus the EDNS
+/// extended bits from the OPT record's TTL high byte (RFC 6891 §6.1.3) when
+/// one is present. The message structure is walked allocation-free; a
+/// truncated or structurally invalid body is an error (ADR 0004: a malformed
+/// response is a protocol error, never goodput).
 pub fn parse_response_header(response: &[u8], expected_id: Option<u16>) -> Result<ResponseHeader> {
-    // Decode only the fixed 12-byte DNS header — id, flags, rcode — which is all
-    // a load run records. `Header::from_bytes` reads exactly those bytes and
-    // skips the question/answer/authority/additional sections entirely, so a
-    // multi-million-reply run avoids hickory's full per-record decode and its
-    // allocations on the hot reply path.
     let header = Header::from_bytes(response).map_err(|error| {
         WireSurgeError::new("invalid_dns_response", error.to_string()).retryable(false)
     })?;
@@ -61,17 +62,128 @@ pub fn parse_response_header(response: &[u8], expected_id: Option<u16>) -> Resul
             "DNS response has an unexpected opcode",
         ));
     }
+    let extended = opt_extended_rcode(response)
+        .map_err(|error| WireSurgeError::new("invalid_dns_response", error).retryable(false))?
+        .unwrap_or(0);
     Ok(ResponseHeader {
-        // Low 4 bits only: `Header::from_bytes` masks rcode to the header nibble
-        // (hickory `ResponseCode::from_low`). The 12-bit EDNS extended rcode lives
-        // in the OPT RR TTL high byte (additional section); recovering it would
-        // require a full `Message::from_vec` decode of every reply, defeating this
-        // header-only fast path. rcode is stats-only (never gates retry/error) and
-        // extended rcodes (>= 16) do not occur under plain query load, so the
-        // low-nibble value is sufficient.
-        rcode: u16::from(header.response_code),
+        rcode: u16::from(header.response_code) | (u16::from(extended) << 4),
         truncated: header.truncation,
     })
+}
+
+fn invalid_body() -> String {
+    "malformed DNS response body".to_string()
+}
+
+/// Walk the question/answer/authority/additional sections allocation-free and
+/// return the extended RCODE high byte of the last OPT record (RFC 6891
+/// §6.1.3), or `None` when no OPT record is present.
+fn opt_extended_rcode(msg: &[u8]) -> std::result::Result<Option<u8>, String> {
+    if msg.len() < 12 {
+        return Err(invalid_body());
+    }
+    let qd = u16::from_be_bytes([msg[4], msg[5]]);
+    let an = u16::from_be_bytes([msg[6], msg[7]]);
+    let ns = u16::from_be_bytes([msg[8], msg[9]]);
+    let ar = u16::from_be_bytes([msg[10], msg[11]]);
+    let mut pos = 12usize;
+    for _ in 0..qd {
+        pos = skip_name(msg, pos).ok_or_else(invalid_body)?;
+        pos = pos.checked_add(4).ok_or_else(invalid_body)?;
+        if pos > msg.len() {
+            return Err(invalid_body());
+        }
+    }
+    let mut extended = None;
+    for _ in 0..(an as usize + ns as usize + ar as usize) {
+        pos = skip_name(msg, pos).ok_or_else(invalid_body)?;
+        let Some(rest) = msg.get(pos..pos + 10) else {
+            return Err(invalid_body());
+        };
+        if u16::from_be_bytes([rest[0], rest[1]]) == 41 {
+            extended = Some(rest[4]); // OPT TTL high byte (RFC 6891 §6.1.3)
+        }
+        let rdlen = u16::from_be_bytes([rest[8], rest[9]]) as usize;
+        pos += 10 + rdlen;
+        if pos > msg.len() {
+            return Err(invalid_body());
+        }
+    }
+    Ok(extended)
+}
+
+/// RFC 1035 label walk starting at `pos`, handling compression pointers (the
+/// pointer occupies 2 bytes; RFC 1035 §4.1.4). `None` on truncation or a
+/// reserved label type.
+fn skip_name(msg: &[u8], mut pos: usize) -> Option<usize> {
+    loop {
+        let len = *msg.get(pos)?;
+        match len & 0xC0 {
+            0xC0 => return Some(pos + 2),
+            0x00 if len == 0 => return Some(pos + 1),
+            0x00 => {
+                pos += 1 + len as usize;
+                if pos > msg.len() {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// Byte range of the question section (qname + qtype + qclass) when
+/// `qdcount == 1` and the name is uncompressed (RFC 1035 §4.1.2 question
+/// names are not compressed).
+pub(crate) fn question_range(msg: &[u8]) -> Option<std::ops::Range<usize>> {
+    if msg.len() < 12 {
+        return None;
+    }
+    let qd = u16::from_be_bytes([msg[4], msg[5]]);
+    if qd != 1 {
+        return None;
+    }
+    let end = walk_uncompressed_name(msg, 12)?;
+    let end = end.checked_add(4)?;
+    (end <= msg.len()).then_some(12..end)
+}
+
+fn walk_uncompressed_name(msg: &[u8], mut pos: usize) -> Option<usize> {
+    loop {
+        let len = *msg.get(pos)?;
+        if len & 0xC0 != 0 {
+            return None;
+        }
+        if len == 0 {
+            return Some(pos + 1);
+        }
+        pos += 1 + len as usize;
+        if pos > msg.len() {
+            return None;
+        }
+    }
+}
+
+/// ADR 0004: a matching response must carry the same question as the query
+/// (qname, qtype, qclass, byte-identical) on every DNS transport. A response
+/// whose question differs is a protocol error, not goodput or a timeout.
+pub fn response_question_matches(response: &[u8], query: &[u8]) -> bool {
+    let Some(rq) = question_range(response) else {
+        return false;
+    };
+    let Some(qq) = question_range(query) else {
+        return false;
+    };
+    response.get(rq) == query.get(qq)
+}
+
+/// Same as [`response_question_matches`] against a caller-stored expected
+/// question section (the query's question bytes captured at send time).
+pub(crate) fn question_matches_response(response: &[u8], expected: &[u8]) -> bool {
+    let Some(range) = question_range(response) else {
+        return false;
+    };
+    response.get(range) == Some(expected)
 }
 
 fn parse_dns_name(qname: &str) -> Result<Name> {

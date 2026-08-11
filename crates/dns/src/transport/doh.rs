@@ -19,7 +19,7 @@ use wiresurge_http::h2::{H2Config, H2Error, H2Request, H2Sender, handshake};
 use wiresurge_transport::{ConnectTarget, HttpMethod, HttpTemplate, connect_tls};
 
 use super::{Connection, DnsRequest, DnsResponse, Transport, TransportCaps, TransportError};
-use crate::parse_response_header;
+use crate::{parse_response_header, response_question_matches};
 
 const DNS_MESSAGE: &str = "application/dns-message";
 
@@ -216,6 +216,11 @@ impl Connection for DohConn {
         }
         let header = parse_response_header(&response.body, None)
             .map_err(|error| TransportError::Protocol(error.message))?;
+        if !response_question_matches(&response.body, &request.wire) {
+            return Err(TransportError::Protocol(
+                "response question does not match the query".into(),
+            ));
+        }
         Ok(DnsResponse {
             correlation,
             rcode: header.rcode,

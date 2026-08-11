@@ -8,7 +8,12 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{Notify, mpsc};
 
 use super::{Connection, DnsRequest, DnsResponse, TransportCaps, TransportError};
-use crate::{MAX_DNS_MESSAGE_LEN, parse_response_header};
+use crate::{
+    MAX_DNS_MESSAGE_LEN, parse_response_header, question_matches_response, question_range,
+};
+
+/// Longest question section (qname up to 255 bytes + qtype + qclass).
+const MAX_QUESTION_LEN: usize = 255 + 2 + 2;
 
 /// One outstanding query: the reply slot the reader fills, plus the wakeup the
 /// waiter parks on. The `Notify` comes from a per-connection freelist and is
@@ -16,7 +21,12 @@ use crate::{MAX_DNS_MESSAGE_LEN, parse_response_header};
 /// (the previous `oneshot` allocated a fresh shared cell every time).
 struct Slot {
     notify: Arc<Notify>,
-    response: Option<DnsResponse>,
+    response: Option<Result<DnsResponse, TransportError>>,
+    /// The query's question section (qname + qtype + qclass), captured inline
+    /// at register time so the reader can verify response identity without a
+    /// per-query allocation (ADR 0004).
+    question: [u8; MAX_QUESTION_LEN],
+    question_len: u16,
 }
 
 struct CorrelatorState {
@@ -63,11 +73,22 @@ impl Correlator {
         wire[0] = (id >> 8) as u8;
         wire[1] = (id & 0xff) as u8;
         let notify = st.free.pop().unwrap_or_else(|| Arc::new(Notify::new()));
+        let mut question = [0u8; MAX_QUESTION_LEN];
+        let question_len = match question_range(wire) {
+            Some(range) => {
+                let bytes = &wire[range];
+                question[..bytes.len()].copy_from_slice(bytes);
+                bytes.len() as u16
+            }
+            None => 0,
+        };
         st.pending.insert(
             id,
             Slot {
                 notify: Arc::clone(&notify),
                 response: None,
+                question,
+                question_len,
             },
         );
         (id, notify)
@@ -88,22 +109,32 @@ impl Correlator {
             return;
         }
         let id = u16::from_be_bytes([buf[0], buf[1]]);
-        let mut st = self.state.lock().unwrap();
-        let Some(slot) = st.pending.get_mut(&id) else {
-            return;
-        };
         // A matching id with an unparseable header leaves the slot untouched; the
         // waiter reaps it on timeout (the reply is malformed, so there is nothing
         // to deliver).
         let Ok(header) = parse_response_header(buf, Some(id)) else {
             return;
         };
-        slot.response = Some(DnsResponse {
-            correlation: id,
-            rcode: header.rcode,
-            truncated: header.truncated,
-            bytes_in: buf.len(),
-        });
+        let mut st = self.state.lock().unwrap();
+        let Some(slot) = st.pending.get_mut(&id) else {
+            return;
+        };
+        // ADR 0004: a same-id response whose question differs from the query
+        // is a protocol error, not goodput or a timeout.
+        let response =
+            if question_matches_response(buf, &slot.question[..slot.question_len as usize]) {
+                Ok(DnsResponse {
+                    correlation: id,
+                    rcode: header.rcode,
+                    truncated: header.truncated,
+                    bytes_in: buf.len(),
+                })
+            } else {
+                Err(TransportError::Protocol(
+                    "response question does not match the query".into(),
+                ))
+            };
+        slot.response = Some(response);
         let notify = Arc::clone(&slot.notify);
         drop(st);
         notify.notify_one();
@@ -131,10 +162,10 @@ impl Correlator {
                 .pending
                 .get_mut(&id)
                 .expect("slot stays registered until its waiter removes it");
-            if let Some(response) = slot.response.take() {
+            if let Some(result) = slot.response.take() {
                 let slot = st.pending.remove(&id).unwrap();
                 st.free.push(slot.notify);
-                return Ok(response);
+                return result;
             }
             if st.closed {
                 let slot = st.pending.remove(&id).unwrap();
