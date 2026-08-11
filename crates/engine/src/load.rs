@@ -301,11 +301,6 @@ impl WorkSource {
             wire: self.wires[row].clone(),
         })
     }
-
-    fn exhausted(&self) -> bool {
-        let index = self.seq.load(Ordering::Relaxed);
-        self.count.is_some_and(|n| index >= n) || self.deadline.is_some_and(|d| Instant::now() >= d)
-    }
 }
 
 async fn run_actor<T: Transport>(
@@ -349,6 +344,11 @@ async fn run_actor<T: Transport>(
         ticker
     });
 
+    // `next()` returning `None` is permanent — the count is reached, the
+    // scheduled slot is at/past the budget, or the deadline passed, all
+    // monotonic — so the actor stops asking and cannot hot-spin (ADR 0002).
+    let mut no_more_work = false;
+
     loop {
         // Stop feeding a dead connection. A closed transport (peer GOAWAY,
         // driver gone) makes exchange() fail synchronously; without this guard a
@@ -356,7 +356,11 @@ async fn run_actor<T: Transport>(
         // burning a core, and starving the healthy connections of the run's
         // count/QPS budget. There is no reconnect, so once closed this actor is
         // done after its in-flight queries settle.
-        while inflight.len() < cap && !cancel.is_cancelled() && !conn_ref.is_closed() {
+        while inflight.len() < cap
+            && !cancel.is_cancelled()
+            && !conn_ref.is_closed()
+            && !no_more_work
+        {
             match work.next(&cancel).await {
                 Some(request) => {
                     recorder.on_sent();
@@ -366,12 +370,15 @@ async fn run_actor<T: Transport>(
                         (result, started.elapsed())
                     });
                 }
-                None => break,
+                None => {
+                    no_more_work = true;
+                    break;
+                }
             }
         }
 
         if inflight.is_empty() {
-            if cancel.is_cancelled() || work.exhausted() || conn_ref.is_closed() {
+            if no_more_work || cancel.is_cancelled() || conn_ref.is_closed() {
                 break;
             }
             continue;
@@ -794,6 +801,36 @@ mod tests {
         let budget = plan.resource_budget();
         assert_eq!(budget.total_in_flight, 128);
         assert_eq!(budget.corpus_rows, 1);
+    }
+
+    #[tokio::test]
+    async fn work_past_the_seven_day_budget_is_refused_without_a_deadline() {
+        // A count-only run with a slow rate cap must refuse work whose
+        // scheduled slot is at/past MAX_RUN_SECS (ADR 0002), so the actors
+        // terminate instead of spinning on `None` (the `exhausted()` hot-spin
+        // regression).
+        let start = Instant::now();
+        let source = WorkSource {
+            seq: AtomicU64::new(604_800), // slot at start+7d == MAX_RUN_SECS
+            count: None,
+            deadline: None,
+            gate: Some(RateGate { start, qps: 1.0 }),
+            corpus: Corpus::single("example.com"),
+            wires: vec![wiresurge_dns::build_query(0, "example.com", 1, &[]).unwrap()],
+            seed: 0,
+            mode: SelectMode::Sequential,
+        };
+        let cancel = CancellationToken::new();
+        let result = tokio::select! {
+            r = source.next(&cancel) => r,
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                panic!("next() waited for a slot past the 7-day budget");
+            }
+        };
+        assert!(
+            result.is_none(),
+            "work scheduled past the 7-day budget must be refused"
+        );
     }
 
     #[test]
