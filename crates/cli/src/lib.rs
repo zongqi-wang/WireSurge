@@ -889,7 +889,7 @@ fn format_load_text(stats: &LoadStats) -> String {
          received         {:>10}  responses  ({:.1}% of sent)\n\
          goodput          {:>10}  responses  ({:.1}% of sent)\n\
          throughput       {:>10}  responses/sec (received)\n\
-         goodput          {:>10}  responses/sec (rcode 0)\n\
+         goodput rate     {:>10}  responses/sec (rcode 0)\n\
          timeouts         {:>10}  queries\n\
          transport errors {:>10}  queries\n\
          conn errors      {:>10}  connections\n\

@@ -1,5 +1,5 @@
-//! P0-A regressions (P0A-04): DNS accounting honesty — each test encodes the
-//! ADR 0004 contract and intentionally fails on the current implementation.
+//! P0-A regressions (P0A-04): DNS accounting honesty — each test pins the
+//! ADR 0004 contract.
 
 mod fixtures;
 

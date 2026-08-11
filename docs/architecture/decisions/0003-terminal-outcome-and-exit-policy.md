@@ -40,6 +40,17 @@ Rules:
    emits exactly one JSON value on stdout).
 5. `std::process::exit` remains prohibited as the normal shutdown path.
 
+Implementation status at the P0-A exit gate:
+
+- The exit mapping is implemented for success (0), signal cancellation
+  (130/143), zero-goodput failure (1), and admission rejection (2), and
+  runner records reach a terminal state on every path (rule 3).
+- The single typed `RunOutcome` (Decision), the bounded redacted
+  representative diagnostic (rule 2), and the actor-panic row (table) are
+  deferred to a later P0-A slice; a panicked actor task is currently merged
+  as a connection error, so a run whose other actors produced goodput can
+  still exit 0.
+
 ## Consequences
 
 - **Positive:** exit codes and reports become truthful; scripts and CI can

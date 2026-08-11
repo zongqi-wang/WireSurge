@@ -38,7 +38,7 @@ wiresurge plugin manifest-example
 
 `clap` rejects unknown flags, missing values, and malformed numeric inputs. Human mode provides discoverable help and suggestions. When `--output json` or `--output=json` is used, parse failures and command failures use the same structured envelope with `code`, `message`, `path`, `hint`, and `retryable` fields. Non-interactive commands do not prompt.
 
-For `load`, human mode sends the run banner and optional live samples to stderr and the final summary to stdout. Live samples are enabled only on a TTY, can be disabled with `--no-progress`, and default to `--progress-interval 1000`; intervals below 50 ms are clamped. JSON mode disables the banner and progress, keeps stderr empty on success, and returns aggregate counters, NOERROR and receive rates, rcode counts, latency, cancellation state, and one worker record per connection.
+For `load`, human mode sends the run banner and optional live samples to stderr and the final summary to stdout. Live samples are enabled only on a TTY, can be disabled with `--no-progress`, and default to `--progress-interval 1000`; intervals below 50 ms are clamped. JSON mode disables the banner and progress, keeps stderr empty on success, and returns aggregate counters, goodput and receive rates, rcode counts, latency, cancellation state, and one worker record per connection.
 
 ## Quick Start
 
