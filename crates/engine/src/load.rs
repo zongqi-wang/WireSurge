@@ -44,18 +44,13 @@ impl Default for WorkerSlot {
 /// blocking up to the full per-request timeout on stalled queries.
 const CANCEL_GRACE: Duration = Duration::from_millis(250);
 
-/// Conservative per-run limits (ADR 0002/0005): the CLI cannot silently
-/// launch an extreme resource plan.
 const MAX_CONCURRENCY: usize = 1024;
 const MAX_IN_FLIGHT: usize = 1024;
 const MAX_QPS: f64 = 1_000_000.0;
 const MAX_AGGREGATE_IN_FLIGHT: usize = 4096;
 const MAX_IN_FLIGHT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_CORPUS_ROWS: usize = 10_000_000;
-/// Worst-case DNS wire message length (u16 length prefix).
 const MAX_WIRE_LEN: u64 = u16::MAX as u64;
-/// Longest admissible wall-clock run (ADR 0002); also the bound that keeps
-/// every rate-gate wait within a representable `Duration`.
 pub const MAX_RUN_SECS: f64 = 7.0 * 24.0 * 3600.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,9 +85,6 @@ impl LoadConfig {
     }
 }
 
-/// An admitted load plan. Constructed only by [`ValidatedLoadPlan::new`],
-/// which enforces the ADR 0002 numeric domains and the ADR 0005 aggregate
-/// resource budget; the engine executes only admitted plans.
 #[derive(Clone)]
 pub struct ValidatedLoadPlan {
     config: LoadConfig,
@@ -190,7 +182,6 @@ impl ValidatedLoadPlan {
     }
 }
 
-/// The ADR 0005 resource envelope of an admitted plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResourceBudget {
     pub total_in_flight: usize,
@@ -277,11 +268,6 @@ impl WorkSource {
             return None;
         }
         if let Some(gate) = &self.gate {
-            // ADR 0002: refuse before waiting — the scheduled slot must be
-            // inside the deadline (or the MAX_RUN_SECS cap when there is no
-            // deadline). Comparing slot seconds before the wait also keeps
-            // every wait within a representable Duration, so the schedule
-            // cannot panic on overflow.
             let slot_secs = index as f64 / gate.qps;
             let budget_secs = self.deadline.map_or(MAX_RUN_SECS, |d| {
                 d.saturating_duration_since(gate.start).as_secs_f64()
@@ -344,9 +330,6 @@ async fn run_actor<T: Transport>(
         ticker
     });
 
-    // `next()` returning `None` is permanent — the count is reached, the
-    // scheduled slot is at/past the budget, or the deadline passed, all
-    // monotonic — so the actor stops asking and cannot hot-spin (ADR 0002).
     let mut no_more_work = false;
 
     loop {
@@ -454,7 +437,7 @@ async fn sample_progress(
 ) {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    ticker.tick().await; // first tick is immediate; skip the empty t=0 sample.
+    ticker.tick().await;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
@@ -549,9 +532,7 @@ pub async fn run_load_with_progress(
 
     let edns_options = config.edns_options.as_slice();
 
-    // Encode every corpus row's wire message once, before the run clock starts,
-    // so the hot path only clones a prebuilt buffer and a large corpus cannot
-    // delay the first send. A malformed name therefore surfaces here rather than
+    // A malformed name surfaces here, before the run clock starts, rather than
     // on first send.
     let wires = config
         .corpus
@@ -635,7 +616,6 @@ pub async fn run_load_with_progress(
         })
         .collect::<Vec<_>>();
 
-    // Final frame from the joined recorders, after the sampler stops.
     if let Some(sampler) = sampler {
         sampler.abort();
         let _ = sampler.await;
@@ -673,11 +653,6 @@ impl LoadStats {
         }
     }
 
-    /// Rate of goodput: matching responses with RCODE 0 (ADR 0004). A
-    /// response with any other rcode (REFUSED, SERVFAIL, ...) still counts
-    /// toward `recv_qps`, so a server that cheaply rejects load reports a
-    /// high `recv_qps` but a low `goodput_qps`; the latter is the only honest
-    /// measure of resolved traffic.
     pub fn goodput_qps(&self) -> f64 {
         if self.duration_s > 0.0 {
             self.recorder.goodput() as f64 / self.duration_s
@@ -806,13 +781,9 @@ mod tests {
 
     #[tokio::test]
     async fn work_past_the_seven_day_budget_is_refused_without_a_deadline() {
-        // A count-only run with a slow rate cap must refuse work whose
-        // scheduled slot is at/past MAX_RUN_SECS (ADR 0002), so the actors
-        // terminate instead of spinning on `None` (the `exhausted()` hot-spin
-        // regression).
         let start = Instant::now();
         let source = WorkSource {
-            seq: AtomicU64::new(604_800), // slot at start+7d == MAX_RUN_SECS
+            seq: AtomicU64::new(604_800),
             count: None,
             deadline: None,
             gate: Some(RateGate { start, qps: 1.0 }),
@@ -872,11 +843,6 @@ mod tests {
 
     #[tokio::test]
     async fn work_scheduled_past_the_deadline_is_never_admitted() {
-        // ADR 0002: admission compares the query's *scheduled slot*
-        // (start + n/qps) with the deadline BEFORE the rate-gate wait; a query
-        // whose slot is at/past the deadline is refused without waiting. The
-        // buggy implementation checks the wall clock before the wait and then
-        // sleeps past the deadline, admitting the query.
         let start = Instant::now();
         let deadline = start + Duration::from_millis(400);
         let source = WorkSource {
@@ -893,9 +859,6 @@ mod tests {
 
         assert!(source.next(&cancel).await.is_some());
 
-        // The next fetch happens at ~start+300ms, before the deadline passes,
-        // for slot 4 at start+400ms == deadline. The 150ms sleep is only a
-        // hang guard: it fires after the buggy slot at 400ms.
         let started = Instant::now();
         let result = tokio::select! {
             r = source.next(&cancel) => r,

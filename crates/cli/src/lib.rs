@@ -629,13 +629,10 @@ fn parse_proxy_addr(value: &str, field: &str) -> Result<SocketAddr> {
 
 async fn load_command(args: LoadArgs, output_json: bool) -> Result<(String, i32)> {
     let config = build_load_config(&args)?;
-    // ADR 0005: the engine executes only admitted plans; a rejection here
-    // surfaces as a structured error with exit code 2.
     let plan = ValidatedLoadPlan::new(config)?;
     let config = plan.config();
 
     let progress_enabled = !output_json && !args.no_progress && std::io::stderr().is_terminal();
-    // ADR 0002 empty-run carve-out for the outcome rule below.
     let empty_run = config.count == Some(0);
     if !output_json {
         eprintln!("{}", format_load_banner(&args, config));
@@ -663,10 +660,6 @@ async fn load_command(args: LoadArgs, output_json: bool) -> Result<(String, i32)
     };
 
     stats.cancelled |= exit_code != 0;
-    // ADR 0003: a run that attempted work but produced no goodput is Failed
-    // (exit 1) — including the all-connections-failed case. The documented
-    // --count 0 empty run (ADR 0002) succeeds even when its connection
-    // attempts fail.
     let outcome_code = if stats.cancelled {
         exit_code
     } else if stats.recorder.goodput() == 0
@@ -720,9 +713,6 @@ fn format_load_banner(args: &LoadArgs, config: &LoadConfig) -> String {
         None => "as fast as the target allows".to_string(),
     };
 
-    // Operator-facing recap of the optional knobs in effect: the PROXY v2
-    // header on/off, plus whether any EDNS option or extra HTTP query parameter
-    // was supplied. These are generic options, not credentials.
     let proxy = if config.target.proxy.is_some() {
         "on"
     } else {
@@ -1447,7 +1437,6 @@ mod tests {
             temp_dir(),
         );
         assert_eq!(outcome.code, 1);
-        // Error codes are snake_case even though the flag name is hyphenated.
         assert!(outcome.stdout.contains("invalid_edns_option"));
         assert!(!outcome.stdout.contains("invalid_edns-option"));
     }
@@ -1484,7 +1473,6 @@ mod tests {
         assert_eq!(options[0].payload, vec![0x00]);
         assert_eq!(options[1].code, 8);
         assert_eq!(options[1].payload, vec![0x00, 0x01]);
-        // The second code-3 option is kept distinct from the first.
         assert_eq!(options[2].code, 3);
         assert_eq!(options[2].payload, vec![0xff]);
     }
@@ -2033,7 +2021,6 @@ mod tests {
             temp_dir(),
         );
         assert_eq!(outcome.code, 1);
-        // Error codes are snake_case even though the flag name is hyphenated.
         assert!(
             outcome.stdout.contains("invalid_http_param"),
             "{}",
@@ -2121,7 +2108,6 @@ mod tests {
 
     #[test]
     fn redact_error_noop_without_secrets() {
-        // With no secrets known, the message is returned unchanged.
         let error = WireSurgeError::new("connection_failed", "plain message");
         let redacted = redact_error(error, &[]);
         assert_eq!(redacted.message, "plain message");

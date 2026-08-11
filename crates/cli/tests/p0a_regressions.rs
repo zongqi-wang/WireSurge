@@ -1,6 +1,3 @@
-//! P0-A regressions (P0A-02, P0A-03, P0A-05): CLI honesty — each test pins
-//! the ADR 0002/0003 contract.
-
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -43,8 +40,6 @@ impl Drop for TempDir {
     }
 }
 
-/// ADR 0002: a huge but finite `--duration-s` is rejected at admission
-/// (7-day cap) with the structured JSON error envelope — never a panic.
 #[test]
 fn huge_finite_duration_is_rejected_with_structured_error() {
     let out = run_in(
@@ -75,8 +70,6 @@ fn huge_finite_duration_is_rejected_with_structured_error() {
     );
 }
 
-/// ADR 0003 + 0004: a run with zero goodput exits non-zero and the load JSON
-/// reports the goodput rate.
 #[test]
 fn load_against_unreachable_target_exits_nonzero_with_goodput_metric() {
     let out = run_in(
@@ -105,8 +98,6 @@ fn load_against_unreachable_target_exits_nonzero_with_goodput_metric() {
     );
 }
 
-/// PIN (ADR 0002): `--count 0` is a documented empty run — immediate
-/// success, zero traffic — not an error.
 #[test]
 fn count_zero_is_an_immediate_successful_empty_run() {
     let out = run_in(
@@ -279,8 +270,6 @@ fn dry_run_runner_record_is_terminal() {
     );
 }
 
-/// ADR 0003: every runner record must reach a terminal state after a
-/// transport failure.
 #[test]
 fn runner_record_terminates_after_connect_failure() {
     let tmp = TempDir::new();

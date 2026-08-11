@@ -14,8 +14,6 @@ pub struct WireSurgeError {
     pub path: Option<String>,
     pub hint: Option<String>,
     pub retryable: bool,
-    /// Admission rejection (ADR 0003): maps to process exit code 2 and is
-    /// never part of the serialized envelope.
     #[serde(skip)]
     pub rejected: bool,
 }

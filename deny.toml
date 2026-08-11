@@ -41,10 +41,8 @@ unused = "deny"
 
 [licenses]
 confidence-threshold = 0.93
-# AGPL-3.0 is the project's own license (ADR 0001), checked because workspace
-# members are part of the graph; no third-party AGPL dependency is allowed by
-# this entry alone. ISC clears ring (Apache-2.0 AND ISC), untrusted, and
-# rustls-webpki, pulled in by the rustls/ring TLS stack.
+# ISC clears ring (Apache-2.0 AND ISC), untrusted, and rustls-webpki, pulled in
+# by the rustls/ring TLS stack.
 allow = [
   "AGPL-3.0",
   "Apache-2.0",
