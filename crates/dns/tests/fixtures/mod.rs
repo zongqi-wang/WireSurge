@@ -52,7 +52,7 @@ pub async fn extract_wire(request: Request<Incoming>) -> Option<Vec<u8>> {
 }
 
 pub fn dns_response(mut wire: Vec<u8>) -> Response<Full<Bytes>> {
-    wire[2] = 0x81;
+    wire[2] = 0x81; // QR/RA bits so parse_response_header accepts it
     wire[3] = 0x80;
     Response::builder()
         .status(StatusCode::OK)

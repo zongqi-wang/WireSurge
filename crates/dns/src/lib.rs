@@ -103,6 +103,7 @@ fn opt_extended_rcode(msg: &[u8]) -> std::result::Result<Option<u8>, String> {
     Ok(extended)
 }
 
+/// RFC 1035 label walk; a compression pointer occupies 2 bytes (§4.1.4).
 fn skip_name(msg: &[u8], mut pos: usize) -> Option<usize> {
     loop {
         let len = *msg.get(pos)?;
@@ -120,6 +121,8 @@ fn skip_name(msg: &[u8], mut pos: usize) -> Option<usize> {
     }
 }
 
+/// Question section byte range when `qdcount == 1` and the name is
+/// uncompressed (RFC 1035 §4.1.2).
 pub(crate) fn question_range(msg: &[u8]) -> Option<std::ops::Range<usize>> {
     if msg.len() < 12 {
         return None;

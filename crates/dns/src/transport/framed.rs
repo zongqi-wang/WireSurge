@@ -296,6 +296,7 @@ impl Connection for FramedConn {
         let mut frame = Vec::with_capacity(request.wire.len() + 2);
         frame.extend_from_slice(&len.to_be_bytes());
         frame.extend_from_slice(&request.wire);
+        // The prebuilt wire is never mutated; the txid is patched into the frame copy.
         let (id, notify) = self.correlator.register(&mut frame[2..]);
 
         if self.writer.send(frame).await.is_err() {

@@ -43,6 +43,7 @@ impl LoadRecorder {
         self.received += 1;
         self.bytes_in += bytes_in as u64;
         self.truncated += u64::from(truncated);
+        // rcodes has 17 buckets; index 16 catches every rcode >= 16.
         self.rcodes[usize::from(rcode.min(16))] += 1;
         self.hist.saturating_record(latency_us.max(1));
     }

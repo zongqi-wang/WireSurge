@@ -151,6 +151,7 @@ async fn send_request_inner(
             Ok(response) => response,
             Err(error) => {
                 let failed = active_runner.clone().finalize_failed();
+                // Snapshot write errors are secondary to the run failure.
                 let _ = store.write_runner_snapshot(&failed);
                 return Err(error);
             }

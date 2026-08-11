@@ -51,6 +51,7 @@ const MAX_AGGREGATE_IN_FLIGHT: usize = 4096;
 const MAX_IN_FLIGHT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_CORPUS_ROWS: usize = 10_000_000;
 const MAX_WIRE_LEN: u64 = u16::MAX as u64;
+/// Also the bound that keeps every rate-gate wait within a representable `Duration`.
 pub const MAX_RUN_SECS: f64 = 7.0 * 24.0 * 3600.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,6 +269,8 @@ impl WorkSource {
             return None;
         }
         if let Some(gate) = &self.gate {
+            // Refuse before waiting: the slot must be inside the budget, which
+            // also keeps every wait within a representable Duration.
             let slot_secs = index as f64 / gate.qps;
             let budget_secs = self.deadline.map_or(MAX_RUN_SECS, |d| {
                 d.saturating_duration_since(gate.start).as_secs_f64()
@@ -437,7 +440,7 @@ async fn sample_progress(
 ) {
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    ticker.tick().await;
+    ticker.tick().await; // first tick is immediate; skip the empty t=0 sample.
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
@@ -653,6 +656,8 @@ impl LoadStats {
         }
     }
 
+    /// Goodput rate: matching responses with RCODE 0; REFUSED/SERVFAIL
+    /// still count toward `recv_qps` but not goodput.
     pub fn goodput_qps(&self) -> f64 {
         if self.duration_s > 0.0 {
             self.recorder.goodput() as f64 / self.duration_s
