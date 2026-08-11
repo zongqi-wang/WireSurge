@@ -32,8 +32,6 @@ fn count_zero_is_an_immediate_successful_empty_run() {
 
 /// ADR 0002: a huge but finite `--duration-s` is rejected at admission
 /// (7-day cap) with the structured JSON error envelope — never a panic.
-///
-/// Currently: panics, exit 101.
 #[test]
 fn huge_finite_duration_is_rejected_with_structured_error() {
     let out = run_in(
