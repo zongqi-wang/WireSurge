@@ -758,7 +758,7 @@ fn progress_header() -> String {
         "sent",
         "received",
         "recv/s",
-        "noerror/s",
+        "goodput/s",
         "infl",
         "p50 ms",
         "p99 ms",
@@ -768,14 +768,14 @@ fn progress_header() -> String {
     )
 }
 
-fn format_progress_row(snap: &RunSnapshot, recv_qps: f64, noerror_qps: f64) -> String {
+fn format_progress_row(snap: &RunSnapshot, recv_qps: f64, goodput_qps: f64) -> String {
     format!(
         "{:>5.1}s  {:>11}  {:>11}  {:>9.0}  {:>9.0}  {:>6}  {:>7.1}  {:>7.1}  {:>6}  {:>6}   {}",
         snap.elapsed_s,
         group_u64(snap.aggregate.sent),
         group_u64(snap.aggregate.received),
         recv_qps,
-        noerror_qps,
+        goodput_qps,
         snap.aggregate.in_flight,
         snap.aggregate.p50_ms,
         snap.aggregate.p99_ms,
@@ -820,19 +820,19 @@ async fn render_progress(mut rx: watch::Receiver<RunSnapshot>) {
             continue;
         }
         // First frame has no prior; fall back to the cumulative rate.
-        let (recv_qps, noerror_qps) = match &prev {
+        let (recv_qps, goodput_qps) = match &prev {
             Some(p) if snap.elapsed_s > p.elapsed_s => {
                 let dt = snap.elapsed_s - p.elapsed_s;
                 let delta = |now: u64, was: u64| now.saturating_sub(was) as f64 / dt;
                 (
                     delta(snap.aggregate.received, p.aggregate.received),
-                    delta(snap.aggregate.noerror, p.aggregate.noerror),
+                    delta(snap.aggregate.goodput, p.aggregate.goodput),
                 )
             }
-            _ => (snap.aggregate.recv_qps, snap.aggregate.noerror_qps),
+            _ => (snap.aggregate.recv_qps, snap.aggregate.goodput_qps),
         };
         // One persistent line per tick: a scrolling log, not an in-place redraw.
-        eprintln!("{}", format_progress_row(&snap, recv_qps, noerror_qps));
+        eprintln!("{}", format_progress_row(&snap, recv_qps, goodput_qps));
         prev = Some(snap);
     }
 }
@@ -841,7 +841,7 @@ fn format_load_text(stats: &LoadStats) -> String {
     let recorder = &stats.recorder;
     let sent = recorder.sent;
     let received = recorder.received;
-    let noerror = recorder.noerror();
+    let goodput = recorder.goodput();
     let response_pct = |count: u64| {
         if sent > 0 {
             100.0 * count as f64 / sent as f64
@@ -872,9 +872,9 @@ fn format_load_text(stats: &LoadStats) -> String {
          duration         {:>10.2}  seconds\n\
          sent             {:>10}  queries\n\
          received         {:>10}  responses  ({:.1}% of sent)\n\
-         noerror          {:>10}  responses  ({:.1}% of sent)\n\
+         goodput          {:>10}  responses  ({:.1}% of sent)\n\
          throughput       {:>10}  responses/sec (received)\n\
-         goodput          {:>10}  responses/sec (noerror)\n\
+         goodput          {:>10}  responses/sec (rcode 0)\n\
          timeouts         {:>10}  queries\n\
          transport errors {:>10}  queries\n\
          conn errors      {:>10}  connections\n\
@@ -885,10 +885,10 @@ fn format_load_text(stats: &LoadStats) -> String {
         group_u64(sent),
         group_u64(received),
         response_pct(received),
-        group_u64(noerror),
-        response_pct(noerror),
+        group_u64(goodput),
+        response_pct(goodput),
         group_u64(stats.recv_qps() as u64),
-        group_u64(stats.noerror_qps() as u64),
+        group_u64(stats.goodput_qps() as u64),
         group_u64(recorder.timeouts),
         group_u64(recorder.errors),
         group_u64(recorder.conn_errors),
@@ -1369,7 +1369,7 @@ mod tests {
             "json carries workers: {}",
             outcome.stdout
         );
-        assert!(value.get("noerror_qps").is_some());
+        assert!(value.get("goodput_qps").is_some());
         assert!(value["workers"].is_array());
     }
 

@@ -35,9 +35,9 @@ pub struct AggregateStats {
     pub truncated: u64,
     pub bytes_in: u64,
     pub in_flight: u64,
-    pub noerror: u64,
+    pub goodput: u64,
     pub recv_qps: f64,
-    pub noerror_qps: f64,
+    pub goodput_qps: f64,
     pub rcodes: BTreeMap<String, u64>,
     pub p50_ms: f64,
     pub p95_ms: f64,
@@ -63,9 +63,9 @@ impl AggregateStats {
             truncated: recorder.truncated,
             bytes_in: recorder.bytes_in,
             in_flight,
-            noerror: recorder.noerror(),
+            goodput: recorder.goodput(),
             recv_qps: rate(recorder.received),
-            noerror_qps: rate(recorder.noerror()),
+            goodput_qps: rate(recorder.goodput()),
             rcodes: recorder.rcode_breakdown(),
             p50_ms: recorder.percentile_ms(0.50),
             p95_ms: recorder.percentile_ms(0.95),
@@ -329,6 +329,6 @@ mod tests {
         assert!(json.contains("\"p99_ms\""));
         assert_eq!(snapshot.aggregate.received, 1);
         assert_eq!(snapshot.aggregate.recv_qps, 0.5);
-        assert_eq!(snapshot.aggregate.noerror_qps, 0.5);
+        assert_eq!(snapshot.aggregate.goodput_qps, 0.5);
     }
 }
