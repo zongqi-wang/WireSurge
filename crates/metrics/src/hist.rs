@@ -43,7 +43,7 @@ impl LoadRecorder {
         self.received += 1;
         self.bytes_in += bytes_in as u64;
         self.truncated += u64::from(truncated);
-        // rcode is the DNS header low-nibble only (see parse_response_header);
+        // rcode is the full (extended) RCODE (see parse_response_header);
         // index 16 is the catch-all for any code >= 16.
         self.rcodes[usize::from(rcode.min(16))] += 1;
         self.hist.saturating_record(latency_us.max(1));
@@ -95,7 +95,9 @@ impl LoadRecorder {
         self.hist.value_at_quantile(quantile) as f64 / 1000.0
     }
 
-    pub fn noerror(&self) -> u64 {
+    /// RCODE-0 responses. Transports deliver only matching responses (ADR
+    /// 0004), so this is the goodput count.
+    pub fn goodput(&self) -> u64 {
         self.rcodes[0]
     }
 

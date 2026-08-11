@@ -673,13 +673,14 @@ impl LoadStats {
         }
     }
 
-    /// Rate of NOERROR (rcode 0) responses. A response with any other rcode
-    /// (REFUSED, SERVFAIL, ...) still counts toward `recv_qps`, so a server that
-    /// cheaply rejects load reports a high `recv_qps` but a low `noerror_qps`;
-    /// the latter is the only honest measure of resolved traffic.
-    pub fn noerror_qps(&self) -> f64 {
+    /// Rate of goodput: matching responses with RCODE 0 (ADR 0004). A
+    /// response with any other rcode (REFUSED, SERVFAIL, ...) still counts
+    /// toward `recv_qps`, so a server that cheaply rejects load reports a
+    /// high `recv_qps` but a low `goodput_qps`; the latter is the only honest
+    /// measure of resolved traffic.
+    pub fn goodput_qps(&self) -> f64 {
         if self.duration_s > 0.0 {
-            self.recorder.noerror() as f64 / self.duration_s
+            self.recorder.goodput() as f64 / self.duration_s
         } else {
             0.0
         }
@@ -695,7 +696,7 @@ impl LoadStats {
             "conn_errors": self.recorder.conn_errors,
             "truncated": self.recorder.truncated,
             "recv_qps": self.recv_qps(),
-            "noerror_qps": self.noerror_qps(),
+            "goodput_qps": self.goodput_qps(),
             "rcodes": self.recorder.rcode_breakdown(),
             "latency_ms": {
                 "min_ms": self.recorder.min_ms(),
