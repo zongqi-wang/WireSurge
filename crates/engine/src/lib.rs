@@ -147,7 +147,17 @@ async fn send_request_inner(
             store.write_runner_snapshot(&cancelled_runner)?;
             return Err(WireSurgeError::new("run_cancelled", "HTTP run was cancelled"));
         }
-        result = send_http_request(request) => result?,
+        result = send_http_request(request) => match result {
+            Ok(response) => response,
+            Err(error) => {
+                // ADR 0003: a transport failure must leave a terminal record;
+                // the run failure is primary, so a snapshot write error is
+                // secondary.
+                let failed = active_runner.clone().finalize_failed();
+                let _ = store.write_runner_snapshot(&failed);
+                return Err(error);
+            }
+        },
     };
 
     let mut warnings = response.warnings.clone();
@@ -201,7 +211,10 @@ pub async fn run_run_spec_with_cancellation(
     // declared contract was not checked rather than letting silence read green.
     if options.dry_run {
         let run_id = generate_id("run", &request.id);
-        let runner = RunnerStats::local(Some(run_id.clone()), options.parallel);
+        // A dry run sends no traffic; the record is finalized immediately so
+        // it cannot stay "active" (ADR 0003).
+        let runner = RunnerStats::local(Some(run_id.clone()), options.parallel)
+            .finish_with_latency(0.0, true);
         store.write_runner_snapshot(&runner)?;
         let mut warnings = vec!["dry run only; no network traffic was sent".to_string()];
         // No response means the assertion stays `NotEvaluated`; present + dry run

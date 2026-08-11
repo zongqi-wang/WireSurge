@@ -635,6 +635,8 @@ async fn load_command(args: LoadArgs, output_json: bool) -> Result<(String, i32)
     let config = plan.config();
 
     let progress_enabled = !output_json && !args.no_progress && std::io::stderr().is_terminal();
+    // ADR 0002 empty-run carve-out for the outcome rule below.
+    let empty_run = config.count == Some(0);
     if !output_json {
         eprintln!("{}", format_load_banner(&args, config));
     }
@@ -661,12 +663,25 @@ async fn load_command(args: LoadArgs, output_json: bool) -> Result<(String, i32)
     };
 
     stats.cancelled |= exit_code != 0;
+    // ADR 0003: a run that attempted work but produced no goodput is Failed
+    // (exit 1) — including the all-connections-failed case. The documented
+    // --count 0 empty run (ADR 0002) succeeds even when its connection
+    // attempts fail.
+    let outcome_code = if stats.cancelled {
+        exit_code
+    } else if stats.recorder.goodput() == 0
+        && (stats.recorder.sent > 0 || (stats.recorder.conn_errors > 0 && !empty_run))
+    {
+        1
+    } else {
+        0
+    };
     let output = if output_json {
         stats.to_json()?
     } else {
         format_load_text(&stats)
     };
-    Ok((output, exit_code))
+    Ok((output, outcome_code))
 }
 
 async fn drive_with_signal<F>(
