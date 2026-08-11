@@ -36,8 +36,9 @@ Scheduling semantics:
 
 1. Admission compares the query's **scheduled slot** (`start + n/qps`) with
    the deadline **before** the rate-gate wait: a query whose slot is at or
-   past the deadline is refused without waiting. `exhausted()` reports the
-   same rule so the run stops admitting work exactly at the deadline.
+   past the deadline is refused without waiting. `next()` returning `None` is
+   permanent (count reached, slot budget or deadline passed — all monotonic),
+   so actors stop requesting work exactly at the deadline.
 2. All duration arithmetic uses checked operations (`checked_add`, saturating
    conversions); an overflowing computation yields a structured error, never a
    panic.

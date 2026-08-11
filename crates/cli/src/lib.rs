@@ -400,7 +400,9 @@ fn build_load_config(args: &LoadArgs) -> Result<LoadConfig> {
         && (qps <= 0.0 || !qps.is_finite())
     {
         return Err(
-            WireSurgeError::new("invalid_qps", "--qps must be a positive, finite number").at("qps"),
+            WireSurgeError::new("invalid_qps", "--qps must be a positive, finite number")
+                .at("qps")
+                .rejected(),
         );
     }
     if !args.http_params.is_empty() && !is_doh {
@@ -450,7 +452,6 @@ fn build_load_config(args: &LoadArgs) -> Result<LoadConfig> {
         seed: args.seed,
         edns_options,
     };
-    config.validate()?;
     Ok(config)
 }
 

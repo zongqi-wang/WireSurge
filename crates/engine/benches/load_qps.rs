@@ -69,6 +69,9 @@ fn write_many_corpus(rows: usize) -> PathBuf {
 }
 
 fn make_cfg(addr: SocketAddr, corpus: Arc<Corpus>, concurrency: usize, count: u64) -> LoadConfig {
+    // Keep the aggregate in-flight (concurrency x 256) within the ADR 0005
+    // admission cap of 4096 regardless of the host's core count.
+    let concurrency = concurrency.min(16);
     LoadConfig {
         proto: LoadProto::Do53Udp,
         target: ConnectTarget::new(addr),
