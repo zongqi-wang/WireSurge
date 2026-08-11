@@ -44,8 +44,19 @@ impl Default for WorkerSlot {
 /// blocking up to the full per-request timeout on stalled queries.
 const CANCEL_GRACE: Duration = Duration::from_millis(250);
 
-const MAX_CONCURRENCY: usize = 1_000_000;
-const MAX_IN_FLIGHT: usize = 1_000_000;
+/// Conservative per-run limits (ADR 0002/0005): the CLI cannot silently
+/// launch an extreme resource plan.
+const MAX_CONCURRENCY: usize = 1024;
+const MAX_IN_FLIGHT: usize = 1024;
+const MAX_QPS: f64 = 1_000_000.0;
+const MAX_AGGREGATE_IN_FLIGHT: usize = 4096;
+const MAX_IN_FLIGHT_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_CORPUS_ROWS: usize = 10_000_000;
+/// Worst-case DNS wire message length (u16 length prefix).
+const MAX_WIRE_LEN: u64 = u16::MAX as u64;
+/// Longest admissible wall-clock run (ADR 0002); also the bound that keeps
+/// every rate-gate wait within a representable `Duration`.
+pub const MAX_RUN_SECS: f64 = 7.0 * 24.0 * 3600.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadProto {
@@ -75,48 +86,152 @@ pub struct LoadConfig {
 
 impl LoadConfig {
     pub fn validate(&self) -> Result<()> {
-        if self.concurrency == 0 {
+        ValidatedLoadPlan::new(self.clone()).map(|_| ())
+    }
+}
+
+/// An admitted load plan. Constructed only by [`ValidatedLoadPlan::new`],
+/// which enforces the ADR 0002 numeric domains and the ADR 0005 aggregate
+/// resource budget; the engine executes only admitted plans.
+#[derive(Clone)]
+pub struct ValidatedLoadPlan {
+    config: LoadConfig,
+}
+
+impl ValidatedLoadPlan {
+    pub fn new(config: LoadConfig) -> Result<Self> {
+        if config.concurrency == 0 {
             return Err(WireSurgeError::new(
                 "invalid_concurrency",
                 "concurrency must be at least 1",
             )
-            .at("concurrency"));
+            .at("concurrency")
+            .rejected());
         }
-        if self.concurrency > MAX_CONCURRENCY {
+        if config.concurrency > MAX_CONCURRENCY {
             return Err(WireSurgeError::new(
                 "invalid_concurrency",
                 format!("concurrency must be at most {MAX_CONCURRENCY}"),
             )
-            .at("concurrency"));
+            .at("concurrency")
+            .rejected());
         }
-        if self.in_flight == 0 {
+        if config.in_flight == 0 {
             return Err(WireSurgeError::new(
                 "invalid_in_flight",
                 "in-flight depth must be at least 1",
             )
-            .at("in_flight"));
+            .at("in_flight")
+            .rejected());
         }
-        if self.in_flight > MAX_IN_FLIGHT {
+        if config.in_flight > MAX_IN_FLIGHT {
             return Err(WireSurgeError::new(
                 "invalid_in_flight",
                 format!("in-flight depth must be at most {MAX_IN_FLIGHT}"),
             )
-            .at("in_flight"));
+            .at("in_flight")
+            .rejected());
         }
-        if let Some(qps) = self.qps_cap
+        if let Some(qps) = config.qps_cap
             && (qps <= 0.0 || !qps.is_finite())
         {
             return Err(WireSurgeError::new(
                 "invalid_qps",
                 "qps cap must be a positive, finite number",
             )
-            .at("qps_cap"));
+            .at("qps_cap")
+            .rejected());
         }
-        if self.duration.is_none() && self.count.is_none() {
+        if config.qps_cap.is_some_and(|qps| qps > MAX_QPS) {
+            return Err(WireSurgeError::new(
+                "invalid_qps",
+                format!("qps cap must be at most {MAX_QPS}"),
+            )
+            .at("qps_cap")
+            .rejected());
+        }
+        if config
+            .duration
+            .is_some_and(|d| d.is_zero() || d.as_secs_f64() > MAX_RUN_SECS)
+        {
+            return Err(WireSurgeError::new(
+                "invalid_duration",
+                format!("duration must be at most {MAX_RUN_SECS} seconds"),
+            )
+            .at("duration")
+            .rejected());
+        }
+        if config.duration.is_none() && config.count.is_none() {
             return Err(WireSurgeError::new(
                 "invalid_stop_condition",
                 "a duration (-l) or a count must be set",
-            ));
+            )
+            .rejected());
+        }
+        if config.timeout < Duration::from_millis(1) || config.timeout > Duration::from_secs(60) {
+            return Err(WireSurgeError::new(
+                "invalid_timeout",
+                "timeout must be between 1ms and 60s",
+            )
+            .at("timeout")
+            .rejected());
+        }
+        let budget = ResourceBudget::of(&config);
+        budget.check()?;
+        Ok(Self { config })
+    }
+
+    pub fn config(&self) -> &LoadConfig {
+        &self.config
+    }
+
+    pub fn resource_budget(&self) -> ResourceBudget {
+        ResourceBudget::of(&self.config)
+    }
+}
+
+/// The ADR 0005 resource envelope of an admitted plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceBudget {
+    pub total_in_flight: usize,
+    pub in_flight_bytes: u64,
+    pub corpus_rows: usize,
+}
+
+impl ResourceBudget {
+    fn of(config: &LoadConfig) -> Self {
+        let total_in_flight = config.concurrency.saturating_mul(config.in_flight);
+        Self {
+            total_in_flight,
+            in_flight_bytes: (total_in_flight as u64).saturating_mul(MAX_WIRE_LEN),
+            corpus_rows: config.corpus.len(),
+        }
+    }
+
+    fn check(&self) -> Result<()> {
+        if self.total_in_flight > MAX_AGGREGATE_IN_FLIGHT {
+            return Err(WireSurgeError::new(
+                "invalid_aggregate_in_flight",
+                format!("connections times in-flight must be at most {MAX_AGGREGATE_IN_FLIGHT}"),
+            )
+            .at("concurrency")
+            .rejected());
+        }
+        if self.in_flight_bytes > MAX_IN_FLIGHT_BYTES {
+            return Err(WireSurgeError::new(
+                "invalid_in_flight_bytes",
+                "estimated in-flight bytes exceed the resource budget",
+            )
+            .at("in_flight")
+            .rejected());
+        }
+        if self.corpus_rows > MAX_CORPUS_ROWS {
+            return Err(WireSurgeError::new(
+                "corpus_too_large",
+                format!("corpus must have at most {MAX_CORPUS_ROWS} rows"),
+            )
+            .at("file")
+            .rejected());
         }
         Ok(())
     }
@@ -161,14 +276,25 @@ impl WorkSource {
         if self.count.is_some_and(|n| index >= n) {
             return None;
         }
-        if self.deadline.is_some_and(|d| Instant::now() >= d) {
-            return None;
-        }
         if let Some(gate) = &self.gate {
+            // ADR 0002: refuse before waiting — the scheduled slot must be
+            // inside the deadline (or the MAX_RUN_SECS cap when there is no
+            // deadline). Comparing slot seconds before the wait also keeps
+            // every wait within a representable Duration, so the schedule
+            // cannot panic on overflow.
+            let slot_secs = index as f64 / gate.qps;
+            let budget_secs = self.deadline.map_or(MAX_RUN_SECS, |d| {
+                d.saturating_duration_since(gate.start).as_secs_f64()
+            });
+            if slot_secs >= budget_secs {
+                return None;
+            }
             gate.wait(index, cancel).await;
             if cancel.is_cancelled() {
                 return None;
             }
+        } else if self.deadline.is_some_and(|d| Instant::now() >= d) {
+            return None;
         }
         let row = self.corpus.select_index(index, self.seed, self.mode);
         Some(DnsRequest {
@@ -401,18 +527,18 @@ fn merge_actor_result(
     recorders.push((worker_id, recorder));
 }
 
-pub async fn run_load(config: LoadConfig, cancel: CancellationToken) -> Result<LoadStats> {
-    run_load_with_progress(config, cancel, None).await
+pub async fn run_load(plan: ValidatedLoadPlan, cancel: CancellationToken) -> Result<LoadStats> {
+    run_load_with_progress(plan, cancel, None).await
 }
 
 /// Same as `run_load`, plus optional live progress. With `progress = None` no
 /// slots, ticker, or sampler exist, so this path is identical to the batch run.
 pub async fn run_load_with_progress(
-    config: LoadConfig,
+    plan: ValidatedLoadPlan,
     cancel: CancellationToken,
     progress: Option<(ProgressConfig, watch::Sender<RunSnapshot>)>,
 ) -> Result<LoadStats> {
-    config.validate()?;
+    let config = plan.config();
 
     let edns_options = config.edns_options.as_slice();
 
@@ -603,7 +729,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_bad_qps_cap() {
-        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY, MAX_QPS + 1.0] {
             let mut config = base_config();
             config.qps_cap = Some(bad);
             assert_eq!(config.validate().unwrap_err().code, "invalid_qps", "{bad}");
@@ -612,6 +738,62 @@ mod tests {
         good.qps_cap = Some(100.0);
         assert!(good.validate().is_ok());
         assert!(base_config().validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_oversized_duration() {
+        let mut config = base_config();
+        config.duration = Some(Duration::from_secs_f64(MAX_RUN_SECS + 1.0));
+        let error = config.validate().unwrap_err();
+        assert_eq!(error.code, "invalid_duration");
+        assert!(error.rejected, "admission errors must map to exit 2");
+
+        let mut zero = base_config();
+        zero.duration = Some(Duration::ZERO);
+        assert_eq!(zero.validate().unwrap_err().code, "invalid_duration");
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_timeout() {
+        let mut config = base_config();
+        config.timeout = Duration::ZERO;
+        assert_eq!(config.validate().unwrap_err().code, "invalid_timeout");
+        config.timeout = Duration::from_secs(61);
+        assert_eq!(config.validate().unwrap_err().code, "invalid_timeout");
+    }
+
+    #[test]
+    fn validate_rejects_aggregate_in_flight_over_budget() {
+        let mut ok = base_config();
+        ok.concurrency = 64;
+        ok.in_flight = 64; // 4096 == MAX_AGGREGATE_IN_FLIGHT
+        assert!(ok.validate().is_ok());
+
+        let mut over = base_config();
+        over.concurrency = 65;
+        over.in_flight = 64; // 4160 > 4096
+        assert_eq!(
+            over.validate().unwrap_err().code,
+            "invalid_aggregate_in_flight"
+        );
+    }
+
+    #[test]
+    fn count_zero_is_an_admissible_empty_run() {
+        let mut config = base_config();
+        config.count = Some(0);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn resource_budget_reports_the_envelope() {
+        let mut config = base_config();
+        config.concurrency = 8;
+        config.in_flight = 16;
+        let plan = ValidatedLoadPlan::new(config).unwrap();
+        let budget = plan.resource_budget();
+        assert_eq!(budget.total_in_flight, 128);
+        assert_eq!(budget.corpus_rows, 1);
     }
 
     #[test]
@@ -648,5 +830,45 @@ mod tests {
         merge_actor_result(&mut aggregate, &mut recorders, 8, Ok((3, recorder)));
         assert_eq!(aggregate.sent, 1);
         assert_eq!(recorders[1].0, 3, "Ok result keeps its own worker id");
+    }
+
+    #[tokio::test]
+    async fn work_scheduled_past_the_deadline_is_never_admitted() {
+        // ADR 0002: admission compares the query's *scheduled slot*
+        // (start + n/qps) with the deadline BEFORE the rate-gate wait; a query
+        // whose slot is at/past the deadline is refused without waiting. The
+        // buggy implementation checks the wall clock before the wait and then
+        // sleeps past the deadline, admitting the query.
+        let start = Instant::now();
+        let deadline = start + Duration::from_millis(400);
+        let source = WorkSource {
+            seq: AtomicU64::new(3),
+            count: None,
+            deadline: Some(deadline),
+            gate: Some(RateGate { start, qps: 10.0 }),
+            corpus: Corpus::single("example.com"),
+            wires: vec![wiresurge_dns::build_query(0, "example.com", 1, &[]).unwrap()],
+            seed: 0,
+            mode: SelectMode::Sequential,
+        };
+        let cancel = CancellationToken::new();
+
+        assert!(source.next(&cancel).await.is_some());
+
+        // The next fetch happens at ~start+300ms, before the deadline passes,
+        // for slot 4 at start+400ms == deadline. The 150ms sleep is only a
+        // hang guard: it fires after the buggy slot at 400ms.
+        let started = Instant::now();
+        let result = tokio::select! {
+            r = source.next(&cancel) => r,
+            _ = tokio::time::sleep(Duration::from_millis(150)) => {
+                panic!("next() waited for a slot scheduled past the deadline");
+            }
+        };
+        assert!(
+            result.is_none(),
+            "work scheduled at/past the deadline was admitted (returned after {:?})",
+            started.elapsed(),
+        );
     }
 }

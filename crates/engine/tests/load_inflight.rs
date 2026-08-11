@@ -5,7 +5,7 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 use wiresurge_corpus::Corpus;
-use wiresurge_engine::load::{LoadConfig, LoadProto, run_load};
+use wiresurge_engine::load::{LoadConfig, LoadProto, ValidatedLoadPlan, run_load};
 use wiresurge_transport::ConnectTarget;
 
 /// A UDP echo server that answers each query after a fixed per-request delay,
@@ -57,7 +57,12 @@ async fn many_in_flight_beats_one_in_flight() {
     };
 
     let started = std::time::Instant::now();
-    let stats = run_load(config, CancellationToken::new()).await.unwrap();
+    let stats = run_load(
+        ValidatedLoadPlan::new(config).unwrap(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     let elapsed = started.elapsed();
 
     assert_eq!(stats.recorder.sent, count);
@@ -90,7 +95,12 @@ async fn duration_mode_stops_and_counts() {
         seed: 7,
         edns_options: Vec::new(),
     };
-    let stats = run_load(config, CancellationToken::new()).await.unwrap();
+    let stats = run_load(
+        ValidatedLoadPlan::new(config).unwrap(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     assert!(stats.recorder.received > 0);
     assert!(stats.duration_s >= 0.3);
 }
@@ -115,7 +125,9 @@ async fn cancel_before_connect_returns_promptly_as_conn_error() {
     let cancel = CancellationToken::new();
     cancel.cancel();
     let started = std::time::Instant::now();
-    let stats = run_load(config, cancel).await.unwrap();
+    let stats = run_load(ValidatedLoadPlan::new(config).unwrap(), cancel)
+        .await
+        .unwrap();
     assert!(
         started.elapsed() < Duration::from_secs(5),
         "cancelled run must not block on connect"
@@ -146,7 +158,12 @@ async fn connect_timeout_bounds_a_black_hole_target() {
         edns_options: Vec::new(),
     };
     let started = std::time::Instant::now();
-    let stats = run_load(config, CancellationToken::new()).await.unwrap();
+    let stats = run_load(
+        ValidatedLoadPlan::new(config).unwrap(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     assert!(
         started.elapsed() < Duration::from_secs(3),
         "connect must be bounded by the timeout, not the OS SYN timeout"
