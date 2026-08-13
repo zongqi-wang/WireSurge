@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use wiresurge_core::{RequestSpec, Result, WireSurgeError, serialize_json, validate_id};
@@ -56,8 +57,11 @@ impl WorkspaceStore {
     pub fn create_request(&self, request: &RequestSpec) -> Result<()> {
         self.ensure_workspace()?;
         validate_id(&request.id)?;
-        fs::write(self.request_path(&request.id), request.to_yaml()?)?;
-        Ok(())
+        atomic_write(
+            &self.request_path(&request.id),
+            request.to_yaml()?.as_bytes(),
+            true,
+        )
     }
 
     pub fn update_request(&self, id: &str, request: &RequestSpec) -> Result<()> {
@@ -73,7 +77,7 @@ impl WorkspaceStore {
         }
         let mut updated = request.clone();
         updated.id = id.to_string();
-        fs::write(path, updated.to_yaml()?)?;
+        atomic_write(&path, updated.to_yaml()?.as_bytes(), false)?;
         Ok(())
     }
 
@@ -251,6 +255,41 @@ impl WorkspaceStore {
     }
 }
 
+/// P0-A-08 leaf write: with `create_new`, the leaf must not exist — a
+/// collision or a symlink entry (dangling or not) fails instead of being
+/// followed or overwritten. Replacement writes go through a sibling temp file
+/// and rename, so a crash mid-write leaves the previous content intact.
+/// Parent-directory anchoring is P0-B (the workspace parent is trusted here).
+fn atomic_write(path: &Path, bytes: &[u8], create_new: bool) -> Result<()> {
+    if create_new {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    WireSurgeError::new(
+                        "request_already_exists",
+                        "a request with this id already exists",
+                    )
+                    .at("id")
+                } else {
+                    WireSurgeError::from(error)
+                }
+            })?;
+        file.write_all(bytes).map_err(WireSurgeError::from)?;
+        return Ok(());
+    }
+    let tmp_path = PathBuf::from(format!("{}.tmp", path.display()));
+    {
+        let mut file = fs::File::create(&tmp_path).map_err(WireSurgeError::from)?;
+        file.write_all(bytes).map_err(WireSurgeError::from)?;
+        file.sync_all().map_err(WireSurgeError::from)?;
+    }
+    fs::rename(&tmp_path, path).map_err(WireSurgeError::from)?;
+    Ok(())
+}
+
 fn report_html(summary: &ReportSummary, summary_json: &str, details_json: &str) -> String {
     format!(
         r#"<!doctype html>
@@ -324,6 +363,42 @@ mod tests {
         let requests = store.list_requests().unwrap();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].id, "req-a");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn update_request_replaces_content_atomically() {
+        let root = std::env::temp_dir().join(format!(
+            "wiresurge-storage-update-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = WorkspaceStore::new(&root);
+        store.init().unwrap();
+        store
+            .create_request(
+                &RequestSpec::from_json(r#"{"id":"req-a","name":"A","url":"http://localhost"}"#)
+                    .unwrap(),
+            )
+            .unwrap();
+        // A stale temp file left by a crashed earlier write must not
+        // interfere with the next atomic replacement.
+        fs::write(
+            store.request_path("req-a").with_extension("yaml.tmp"),
+            b"stale",
+        )
+        .unwrap();
+        store
+            .update_request(
+                "req-a",
+                &RequestSpec::from_json(r#"{"id":"req-a","name":"B","url":"http://localhost"}"#)
+                    .unwrap(),
+            )
+            .unwrap();
+        let updated = store.load_request("req-a").unwrap();
+        assert_eq!(updated.name, "B");
         let _ = fs::remove_dir_all(root);
     }
 
