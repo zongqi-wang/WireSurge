@@ -213,7 +213,6 @@ async fn dot_proxy_header_precedes_client_hello() {
     let acceptor = TlsAcceptor::from(server_config(ServerMode::Echo));
     tokio::spawn(async move {
         let (mut tcp, _) = listener.accept().await.unwrap();
-        // Read the PROXY preamble in the clear, before any TLS bytes.
         let mut fixed = [0u8; 16];
         tcp.read_exact(&mut fixed).await.unwrap();
         assert_eq!(
@@ -225,7 +224,6 @@ async fn dot_proxy_header_precedes_client_hello() {
         let block_len = u16::from_be_bytes([fixed[14], fixed[15]]) as usize;
         let mut block = vec![0u8; block_len];
         tcp.read_exact(&mut block).await.unwrap();
-        // Now the remaining stream is the TLS handshake + DoT frames.
         let mut tls = acceptor.accept(tcp).await.unwrap();
         let mut len_buf = [0u8; 2];
         if tls.read_exact(&mut len_buf).await.is_ok() {

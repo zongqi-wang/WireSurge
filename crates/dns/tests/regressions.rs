@@ -1,6 +1,3 @@
-//! P0-A regressions (P0A-04): DNS accounting honesty — each test pins the
-//! ADR 0004 contract.
-
 mod fixtures;
 
 use std::time::Duration;
@@ -10,7 +7,6 @@ use wiresurge_dns::transport::doh::DohTransport;
 use wiresurge_dns::transport::{Connection, Transport, TransportError};
 use wiresurge_transport::{ConnectTarget, HttpMethod};
 
-/// DNS response header echoing the request id, with the QR/RA flags set.
 fn response_with_question(request_wire: &[u8], qname: &[u8], arcount: u8) -> Vec<u8> {
     let mut out = Vec::with_capacity(64);
     out.extend_from_slice(&request_wire[..2]);
@@ -21,7 +17,6 @@ fn response_with_question(request_wire: &[u8], qname: &[u8], arcount: u8) -> Vec
     out
 }
 
-/// Same request id, different question (evil.com), rcode NOERROR.
 fn wrong_question_response(request_wire: &[u8]) -> Vec<u8> {
     response_with_question(
         request_wire,
@@ -30,9 +25,6 @@ fn wrong_question_response(request_wire: &[u8]) -> Vec<u8> {
     )
 }
 
-/// Extended-RCODE response: header rcode bits are 0 (NOERROR), but the OPT
-/// record TTL carries the extended RCODE high bits — extended RCODE 16
-/// (BADVERS) per RFC 6891 §6.1.3.
 fn badvers_response(request_wire: &[u8]) -> Vec<u8> {
     let mut out = response_with_question(
         request_wire,

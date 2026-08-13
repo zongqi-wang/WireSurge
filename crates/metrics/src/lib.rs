@@ -195,8 +195,6 @@ impl RunnerStats {
         self
     }
 
-    /// Terminal failure (ADR 0003): the run ended with an error, so the
-    /// record must not stay "active".
     pub fn finalize_failed(mut self) -> Self {
         self.status = "failed".to_string();
         self.active_run_id = None;

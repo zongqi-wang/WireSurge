@@ -29,12 +29,6 @@ pub struct ResponseHeader {
 /// response to its own stream and RFC 8484 §4.1 treats the DNS id as 0 — a
 /// resolver, forwarder, or HTTP cache may legitimately return any id, so an
 /// equality check there would reject valid answers.
-///
-/// The RCODE is the full 12-bit value: the header nibble plus the EDNS
-/// extended bits from the OPT record's TTL high byte (RFC 6891 §6.1.3) when
-/// one is present. The message structure is walked allocation-free; a
-/// truncated or structurally invalid body is an error (ADR 0004: a malformed
-/// response is a protocol error, never goodput).
 pub fn parse_response_header(response: &[u8], expected_id: Option<u16>) -> Result<ResponseHeader> {
     let header = Header::from_bytes(response).map_err(|error| {
         WireSurgeError::new("invalid_dns_response", error.to_string()).retryable(false)
@@ -75,9 +69,6 @@ fn invalid_body() -> String {
     "malformed DNS response body".to_string()
 }
 
-/// Walk the question/answer/authority/additional sections allocation-free and
-/// return the extended RCODE high byte of the last OPT record (RFC 6891
-/// §6.1.3), or `None` when no OPT record is present.
 fn opt_extended_rcode(msg: &[u8]) -> std::result::Result<Option<u8>, String> {
     if msg.len() < 12 {
         return Err(invalid_body());
@@ -112,9 +103,7 @@ fn opt_extended_rcode(msg: &[u8]) -> std::result::Result<Option<u8>, String> {
     Ok(extended)
 }
 
-/// RFC 1035 label walk starting at `pos`, handling compression pointers (the
-/// pointer occupies 2 bytes; RFC 1035 §4.1.4). `None` on truncation or a
-/// reserved label type.
+/// RFC 1035 label walk; a compression pointer occupies 2 bytes (§4.1.4).
 fn skip_name(msg: &[u8], mut pos: usize) -> Option<usize> {
     loop {
         let len = *msg.get(pos)?;
@@ -132,9 +121,8 @@ fn skip_name(msg: &[u8], mut pos: usize) -> Option<usize> {
     }
 }
 
-/// Byte range of the question section (qname + qtype + qclass) when
-/// `qdcount == 1` and the name is uncompressed (RFC 1035 §4.1.2 question
-/// names are not compressed).
+/// Question section byte range when `qdcount == 1` and the name is
+/// uncompressed (RFC 1035 §4.1.2).
 pub(crate) fn question_range(msg: &[u8]) -> Option<std::ops::Range<usize>> {
     if msg.len() < 12 {
         return None;
@@ -164,9 +152,6 @@ fn walk_uncompressed_name(msg: &[u8], mut pos: usize) -> Option<usize> {
     }
 }
 
-/// ADR 0004: a matching response must carry the same question as the query
-/// (qname, qtype, qclass, byte-identical) on every DNS transport. A response
-/// whose question differs is a protocol error, not goodput or a timeout.
 pub fn response_question_matches(response: &[u8], query: &[u8]) -> bool {
     let Some(rq) = question_range(response) else {
         return false;
@@ -177,8 +162,6 @@ pub fn response_question_matches(response: &[u8], query: &[u8]) -> bool {
     response.get(rq) == query.get(qq)
 }
 
-/// Same as [`response_question_matches`] against a caller-stored expected
-/// question section (the query's question bytes captured at send time).
 pub(crate) fn question_matches_response(response: &[u8], expected: &[u8]) -> bool {
     let Some(range) = question_range(response) else {
         return false;

@@ -159,7 +159,7 @@ async fn doh_accepts_zero_id_and_2xx_non_200() {
         wire[2] = 0x81;
         wire[3] = 0x80;
         Response::builder()
-            .status(StatusCode::ACCEPTED) // 202, a 2xx non-200
+            .status(StatusCode::ACCEPTED)
             .header(CONTENT_TYPE, DNS_MESSAGE)
             .body(Full::new(Bytes::from(wire)))
             .unwrap()

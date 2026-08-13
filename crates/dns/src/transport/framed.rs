@@ -12,7 +12,6 @@ use crate::{
     MAX_DNS_MESSAGE_LEN, parse_response_header, question_matches_response, question_range,
 };
 
-/// Longest question section (qname up to 255 bytes + qtype + qclass).
 const MAX_QUESTION_LEN: usize = 255 + 2 + 2;
 
 /// One outstanding query: the reply slot the reader fills, plus the wakeup the
@@ -22,9 +21,6 @@ const MAX_QUESTION_LEN: usize = 255 + 2 + 2;
 struct Slot {
     notify: Arc<Notify>,
     response: Option<Result<DnsResponse, TransportError>>,
-    /// The query's question section (qname + qtype + qclass), captured inline
-    /// at register time so the reader can verify response identity without a
-    /// per-query allocation (ADR 0004).
     question: [u8; MAX_QUESTION_LEN],
     question_len: u16,
 }
@@ -119,8 +115,6 @@ impl Correlator {
         let Some(slot) = st.pending.get_mut(&id) else {
             return;
         };
-        // ADR 0004: a same-id response whose question differs from the query
-        // is a protocol error, not goodput or a timeout.
         let response =
             if question_matches_response(buf, &slot.question[..slot.question_len as usize]) {
                 Ok(DnsResponse {
@@ -299,12 +293,10 @@ impl Connection for FramedConn {
         }
         let len = u16::try_from(request.wire.len())
             .map_err(|_| TransportError::Protocol("query exceeds TCP length field".into()))?;
-        // Build the framed buffer (length prefix + message), then assign the
-        // transaction id by patching it directly into the frame's copy of the
-        // header (frame[2..4]); the shared `wire` is never mutated.
         let mut frame = Vec::with_capacity(request.wire.len() + 2);
         frame.extend_from_slice(&len.to_be_bytes());
         frame.extend_from_slice(&request.wire);
+        // The prebuilt wire is never mutated; the txid is patched into the frame copy.
         let (id, notify) = self.correlator.register(&mut frame[2..]);
 
         if self.writer.send(frame).await.is_err() {

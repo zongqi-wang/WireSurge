@@ -1,8 +1,3 @@
-//! Shared fixtures for the DNS integration tests: TLS HTTP/2 DoH responder,
-//! DNS wire helpers, and DoH target construction.
-//!
-//! Each test crate compiles its own copy of this module and uses a different
-//! subset of the items, so dead-code is expected per crate.
 #![allow(dead_code)]
 
 use std::convert::Infallible;
@@ -32,8 +27,6 @@ pub const CERT_DER: &[u8] = include_bytes!("cert.der");
 pub const KEY_DER: &[u8] = include_bytes!("key.der");
 pub const DNS_MESSAGE: &str = "application/dns-message";
 
-/// Rustls server config with ALPN `h2` — required for the DoH client, whose
-/// default `alpn_relaxed = false` rejects a peer that negotiates no ALPN.
 pub fn server_config() -> Arc<ServerConfig> {
     let cert = CertificateDer::from(CERT_DER.to_vec());
     let key = PrivateKeyDer::try_from(KEY_DER.to_vec()).unwrap();
@@ -45,8 +38,6 @@ pub fn server_config() -> Arc<ServerConfig> {
     Arc::new(config)
 }
 
-/// DNS wire message from a DoH request: base64url `?dns=` (GET) or the raw
-/// body (POST).
 pub async fn extract_wire(request: Request<Incoming>) -> Option<Vec<u8>> {
     let query = request.uri().query().unwrap_or("").to_string();
     if request.method() == Method::GET {
@@ -60,10 +51,8 @@ pub async fn extract_wire(request: Request<Incoming>) -> Option<Vec<u8>> {
     }
 }
 
-/// A 200 `application/dns-message` response with QR/RA bits set so the
-/// client's header validation accepts it.
 pub fn dns_response(mut wire: Vec<u8>) -> Response<Full<Bytes>> {
-    wire[2] = 0x81;
+    wire[2] = 0x81; // QR/RA bits so parse_response_header accepts it
     wire[3] = 0x80;
     Response::builder()
         .status(StatusCode::OK)
@@ -109,9 +98,6 @@ pub fn doh_target_with(
         })
 }
 
-/// Bind a TLS HTTP/2 DoH responder on `bind` and serve `handler` per request.
-/// `None` when the bind is refused (e.g. no IPv6 in CI), so the caller can
-/// skip rather than hard-fail.
 pub async fn spawn_doh_server_on<F, Fut>(bind: &str, handler: F) -> Option<SocketAddr>
 where
     F: Fn(String, Vec<u8>) -> Fut + Send + Sync + 'static,

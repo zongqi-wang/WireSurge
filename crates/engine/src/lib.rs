@@ -150,10 +150,8 @@ async fn send_request_inner(
         result = send_http_request(request) => match result {
             Ok(response) => response,
             Err(error) => {
-                // ADR 0003: a transport failure must leave a terminal record;
-                // the run failure is primary, so a snapshot write error is
-                // secondary.
                 let failed = active_runner.clone().finalize_failed();
+                // Snapshot write errors are secondary to the run failure.
                 let _ = store.write_runner_snapshot(&failed);
                 return Err(error);
             }
@@ -211,8 +209,6 @@ pub async fn run_run_spec_with_cancellation(
     // declared contract was not checked rather than letting silence read green.
     if options.dry_run {
         let run_id = generate_id("run", &request.id);
-        // A dry run sends no traffic; the record is finalized immediately so
-        // it cannot stay "active" (ADR 0003).
         let runner = RunnerStats::local(Some(run_id.clone()), options.parallel)
             .finish_with_latency(0.0, true);
         store.write_runner_snapshot(&runner)?;
