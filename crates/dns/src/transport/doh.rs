@@ -23,11 +23,12 @@ use crate::{parse_response_header, response_question_matches};
 
 const DNS_MESSAGE: &str = "application/dns-message";
 
-/// Conservative cap on locally-issued streams when the peer's
-/// `MAX_CONCURRENT_STREAMS` has not yet been observed. hyper raises the
-/// effective limit to the peer's advertised value once the SETTINGS frame
-/// arrives; this only bounds the very first burst.
-const DOH_IN_FLIGHT: usize = 256;
+/// Upper bound on concurrent HTTP/2 streams (one per in-flight DNS query) on a
+/// single DoH connection. Only a backstop: the engine uses
+/// `min(MAX_DOH_IN_FLIGHT, -q)`, so `--in-flight` (-q, default 64) is the real
+/// control. 65_535 is the conventional HTTP/2 concurrent-stream ceiling; the
+/// server still enforces its own advertised `MAX_CONCURRENT_STREAMS`.
+const MAX_DOH_IN_FLIGHT: usize = 65_535;
 
 pub struct DohTransport;
 
@@ -171,7 +172,7 @@ pub fn assemble(prepared: &Prepared, wire: &[u8]) -> Result<(Uri, Bytes), Transp
 impl Connection for DohConn {
     fn caps(&self) -> TransportCaps {
         TransportCaps {
-            max_in_flight: DOH_IN_FLIGHT,
+            max_in_flight: MAX_DOH_IN_FLIGHT,
         }
     }
 
